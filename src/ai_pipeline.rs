@@ -1,0 +1,369 @@
+use anyhow::Context;
+use futures_util::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
+use serde::Deserialize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use crate::openai::OpenAiClient;
+use crate::rate_limit::RpmGate;
+
+#[derive(Debug, Clone)]
+pub struct AiPipeline {
+    pub openai: OpenAiClient,
+    pub stt_model: String,
+    pub chat_model: String,
+    stt_concurrency: usize,
+    stt_rpm_gate: Option<Arc<RpmGate>>,
+    seo_system_prompt: String,
+    thumbnail_system_prompt: String,
+    seo_user_prompt_template: String,
+    thumbnail_user_prompt_template: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptSegment {
+    pub start: f64,
+    #[allow(dead_code)]
+    pub end: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    pub full_text: String,
+    pub segments: Vec<TranscriptSegment>,
+}
+
+impl AiPipeline {
+    pub fn new(
+        openai: OpenAiClient,
+        stt_model: String,
+        chat_model: String,
+        stt_concurrency: usize,
+        stt_rpm_limit: u32,
+        seo_system_prompt: String,
+        thumbnail_system_prompt: String,
+        seo_user_prompt_template: String,
+        thumbnail_user_prompt_template: String,
+    ) -> Self {
+        let stt_rpm_gate = if stt_rpm_limit > 0 {
+            Some(Arc::new(RpmGate::new(stt_rpm_limit)))
+        } else {
+            None
+        };
+        Self {
+            openai,
+            stt_model,
+            chat_model,
+            stt_concurrency: stt_concurrency.max(1),
+            stt_rpm_gate,
+            seo_system_prompt,
+            thumbnail_system_prompt,
+            seo_user_prompt_template,
+            thumbnail_user_prompt_template,
+        }
+    }
+
+    pub async fn transcribe_chunks(
+        &self,
+        chunks: &[(std::path::PathBuf, f64, f64)],
+        progress: Option<ProgressBar>,
+    ) -> anyhow::Result<Transcript> {
+        let client = self.openai.clone();
+        let stt_model = self.stt_model.clone();
+        let concurrency = self.stt_concurrency;
+        let stt_rpm_gate = self.stt_rpm_gate.clone();
+        if chunks.is_empty() {
+            anyhow::bail!("no audio chunks to transcribe");
+        }
+
+        let total_chunks = chunks.len();
+        let progress = progress.unwrap_or_else(ProgressBar::hidden);
+        progress.set_length(total_chunks as u64);
+        progress.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} transcribing {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed_precise}"
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        progress.set_message("starting");
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let results = stream::iter(chunks.iter().cloned().enumerate())
+            .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
+                let client = client.clone();
+                let stt_model = stt_model.clone();
+                let progress = progress.clone();
+                let completed = completed.clone();
+                let total_chunks = total_chunks;
+                let stt_rpm_gate = stt_rpm_gate.clone();
+                async move {
+                    let chunk_label = chunk_path.display().to_string();
+                    tracing::debug!(chunk=%chunk_label, offset_secs, "transcribing audio chunk");
+
+                    if let Some(gate) = stt_rpm_gate.as_ref() {
+                        gate.wait().await;
+                    }
+                    let tr = client
+                        .transcribe_text(&stt_model, &chunk_path)
+                        .await
+                        .with_context(|| format!("stt for {chunk_label}"))?;
+
+                    let mapped = map_segments_or_synthesize(tr, offset_secs, chunk_duration_secs);
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress.set_message(format!("chunk {done}/{total_chunks}"));
+                    progress.inc(1);
+                    Ok::<_, anyhow::Error>((idx, mapped))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        progress.finish_with_message("transcription complete");
+
+        let mut per_chunk = Vec::with_capacity(results.len());
+        for res in results {
+            per_chunk.push(res?);
+        }
+        per_chunk.sort_by_key(|(idx, _)| *idx);
+
+        let mut segments_out = Vec::new();
+        let mut text_out = String::new();
+        for (_, mapped) in per_chunk {
+            for seg in mapped {
+                if !seg.text.trim().is_empty() {
+                    segments_out.push(seg.clone());
+                    text_out.push_str(seg.text.trim());
+                    text_out.push('\n');
+                }
+            }
+        }
+
+        Ok(Transcript {
+            full_text: text_out,
+            segments: segments_out,
+        })
+    }
+
+    pub async fn seo_package(&self, transcript_text: &str) -> anyhow::Result<SeoPackage> {
+        // Keep prompts bounded.
+        let transcript_text = clamp_chars(transcript_text, 120_000);
+
+        let system = self.seo_system_prompt.as_str();
+        let user = self
+            .seo_user_prompt_template
+            .replace("{{transcript}}", &transcript_text);
+
+        let json = self
+            .openai
+            .chat_json(&self.chat_model, system, &user)
+            .await?;
+        let mut pkg: SeoPackage = serde_json::from_value(json).context("parse SEO package JSON")?;
+
+        // Normalize and enforce constraints.
+        pkg.hashtags = pkg
+            .hashtags
+            .into_iter()
+            .map(|h| h.trim().trim_start_matches('#').to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        pkg.hashtags.sort();
+        pkg.hashtags.dedup();
+
+        pkg.tags_csv = pkg.tags_csv.trim().to_string();
+        if pkg.tags_csv.chars().count() > 500 {
+            pkg.tags_csv = pkg.tags_csv.chars().take(500).collect();
+        }
+
+        Ok(pkg)
+    }
+
+    pub async fn thumbnail_windows(
+        &self,
+        segments: &[TranscriptSegment],
+        count: usize,
+    ) -> anyhow::Result<Vec<ThumbnailMoment>> {
+        // Provide a compact time-indexed summary to the LLM.
+        let minutes = minute_index(segments, 180 /* max minutes */);
+
+        let system = self.thumbnail_system_prompt.as_str();
+        let user = self
+            .thumbnail_user_prompt_template
+            .replace("{{count}}", &count.to_string())
+            .replace("{{minutes}}", &minutes);
+
+        let json = self
+            .openai
+            .chat_json(&self.chat_model, system, &user)
+            .await?;
+        let resp: ThumbnailResponse =
+            serde_json::from_value(json).context("parse thumbnail JSON")?;
+
+        let mut out = resp.moments;
+
+        // Normalize and clamp.
+        for m in &mut out {
+            if !m.center_seconds.is_finite() || m.center_seconds < 0.0 {
+                m.center_seconds = 0.0;
+            }
+            if m.reason.trim().is_empty() {
+                m.reason = "thumbnail moment".to_string();
+            }
+        }
+
+        // If the model under-delivers, pad deterministically so the pipeline still generates
+        // enough thumbnails.
+        if count > 0 && out.len() < count {
+            let approx_duration = segments
+                .iter()
+                .map(|s| s.end.max(s.start))
+                .fold(0.0_f64, |a, b| a.max(b))
+                .max(
+                    segments
+                        .last()
+                        .map(|s| s.start)
+                        .unwrap_or(0.0)
+                        .max(0.0),
+                );
+
+            // Avoid placing filler right at EOF.
+            let last_ts = (approx_duration - 0.25).max(0.0);
+
+            let missing = count - out.len();
+            let base = if count > 1 {
+                last_ts / (count.saturating_sub(1) as f64)
+            } else {
+                0.0
+            };
+
+            for i in 0..missing {
+                let idx = out.len() + i;
+                let mut ts = (idx as f64) * base;
+                if !ts.is_finite() {
+                    ts = 0.0;
+                }
+                ts = ts.max(0.0).min(last_ts);
+                out.push(ThumbnailMoment {
+                    center_seconds: ts,
+                    reason: "big reaction — safe filler".to_string(),
+                });
+            }
+        }
+
+        // Deduplicate near-identical timestamps (keep earliest), then truncate.
+        out.sort_by(|a, b| a.center_seconds.partial_cmp(&b.center_seconds).unwrap_or(std::cmp::Ordering::Equal));
+        out.dedup_by(|a, b| (a.center_seconds - b.center_seconds).abs() < 0.25);
+        out.truncate(count);
+        Ok(out)
+    }
+}
+
+fn map_segments_or_synthesize(
+    tr: crate::openai::TranscriptionText,
+    offset_secs: f64,
+    chunk_duration_secs: f64,
+) -> Vec<TranscriptSegment> {
+    if !tr.segments.is_empty() {
+        return tr
+            .segments
+            .into_iter()
+            .map(|s| TranscriptSegment {
+                start: s.start + offset_secs,
+                end: s.end + offset_secs,
+                text: s.text,
+            })
+            .collect();
+    }
+
+    synthesize_minute_segments(&tr.text, offset_secs, chunk_duration_secs)
+}
+
+fn synthesize_minute_segments(
+    text: &str,
+    offset_secs: f64,
+    chunk_duration_secs: f64,
+) -> Vec<TranscriptSegment> {
+    let dur = if chunk_duration_secs.is_finite() && chunk_duration_secs > 0.0 {
+        chunk_duration_secs
+    } else {
+        60.0
+    };
+    let minutes = ((dur / 60.0).ceil() as usize).max(1);
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![TranscriptSegment {
+            start: offset_secs,
+            end: offset_secs + dur,
+            text: text.to_string(),
+        }];
+    }
+
+    let mut out = Vec::with_capacity(minutes);
+    for i in 0..minutes {
+        let start_word = i * words.len() / minutes;
+        let end_word = ((i + 1) * words.len() / minutes).max(start_word + 1);
+        let seg_text = words[start_word..end_word.min(words.len())].join(" ");
+
+        let start = offset_secs + (i as f64) * 60.0;
+        let end = (start + 60.0).min(offset_secs + dur);
+        out.push(TranscriptSegment {
+            start,
+            end,
+            text: seg_text,
+        });
+    }
+    out
+}
+
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
+}
+
+fn minute_index(segments: &[TranscriptSegment], max_minutes: usize) -> String {
+    let mut buckets: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+    for seg in segments {
+        let minute = (seg.start.max(0.0) as u64) / 60;
+        let entry = buckets.entry(minute).or_default();
+        if entry.len() < 800 {
+            entry.push_str(seg.text.trim());
+            entry.push(' ');
+        }
+    }
+
+    let mut out = String::new();
+    for (minute, text) in buckets.into_iter().take(max_minutes) {
+        out.push_str(&format!(
+            "[{start:>5}s] {text}\n",
+            start = minute * 60,
+            text = clamp_chars(&text, 600)
+        ));
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SeoPackage {
+    pub description: String,
+    pub hashtags: Vec<String>,
+    pub tags_csv: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThumbnailResponse {
+    moments: Vec<ThumbnailMoment>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ThumbnailMoment {
+    pub center_seconds: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub reason: String,
+}

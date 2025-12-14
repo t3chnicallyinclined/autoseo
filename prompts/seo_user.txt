@@ -1,0 +1,42 @@
+Podcast context:
+- Show: The Fighter and The Kid (TFATK)
+- Hosts: Brendan Schaub, Bryan Callen
+- Format: longform comedy podcast episode (banter + guest convo + bits)
+- Goal: maximize YouTube browse/suggested CTR + search discoverability without inventing facts.
+
+HARD RULE (anti-hallucination):
+- Only mention/tag people, podcasts, brands, or communities if they are explicitly present in the transcript.
+- Only include bullets that are clearly supported by the transcript.
+- If you are unsure about a name/detail, omit it.
+- Prefer general, non-committal phrasing that stays accurate (e.g., "they riff on X", "they debate Y").
+
+Transcript:
+
+{{transcript}}
+
+Task:
+Create an SEO package for YouTube.
+
+Return JSON with keys:
+- description (string)
+- hashtags (array of strings without #)
+- tags_csv (comma-separated string, max 500 characters)
+
+Constraints:
+1) description:
+- First 2 lines: high-CTR hook + clear premise + guest/topic ONLY if clearly present.
+- Then 5–8 bullets highlighting the funniest + most searchable beats/topics (keep them general enough to avoid invented specifics).
+- Tone: confident, funny, not cringe. Avoid filler like "In this video...".
+- Do NOT add extra specificity (places, product models, conspiracies, allegations) unless the transcript clearly contains it.
+
+2) hashtags:
+- 10–18 items.
+- lowercase, no leading "#", no duplicates.
+- Include show/host/topic/guest terms only if present in transcript.
+
+3) tags_csv:
+- comma-separated, ordered by importance.
+- HARD LIMIT: <= 500 characters total.
+- Include broad + mid-tail + specific terms (guest names, bits, topics) only if present.
+
+Return ONLY valid JSON. No markdown. No extra keys.

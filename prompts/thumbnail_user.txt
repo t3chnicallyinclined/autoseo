@@ -1,0 +1,26 @@
+Video type: longform comedy podcast.
+Show: The Fighter and The Kid (TFATK) — Brendan Schaub + Bryan Callen.
+
+Pick {{count}} thumbnail moments from the time-indexed transcript.
+
+What wins for comedy podcast thumbnails:
+- extreme facial reactions (shock, laugh, disgust, disbelief)
+- confrontational beats / roasting / clip-worthy arguments
+- surprising confession / outrageous claim
+- recognizable guest moments (if any)
+- moments with a clear quoteable angle (good for 2–4 word overlay)
+
+Return JSON: {"moments": [{"center_seconds": number, "reason": string}...]}.
+
+Hard requirement:
+- Return EXACTLY {{count}} moments. Do not return fewer.
+- If you cannot find enough strong peaks, fill remaining slots by choosing evenly-spaced timestamps across the episode (still based on the time index) and use a generic but plausible reason like "big reaction" / "heated exchange" / "punchline".
+
+Rules:
+- center_seconds must be >= 0 and should target the visual PEAK (not the setup).
+- Spread moments across the episode unless peaks naturally cluster.
+- Do not name a guest/person unless clearly present in the transcript.
+- reason format: "<visual cue> — <clickable angle>".
+
+Time index (each entry is ~1 minute):
+{{minutes}}

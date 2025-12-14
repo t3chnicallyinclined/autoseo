@@ -25,18 +25,42 @@ pub async fn generate_thumbnails(
         0.0
     };
 
+    // Build screenshot tasks.
+    // Prefer 1 shot per moment when we already have enough moments; it halves ffmpeg work vs center+alt.
+    // Add a small buffer of extra tasks to survive occasional screenshot failures/empty outputs.
     let mut tasks: Vec<(std::path::PathBuf, f64)> = Vec::new();
-    for (i, m) in moments.iter().enumerate() {
-        let center = m.center_seconds.max(0.0).min(last_frame_ts);
-        let out_path = thumbs_dir.join(format!("thumb_{i:02}_{sec:.0}.jpg", sec = center));
-        tasks.push((out_path, center));
-
-        let alt = (center + (window / 2.0)).min(last_frame_ts);
-        let out_path2 = thumbs_dir.join(format!("thumb_{i:02}_alt_{sec:.0}.jpg", sec = alt));
-        tasks.push((out_path2, alt));
+    if thumbnail_count == 0 {
+        return Vec::new();
     }
 
-    if tasks.is_empty() || thumbnail_count == 0 {
+    let buffer = (thumbnail_count / 4).max(2); // small safety margin
+    let max_tasks = thumbnail_count.saturating_add(buffer);
+
+    if moments.len() >= thumbnail_count {
+        for (i, m) in moments.iter().take(thumbnail_count).enumerate() {
+            let center = m.center_seconds.max(0.0).min(last_frame_ts);
+            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{sec:.0}.jpg", sec = center));
+            tasks.push((out_path, center));
+        }
+    } else {
+        for (i, m) in moments.iter().enumerate() {
+            if tasks.len() >= max_tasks {
+                break;
+            }
+            let center = m.center_seconds.max(0.0).min(last_frame_ts);
+            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{sec:.0}.jpg", sec = center));
+            tasks.push((out_path, center));
+
+            if tasks.len() >= max_tasks {
+                break;
+            }
+            let alt = (center + (window / 2.0)).min(last_frame_ts);
+            let out_path2 = thumbs_dir.join(format!("thumb_{i:02}_alt_{sec:.0}.jpg", sec = alt));
+            tasks.push((out_path2, alt));
+        }
+    }
+
+    if tasks.is_empty() {
         return Vec::new();
     }
 

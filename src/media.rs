@@ -353,14 +353,17 @@ pub async fn screenshot_jpeg(
     let status = Command::new(ffmpeg)
         .arg("-y")
         .args(["-hide_banner", "-loglevel", "error", "-nostats"])
+        // Reduce startup overhead and avoid probing/decoding non-video streams.
+        .args(["-an", "-sn", "-dn"])
+        .args(["-probesize", "32k", "-analyzeduration", "0"])
         .args(["-ss", &ts])
         .arg("-i")
         .arg(video_path)
         .args(["-frames:v", "1"])
         // Faster thumbnails: optional downscale + cheaper pixel format.
-        // -q:v: lower is higher quality; 3 is usually plenty for selecting a good frame.
+        // -q:v: lower is higher quality; 1 is near-lossless JPEG.
         .args(["-vf", &vf])
-        .args(["-q:v", "3"])
+        .args(["-q:v", "1"])
         .arg(out_path)
         .status()
         .await

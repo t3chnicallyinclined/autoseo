@@ -343,14 +343,19 @@ async fn run_once(
             .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
             .await?;
 
-        pb_thumbs.set_message("LLM (seo)");
-        let seo = ai.seo_package(&transcript.full_text).await?;
-
-        pb_thumbs.set_message("LLM (thumbs)");
-        let moments = ai
-            .thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
-            .await
-            .unwrap_or_default();
+        pb_thumbs.set_message("LLM (seo+thumbs)");
+        let (seo_res, moments_res) = tokio::join!(
+            ai.seo_package(&transcript.full_text),
+            ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
+        );
+        let seo = seo_res?;
+        let moments = match moments_res {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "thumbnail moment selection failed; continuing without moments");
+                Vec::new()
+            }
+        };
 
         let mut attachments = Vec::new();
 
@@ -559,14 +564,19 @@ async fn run_local_once(
         .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
         .await?;
 
-    pb_thumbs.set_message("LLM (seo)");
-    let seo = ai.seo_package(&transcript.full_text).await?;
-
-    pb_thumbs.set_message("LLM (thumbs)");
-    let moments = ai
-        .thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
-        .await
-        .unwrap_or_default();
+    pb_thumbs.set_message("LLM (seo+thumbs)");
+    let (seo_res, moments_res) = tokio::join!(
+        ai.seo_package(&transcript.full_text),
+        ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
+    );
+    let seo = seo_res?;
+    let moments = match moments_res {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "thumbnail moment selection failed; continuing without moments");
+            Vec::new()
+        }
+    };
 
     let mut attachments = Vec::new();
     if is_video {

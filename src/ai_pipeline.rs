@@ -148,37 +148,31 @@ impl AiPipeline {
         })
     }
 
-    pub async fn seo_package(&self, transcript_text: &str) -> anyhow::Result<SeoPackage> {
+    pub async fn seo_variant_text(
+        &self,
+        transcript_text: &str,
+        variant_instructions: &str,
+        variant_index: usize,
+        variant_total: usize,
+    ) -> anyhow::Result<String> {
         // Keep prompts bounded.
         let transcript_text = clamp_chars(transcript_text, 120_000);
 
         let system = self.seo_system_prompt.as_str();
-        let user = self
+        let mut user = self
             .seo_user_prompt_template
-            .replace("{{transcript}}", &transcript_text);
+            .replace("{{transcript}}", transcript_text.as_str());
 
-        let json = self
+        user = user
+            .replace("{{variant_instructions}}", variant_instructions)
+            .replace("{{variant_index}}", &(variant_index + 1).to_string())
+            .replace("{{variant_total}}", &variant_total.to_string());
+
+        let text = self
             .openai
-            .chat_json(&self.chat_model, system, &user)
+            .chat_text(&self.chat_model, system, &user)
             .await?;
-        let mut pkg: SeoPackage = serde_json::from_value(json).context("parse SEO package JSON")?;
-
-        // Normalize and enforce constraints.
-        pkg.hashtags = pkg
-            .hashtags
-            .into_iter()
-            .map(|h| h.trim().trim_start_matches('#').to_string())
-            .filter(|h| !h.is_empty())
-            .collect();
-        pkg.hashtags.sort();
-        pkg.hashtags.dedup();
-
-        pkg.tags_csv = pkg.tags_csv.trim().to_string();
-        if pkg.tags_csv.chars().count() > 500 {
-            pkg.tags_csv = pkg.tags_csv.chars().take(500).collect();
-        }
-
-        Ok(pkg)
+        Ok(text.trim().to_string())
     }
 
     pub async fn thumbnail_windows(
@@ -221,13 +215,7 @@ impl AiPipeline {
                 .iter()
                 .map(|s| s.end.max(s.start))
                 .fold(0.0_f64, |a, b| a.max(b))
-                .max(
-                    segments
-                        .last()
-                        .map(|s| s.start)
-                        .unwrap_or(0.0)
-                        .max(0.0),
-                );
+                .max(segments.last().map(|s| s.start).unwrap_or(0.0).max(0.0));
 
             // Avoid placing filler right at EOF.
             let last_ts = (approx_duration - 0.25).max(0.0);
@@ -254,7 +242,11 @@ impl AiPipeline {
         }
 
         // Deduplicate near-identical timestamps (keep earliest), then truncate.
-        out.sort_by(|a, b| a.center_seconds.partial_cmp(&b.center_seconds).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            a.center_seconds
+                .partial_cmp(&b.center_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.dedup_by(|a, b| (a.center_seconds - b.center_seconds).abs() < 0.25);
         out.truncate(count);
         Ok(out)
@@ -346,13 +338,6 @@ fn minute_index(segments: &[TranscriptSegment], max_minutes: usize) -> String {
         ));
     }
     out
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SeoPackage {
-    pub description: String,
-    pub hashtags: Vec<String>,
-    pub tags_csv: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -64,9 +64,15 @@ impl DriveClient {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
-        let mut file = tokio::fs::File::create(dest)
+        let file_name = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("dest missing filename")?;
+        let tmp = dest.with_file_name(format!("{file_name}.partial"));
+
+        let mut file = tokio::fs::File::create(&tmp)
             .await
-            .with_context(|| format!("create {}", dest.display()))?;
+            .with_context(|| format!("create {}", tmp.display()))?;
 
         let mut stream = res.bytes_stream();
         use tokio::io::AsyncWriteExt;
@@ -74,7 +80,15 @@ impl DriveClient {
             let chunk = chunk.context("download stream chunk")?;
             file.write_all(&chunk).await?;
         }
+
         file.flush().await.ok();
+        file.sync_all().await.ok();
+
+        // Replace destination atomically (best-effort remove first for non-POSIX filesystems).
+        let _ = tokio::fs::remove_file(dest).await;
+        tokio::fs::rename(&tmp, dest)
+            .await
+            .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
         Ok(())
     }
 }

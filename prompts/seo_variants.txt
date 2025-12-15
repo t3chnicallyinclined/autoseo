@@ -1,0 +1,31 @@
+# SEO VARIANTS (edit freely)
+#
+# This file is read by the app to generate multiple *distinct* SEO packages per video.
+# Provide one variant instruction block per package.
+# Separate blocks with a line containing only: ---
+#
+# These instructions are appended into the SEO user prompt via {{variant_instructions}}.
+
+Variant 1 (Browse/Suggested-first):
+- Optimize for curiosity + CTR in Browse/Suggested.
+- Lead with the most clickable premise (without inventing facts).
+- Emphasize the single funniest/most surprising thread as the “promise”.
+- Titles: 5 options, 1 clearly best (label it).
+- Thumbnail text: 5 short options (no “hate”, no slurs, algorithm-safe).
+
+---
+
+Variant 2 (Search/Keyword-first):
+- Optimize for Search discoverability.
+- Use the most important real names/segments/topics ONLY if explicitly present in the transcript.
+- Titles: 5 options, more literal and searchable.
+- Description: keyword-rich but still natural and funny.
+- Tags: prioritize broad-to-specific discoverability.
+
+---
+
+Variant 3 (Retention/Structure-first):
+- Optimize for retention and “promise/payoff” clarity.
+- Make the description skimmable with strong topic anchors.
+- Titles: 5 options that imply a clear arc.
+- Highlight why the clip is worth watching to the end.

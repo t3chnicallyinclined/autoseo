@@ -1,6 +1,6 @@
 Podcast context:
 - Show: The Fighter and The Kid (TFATK)
-- Hosts: Brendan Schaub, Bryan Callen
+- Hosts: Brendan Schaub, Bryan Callen 
 - Format: longform comedy podcast episode (banter + guest convo + bits)
 - Goal: maximize YouTube browse/suggested CTR + search discoverability without inventing facts.
 
@@ -14,29 +14,23 @@ Transcript:
 
 {{transcript}}
 
-Task:
-Create an SEO package for YouTube.
+Variant guidance (make this version meaningfully different from other variants):
+{{variant_instructions}}
 
-Return JSON with keys:
-- description (string)
-- hashtags (array of strings without #)
-- tags_csv (comma-separated string, max 500 characters)
+Task:
+Create ONE complete, ready-to-upload YouTube SEO package for THIS variant ({{variant_index}}/{{variant_total}}).
+
+Output format:
+- Return plain text only (no JSON, no markdown fences).
+- Use the exact section structure and vibe shown in prompts/example_response.txt:
+	- 🎬 CLIP TITLE OPTIONS (5)
+	- 🎨 THUMBNAIL TEXT OPTIONS (5)
+	- 📝 FULL SEO DESCRIPTION (based only on transcript)
+	- 🔎 TAGS (comma-separated; keep under 500 chars)
+	- #️⃣ HASHTAGS (single line)
 
 Constraints:
-1) description:
-- First 2 lines: high-CTR hook + clear premise + guest/topic ONLY if clearly present.
-- Then 5–8 bullets highlighting the funniest + most searchable beats/topics (keep them general enough to avoid invented specifics).
-- Tone: confident, funny, not cringe. Avoid filler like "In this video...".
-- Do NOT add extra specificity (places, product models, conspiracies, allegations) unless the transcript clearly contains it.
-
-2) hashtags:
-- 10–18 items.
-- lowercase, no leading "#", no duplicates.
-- Include show/host/topic/guest terms only if present in transcript.
-
-3) tags_csv:
-- comma-separated, ordered by importance.
-- HARD LIMIT: <= 500 characters total.
-- Include broad + mid-tail + specific terms (guest names, bits, topics) only if present.
-
-Return ONLY valid JSON. No markdown. No extra keys.
+- Faithful to transcript: do not invent names, guests, shows, events, claims.
+- If unsure about a detail, omit it or generalize.
+- Avoid unsafe/defamatory language unless clearly present in transcript.
+- Make this variant genuinely different in hook/angle/keyword emphasis from other variants.

@@ -14,9 +14,10 @@ mod thumbs;
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
+use futures_util::future::try_join_all;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use ai_pipeline::AiPipeline;
+use ai_pipeline::{AiPipeline, ThumbnailMoment};
 use config::Config;
 use dedupe::FileBackedDedupe;
 use drive::DriveClient;
@@ -41,8 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let drive = DriveClient::new();
     let mut dedupe = FileBackedDedupe::load(&cfg.dedupe_file).await?;
 
-    let ai = if cfg.dry_run {
-        None
+    let (ai, seo_variant_blocks) = if cfg.dry_run {
+        (None, Vec::new())
     } else {
         let api_key = cfg
             .openai_api_key
@@ -85,26 +86,57 @@ async fn main() -> anyhow::Result<()> {
                 .trim()
                 .to_string();
 
-        Some(AiPipeline::new(
-            openai,
-            cfg.openai_stt_model.clone(),
-            cfg.openai_chat_model.clone(),
-            cfg.stt_concurrency,
-            cfg.stt_rpm_limit,
-            seo_system_prompt,
-            thumbnail_system_prompt,
-            seo_user_prompt_template,
-            thumbnail_user_prompt_template,
-        ))
+        let variants_raw = tokio::fs::read_to_string(&cfg.seo_variants_prompt_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "read seo variants prompt at {}",
+                    &cfg.seo_variants_prompt_path
+                )
+            })?;
+        let seo_variant_blocks = parse_variants_prompt_file(&variants_raw);
+
+        (
+            Some(AiPipeline::new(
+                openai,
+                cfg.openai_stt_model.clone(),
+                cfg.openai_chat_model.clone(),
+                cfg.stt_concurrency,
+                cfg.stt_rpm_limit,
+                seo_system_prompt,
+                thumbnail_system_prompt,
+                seo_user_prompt_template,
+                thumbnail_user_prompt_template,
+            )),
+            seo_variant_blocks,
+        )
     };
 
     if let Some(local_path) = cfg.local_video_path.as_deref() {
-        run_local_once(&cfg, &google, &gmail, ai.as_ref(), local_path).await?;
+        run_local_once(
+            &cfg,
+            &google,
+            &gmail,
+            ai.as_ref(),
+            local_path,
+            &seo_variant_blocks,
+        )
+        .await?;
         return Ok(());
     }
 
     loop {
-        if let Err(e) = run_once(&cfg, &google, &gmail, &drive, ai.as_ref(), &mut dedupe).await {
+        if let Err(e) = run_once(
+            &cfg,
+            &google,
+            &gmail,
+            &drive,
+            ai.as_ref(),
+            &mut dedupe,
+            &seo_variant_blocks,
+        )
+        .await
+        {
             tracing::error!(error = ?e, "run_once failed");
         }
 
@@ -124,6 +156,7 @@ async fn run_once(
     drive: &DriveClient,
     ai: Option<&AiPipeline>,
     dedupe: &mut FileBackedDedupe,
+    seo_variant_blocks: &[String],
 ) -> anyhow::Result<()> {
     let access_token = google.access_token().await?;
 
@@ -239,7 +272,35 @@ async fn run_once(
         tokio::fs::create_dir_all(&job_dir).await.ok();
 
         let video_path = job_dir.join(&meta.name);
-        if !video_path.exists() {
+        let expected_size_bytes = meta
+            .size
+            .as_deref()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+
+        let need_download = match tokio::fs::metadata(&video_path).await {
+            Ok(m) => {
+                let actual = m.len();
+                match expected_size_bytes {
+                    Some(expected) if expected > 0 => {
+                        if actual == expected {
+                            false
+                        } else {
+                            tracing::warn!(
+                                dest=%video_path.display(),
+                                actual_bytes=actual,
+                                expected_bytes=expected,
+                                "existing file size mismatch; re-downloading"
+                            );
+                            true
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            Err(_) => true,
+        };
+
+        if need_download {
             tracing::info!(dest=%video_path.display(), "downloading video from drive");
             drive
                 .download_to_path(&access_token, file_id, &video_path)
@@ -343,17 +404,28 @@ async fn run_once(
             .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
             .await?;
 
-        pb_thumbs.set_message("LLM (seo+thumbs)");
-        let (seo_res, moments_res) = tokio::join!(
-            ai.seo_package(&transcript.full_text),
+        let variant_total = cfg.seo_variants.max(1);
+        let selected_variant_instructions: Vec<String> = (0..variant_total)
+            .map(|i| select_variant_instructions(seo_variant_blocks, i))
+            .collect();
+
+        pb_thumbs.set_message("LLM (seo variants + thumbs)");
+        let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
+            |(i, inst)| ai.seo_variant_text(&transcript.full_text, inst.as_str(), i, variant_total),
+        ));
+
+        let (seo_texts_res, moments_res) = tokio::join!(
+            seo_fut,
             ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
         );
-        let seo = seo_res?;
+        let seo_texts = seo_texts_res?;
+
         let moments = match moments_res {
-            Ok(m) => m,
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
             Err(e) => {
-                tracing::warn!(error = %e, "thumbnail moment selection failed; continuing without moments");
-                Vec::new()
+                tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
+                fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
             }
         };
 
@@ -379,7 +451,7 @@ async fn run_once(
             .await;
         }
 
-        let subject = if attachments.is_empty() {
+        let subject_base = if attachments.is_empty() {
             format!("{} SEO package: {}", cfg.result_subject_prefix, meta.name)
         } else {
             format!(
@@ -388,42 +460,20 @@ async fn run_once(
             )
         };
 
-        let mut body = format!(
-            "SEO DESCRIPTION:\n\n{}\n\nHASHTAGS:\n{}\n\nTAGS (<=500 chars, comma-separated):\n{}\n\n",
-            seo.description.trim(),
-            seo.hashtags
-                .iter()
-                .map(|h| format!("#{}", h))
-                .collect::<Vec<_>>()
-                .join(" "),
-            seo.tags_csv.trim()
-        );
-
-        if !moments.is_empty() {
-            body.push_str("THUMBNAIL-WORTHY MOMENTS (timestamps):\n");
-            for m in &moments {
-                body.push_str(&format!(
-                    "- {} — {}\n",
-                    format_hhmmss(m.center_seconds),
-                    m.reason.trim()
-                ));
-            }
-            body.push('\n');
+        for (i, body) in seo_texts.iter().enumerate() {
+            let subject = format!("{subject_base} ({}/{})", i + 1, variant_total);
+            let raw_mime = build_mime_email("me", result_to, &subject, body, &attachments);
+            let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
+            let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
+            tracing::info!(
+                sent_message_id,
+                variant = i + 1,
+                variants = variant_total,
+                "sent result email"
+            );
         }
 
-        if attachments.is_empty() && is_video {
-            body.push_str("NOTE: No thumbnails attached (ffmpeg/screenshot failed).\n\n");
-        } else if attachments.is_empty() && !is_video {
-            body.push_str("NOTE: No thumbnails attached (input is not a video).\n\n");
-        }
-
-        // Gmail API will set the From based on authenticated user, but RFC headers still help.
-        let raw_mime = build_mime_email("me", result_to, &subject, &body, &attachments);
-        let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
-        let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
-        tracing::info!(sent_message_id, "sent result email");
-
-        // Mark as processed.
+        // Mark as processed only after all variant emails are sent.
         dedupe.insert(message_id).await?;
         tracing::info!("done");
 
@@ -440,6 +490,7 @@ async fn run_local_once(
     gmail: &GmailClient,
     ai: Option<&AiPipeline>,
     local_path: &str,
+    seo_variant_blocks: &[String],
 ) -> anyhow::Result<()> {
     let ai = ai.ok_or_else(|| anyhow::anyhow!("AI pipeline not configured"))?;
     let result_to = cfg
@@ -485,7 +536,11 @@ async fn run_local_once(
             .await
             .context("wav duration")?;
         let chunk_secs = choose_chunk_secs(cfg, Some(total_duration));
-        tracing::info!(total_secs = total_duration, chunk_secs, "chunk sizing (wav)");
+        tracing::info!(
+            total_secs = total_duration,
+            chunk_secs,
+            "chunk sizing (wav)"
+        );
 
         let chunks_dir = job_dir.join("audio_chunks");
         clear_chunk_dir(&chunks_dir).await.ok();
@@ -518,11 +573,16 @@ async fn run_local_once(
             .await
             .with_context(|| format!("ffprobe duration for {}", audio_path.display()))?;
         let chunk_secs = choose_chunk_secs(cfg, Some(total_duration));
-        tracing::info!(total_secs = total_duration, chunk_secs, "chunk sizing (video)");
+        tracing::info!(
+            total_secs = total_duration,
+            chunk_secs,
+            "chunk sizing (video)"
+        );
 
         let chunks_dir = job_dir.join("audio_chunks");
         clear_chunk_dir(&chunks_dir).await.ok();
-        let chunk_paths = media::segment_audio(&cfg.ffmpeg, &audio_path, &chunks_dir, chunk_secs).await?;
+        let chunk_paths =
+            media::segment_audio(&cfg.ffmpeg, &audio_path, &chunks_dir, chunk_secs).await?;
         if chunk_paths.is_empty() {
             anyhow::bail!("no audio chunks produced");
         }
@@ -564,17 +624,28 @@ async fn run_local_once(
         .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
         .await?;
 
-    pb_thumbs.set_message("LLM (seo+thumbs)");
-    let (seo_res, moments_res) = tokio::join!(
-        ai.seo_package(&transcript.full_text),
+    let variant_total = cfg.seo_variants.max(1);
+    let selected_variant_instructions: Vec<String> = (0..variant_total)
+        .map(|i| select_variant_instructions(seo_variant_blocks, i))
+        .collect();
+
+    pb_thumbs.set_message("LLM (seo variants + thumbs)");
+    let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
+        |(i, inst)| ai.seo_variant_text(&transcript.full_text, inst.as_str(), i, variant_total),
+    ));
+
+    let (seo_texts_res, moments_res) = tokio::join!(
+        seo_fut,
         ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
     );
-    let seo = seo_res?;
+    let seo_texts = seo_texts_res?;
+
     let moments = match moments_res {
-        Ok(m) => m,
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
         Err(e) => {
-            tracing::warn!(error = %e, "thumbnail moment selection failed; continuing without moments");
-            Vec::new()
+            tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
+            fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
         }
     };
 
@@ -598,7 +669,8 @@ async fn run_local_once(
         .await;
     }
 
-    let subject = if attachments.is_empty() {
+    let access_token = google.access_token().await?;
+    let subject_base = if attachments.is_empty() {
         format!("{} SEO package: {}", cfg.result_subject_prefix, file_name)
     } else {
         format!(
@@ -607,41 +679,68 @@ async fn run_local_once(
         )
     };
 
-    let mut body = format!(
-        "SEO DESCRIPTION:\n\n{}\n\nHASHTAGS:\n{}\n\nTAGS (<=500 chars, comma-separated):\n{}\n\n",
-        seo.description.trim(),
-        seo.hashtags
-            .iter()
-            .map(|h| format!("#{}", h))
-            .collect::<Vec<_>>()
-            .join(" "),
-        seo.tags_csv.trim()
-    );
-
-    if !moments.is_empty() {
-        body.push_str("THUMBNAIL-WORTHY MOMENTS (timestamps):\n");
-        for m in &moments {
-            body.push_str(&format!(
-                "- {} — {}\n",
-                format_hhmmss(m.center_seconds),
-                m.reason.trim()
-            ));
-        }
-        body.push('\n');
+    for (i, body) in seo_texts.iter().enumerate() {
+        let subject = format!("{subject_base} ({}/{})", i + 1, variant_total);
+        let raw_mime = build_mime_email("me", result_to, &subject, body, &attachments);
+        let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
+        let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
+        tracing::info!(
+            sent_message_id,
+            variant = i + 1,
+            variants = variant_total,
+            "sent result email (local)"
+        );
     }
 
-    if attachments.is_empty() && is_video {
-        body.push_str("NOTE: No thumbnails attached (ffmpeg/screenshot failed).\n\n");
-    } else if attachments.is_empty() && !is_video {
-        body.push_str("NOTE: No thumbnails attached (input is not a video).\n\n");
-    }
-
-    let access_token = google.access_token().await?;
-    let raw_mime = build_mime_email("me", result_to, &subject, &body, &attachments);
-    let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
-    let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
-    tracing::info!(sent_message_id, "sent result email (local)");
     Ok(())
+}
+
+fn parse_variants_prompt_file(s: &str) -> Vec<String> {
+    s.split("\n---\n")
+        .map(|block| {
+            let mut lines = block.lines();
+            // Drop leading empty/comment lines to avoid leaking header comments into the first variant.
+            while let Some(line) = lines.clone().next() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    lines.next();
+                    continue;
+                }
+                break;
+            }
+            lines.collect::<Vec<_>>().join("\n").trim().to_string()
+        })
+        .filter(|b| !b.trim().is_empty())
+        .collect()
+}
+
+fn select_variant_instructions(blocks: &[String], idx: usize) -> String {
+    if blocks.is_empty() {
+        return String::new();
+    }
+    blocks[idx % blocks.len()].trim().to_string()
+}
+
+fn fallback_thumbnail_moments(slots: usize, total_duration_secs: f64) -> Vec<ThumbnailMoment> {
+    let n = slots.max(1);
+    let total = total_duration_secs.max(0.0);
+    let eof_epsilon_secs = 0.25;
+    let last_ts = if total.is_finite() && total > 0.0 {
+        (total - eof_epsilon_secs).max(0.0)
+    } else {
+        0.0
+    };
+
+    (0..n)
+        .map(|i| {
+            let frac = (i as f64 + 1.0) / (n as f64 + 1.0);
+            let ts = (total * frac).max(0.0).min(last_ts);
+            ThumbnailMoment {
+                center_seconds: ts,
+                reason: "fallback".to_string(),
+            }
+        })
+        .collect()
 }
 
 async fn ensure_tool_available(cmd: &str, label: &str) -> anyhow::Result<()> {
@@ -720,22 +819,6 @@ fn choose_chunk_secs(cfg: &Config, total_duration: Option<f64>) -> u64 {
     }
 
     chunk as u64
-}
-
-fn format_hhmmss(secs: f64) -> String {
-    let mut s = secs;
-    if !s.is_finite() || s < 0.0 {
-        s = 0.0;
-    }
-    let total = s.floor() as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let sec = total % 60;
-    if h > 0 {
-        format!("{h:02}:{m:02}:{sec:02}")
-    } else {
-        format!("{m:02}:{sec:02}")
-    }
 }
 
 async fn dump_failed_message(

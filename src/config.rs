@@ -117,7 +117,7 @@ pub struct Config {
 
     /// Maximum thumbnail height in pixels (preserve aspect ratio). Set 0 to disable scaling.
     /// Lower values are faster to generate and smaller to email.
-    #[arg(long, env = "THUMBNAIL_MAX_HEIGHT", default_value_t = 720)]
+    #[arg(long, env = "THUMBNAIL_MAX_HEIGHT", default_value_t = 1080)]
     pub thumbnail_max_height: u32,
 
     /// OpenAI-compatible base URL (no trailing slash), e.g. https://api.openai.com
@@ -160,6 +160,19 @@ pub struct Config {
         default_value = "./prompts/seo_user.txt"
     )]
     pub seo_user_prompt_path: String,
+
+    /// Number of distinct SEO variants to generate per video.
+    #[arg(long, env = "SEO_VARIANTS", default_value_t = 3)]
+    pub seo_variants: usize,
+
+    /// Path to the SEO variants prompt file.
+    /// Suggested format: variant blocks separated by a line containing only `---`.
+    #[arg(
+        long,
+        env = "SEO_VARIANTS_PROMPT_PATH",
+        default_value = "./prompts/seo_variants.txt"
+    )]
+    pub seo_variants_prompt_path: String,
 
     /// Path to the thumbnail-selection system prompt text file.
     #[arg(

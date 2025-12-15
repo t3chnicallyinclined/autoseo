@@ -344,10 +344,12 @@ pub async fn screenshot_jpeg(
     // If max_height is set, downscale while preserving aspect ratio.
     // Use -2 to ensure even width for yuv420-based pixel formats.
     let vf = if max_height > 0 {
-        format!("scale=-2:{max_height},format=yuvj420p")
+        // High-quality downscale when requested.
+        format!("scale=-2:{max_height}:flags=lanczos,format=yuvj420p")
     } else {
-        // Keep original size; still keep a broadly compatible JPEG format.
-        "scale=iw:ih:flags=bicubic,format=yuvj420p".to_string()
+        // Truly no-resample: keep original size.
+        // Prefer 4:4:4 JPEG for maximum fidelity; Gmail/clients generally render it fine.
+        "format=yuvj444p".to_string()
     };
 
     let status = Command::new(ffmpeg)

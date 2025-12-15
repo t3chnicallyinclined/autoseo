@@ -243,6 +243,65 @@ impl OpenAiClient {
         Ok(serde_json::from_str(&content).context("chat content was not JSON")?)
     }
 
+    pub async fn chat_text(&self, model: &str, system: &str, user: &str) -> anyhow::Result<String> {
+        // gpt-5.* (and some other newer models) are served via the Responses API, not chat.
+        if model.starts_with("gpt-5") {
+            return self
+                .responses_text(model, system, user)
+                .await
+                .with_context(|| format!("/v1/responses model={model}"));
+        }
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user.to_string(),
+                },
+            ],
+            response_format: None,
+            temperature: Some(0.7),
+        };
+
+        let res = self
+            .post_json_with_retry(&url, &body, "POST /v1/chat/completions")
+            .await?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            if status.as_u16() == 404
+                && (body.contains("not a chat model")
+                    || body.contains("v1/chat/completions")
+                    || body.contains("Did you mean to use v1/responses")
+                    || body.contains("Did you mean to use v1/completions"))
+            {
+                return self
+                    .responses_text(model, system, user)
+                    .await
+                    .with_context(|| format!("fallback /v1/responses model={model}"));
+            }
+
+            anyhow::bail!("chat failed: {status} {body}");
+        }
+
+        let parsed: ChatResponse = res.json().await.context("parse chat response")?;
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .context("missing chat content")?;
+
+        Ok(content)
+    }
+
     async fn responses_json(
         &self,
         model: &str,
@@ -292,6 +351,51 @@ impl OpenAiClient {
         Ok(serde_json::from_str(&text).context("responses content was not JSON")?)
     }
 
+    async fn responses_text(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/v1/responses", self.base_url);
+        let allow_temperature = !model.starts_with("gpt-5");
+        let body = ResponsesRequest {
+            model: model.to_string(),
+            input: vec![
+                ResponsesInputMessage {
+                    role: "system".to_string(),
+                    content: vec![ResponsesInputContent::InputText {
+                        text: system.to_string(),
+                    }],
+                },
+                ResponsesInputMessage {
+                    role: "user".to_string(),
+                    content: vec![ResponsesInputContent::InputText {
+                        text: user.to_string(),
+                    }],
+                },
+            ],
+            // No enforced JSON format.
+            text: None,
+            temperature: if allow_temperature { Some(0.7) } else { None },
+        };
+
+        let res = self
+            .post_json_with_retry(&url, &body, "POST /v1/responses")
+            .await?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("responses failed: {status} {body}");
+        }
+
+        let parsed: ResponsesResponse = res.json().await.context("parse responses response")?;
+        parsed
+            .output_text()
+            .context("missing responses output_text")
+    }
+
     async fn post_json_with_retry<T: Serialize + ?Sized>(
         &self,
         url: &str,
@@ -304,11 +408,7 @@ impl OpenAiClient {
         let mut backoff = Duration::from_millis(400);
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let res = self
-                .auth(self.http.post(url))
-                .json(body)
-                .send()
-                .await;
+            let res = self.auth(self.http.post(url)).json(body).send().await;
 
             match res {
                 Ok(r) => {
@@ -317,10 +417,7 @@ impl OpenAiClient {
                         return Ok(r);
                     }
 
-                    let retryable = matches!(
-                        status.as_u16(),
-                        429 | 500 | 502 | 503 | 504
-                    );
+                    let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
 
                     if retryable && attempt < MAX_ATTEMPTS {
                         let body_text = r.text().await.unwrap_or_default();

@@ -31,6 +31,40 @@ pub async fn extract_audio_m4a(
     Ok(())
 }
 
+pub async fn transcode_audio_to_m4a(
+    ffmpeg: &str,
+    input_audio_path: &std::path::Path,
+    audio_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = audio_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    // Transcode arbitrary audio into a low-bitrate mono track; good enough for STT and cheap to upload.
+    let status = Command::new(ffmpeg)
+        .arg("-y")
+        .args(["-hide_banner", "-loglevel", "error", "-nostats"])
+        .arg("-i")
+        .arg(input_audio_path)
+        .args(["-ac", "1", "-ar", "16000"])
+        .args(["-c:a", "aac", "-b:a", "32k"])
+        .arg(audio_path)
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "run ffmpeg transcode audio from {}",
+                input_audio_path.display()
+            )
+        })?;
+
+    if !status.success() {
+        anyhow::bail!("ffmpeg audio transcode failed (exit {status})");
+    }
+
+    Ok(())
+}
+
 pub async fn segment_audio(
     ffmpeg: &str,
     audio_path: &std::path::Path,

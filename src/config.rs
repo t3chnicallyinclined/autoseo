@@ -28,9 +28,9 @@ pub struct Config {
     #[arg(long, env = "GMAIL_MAX_RESULTS", default_value_t = 10)]
     pub gmail_max_results: u32,
 
-    /// If set, only process Drive files that look like videos (mimeType starts with video/ or name ends with .mp4).
-    /// Non-video Drive files are skipped and we continue scanning messages.
-    #[arg(long, env = "REQUIRE_VIDEO", default_value_t = true)]
+    /// If set, only process Drive files that look like videos (mimeType starts with video/ or common video extensions).
+    /// When false, audio files (e.g. mp3/m4a/wav) are also accepted.
+    #[arg(long, env = "REQUIRE_VIDEO", default_value_t = false)]
     pub require_video: bool,
 
     /// If set, run a single poll cycle and exit.

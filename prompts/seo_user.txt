@@ -1,15 +1,3 @@
-Podcast context:
-- Show: The Fighter and The Kid (TFATK)
-- Hosts: Brendan Schaub, Bryan Callen 
-- Format: longform comedy podcast episode (banter + guest convo + bits)
-- Goal: maximize YouTube browse/suggested CTR + search discoverability without inventing facts.
-
-HARD RULE (anti-hallucination):
-- Only mention/tag people, podcasts, brands, or communities if they are explicitly present in the transcript.
-- Only include bullets that are clearly supported by the transcript.
-- If you are unsure about a name/detail, omit it.
-- Prefer general, non-committal phrasing that stays accurate (e.g., "they riff on X", "they debate Y").
-
 Transcript:
 
 {{transcript}}
@@ -17,15 +5,14 @@ Transcript:
 Variant guidance (make this version meaningfully different from other variants):
 {{variant_instructions}}
 
-Task:
-Create ONE complete, ready-to-upload YouTube SEO package for THIS variant ({{variant_index}}/{{variant_total}}).
+Task: Please give me a full seo package for {{show_name}} ready for YouTube and for THIS variant ({{variant_index}}/{{variant_total}}).
 
 Output format:
-- Return plain text only (no JSON, no markdown fences).
+
 - Use the exact section structure and vibe shown in prompts/example_response.txt:
+	- 📝 FULL SEO RICH DESCRIPTION (2-5 paragraphs based only on transcript)
 	- 🎬 CLIP TITLE OPTIONS (5)
 	- 🎨 THUMBNAIL TEXT OPTIONS (5)
-	- 📝 FULL SEO DESCRIPTION (based only on transcript)
 	- 🔎 TAGS (comma-separated; keep under 500 chars)
 	- #️⃣ HASHTAGS (single line)
 

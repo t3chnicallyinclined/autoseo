@@ -26,12 +26,21 @@ use google_auth::GoogleAuth;
 use mime::build_mime_email;
 use openai::OpenAiClient;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Ensure we always get useful logs in Docker (even if RUST_LOG is unset/invalid).
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cfg = Config::parse();
+
+    // Print a minimal startup banner to stdout so `docker logs` is never empty.
+    println!(
+        "autoseo starting (poll_interval_secs={}, require_video={}, work_dir={}, dedupe_file={})",
+        cfg.poll_interval_secs, cfg.require_video, cfg.work_dir, cfg.dedupe_file
+    );
 
     let google = GoogleAuth::new(
         cfg.google_client_id.clone(),
@@ -241,12 +250,32 @@ async fn run_once(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("RESULT_TO is required unless --dry-run"))?;
 
-        let is_wav = meta.mime_type.eq_ignore_ascii_case("audio/x-wav")
-            || meta.mime_type.eq_ignore_ascii_case("audio/wav")
-            || meta.name.to_lowercase().ends_with(".wav");
+        let name_lower = meta.name.to_lowercase();
+        let mime_lower = meta.mime_type.to_lowercase();
 
-        let is_video = meta.mime_type.to_lowercase().starts_with("video/")
-            || meta.name.to_lowercase().ends_with(".mp4");
+        let is_wav = mime_lower.eq("audio/x-wav")
+            || mime_lower.eq("audio/wav")
+            || name_lower.ends_with(".wav");
+
+        let is_audio = mime_lower.starts_with("audio/")
+            || name_lower.ends_with(".wav")
+            || name_lower.ends_with(".mp3")
+            || name_lower.ends_with(".m4a")
+            || name_lower.ends_with(".aac")
+            || name_lower.ends_with(".flac")
+            || name_lower.ends_with(".ogg")
+            || name_lower.ends_with(".opus")
+            || name_lower.ends_with(".wma")
+            || name_lower.ends_with(".aiff")
+            || name_lower.ends_with(".aif");
+
+        let is_video = mime_lower.starts_with("video/")
+            || name_lower.ends_with(".mp4")
+            || name_lower.ends_with(".mov")
+            || name_lower.ends_with(".mkv")
+            || name_lower.ends_with(".webm")
+            || name_lower.ends_with(".m4v")
+            || name_lower.ends_with(".avi");
 
         if cfg.require_video && !is_video {
             tracing::info!(
@@ -255,6 +284,18 @@ async fn run_once(
                 name = %meta.name,
                 mime_type = %meta.mime_type,
                 "skipping non-video drive file (require_video=true)"
+            );
+            dedupe.insert(message_id).await?;
+            continue;
+        }
+
+        if !is_video && !is_audio {
+            tracing::info!(
+                message_id,
+                file_id,
+                name = %meta.name,
+                mime_type = %meta.mime_type,
+                "skipping unrecognized media type (not audio/video)"
             );
             dedupe.insert(message_id).await?;
             continue;
@@ -301,7 +342,7 @@ async fn run_once(
         };
 
         if need_download {
-            tracing::info!(dest=%video_path.display(), "downloading video from drive");
+            tracing::info!(dest=%video_path.display(), "downloading media from drive");
             drive
                 .download_to_path(&access_token, file_id, &video_path)
                 .await?;
@@ -345,7 +386,11 @@ async fn run_once(
         } else {
             let audio_path = job_dir.join("audio.m4a");
             if !audio_path.exists() {
-                media::extract_audio_m4a(&cfg.ffmpeg, &video_path, &audio_path).await?;
+                if is_video {
+                    media::extract_audio_m4a(&cfg.ffmpeg, &video_path, &audio_path).await?;
+                } else {
+                    media::transcode_audio_to_m4a(&cfg.ffmpeg, &video_path, &audio_path).await?;
+                }
             }
 
             let total_duration = media::duration_secs(&cfg.ffprobe, &audio_path)
@@ -355,7 +400,7 @@ async fn run_once(
             tracing::info!(
                 total_secs = total_duration,
                 chunk_secs,
-                "chunk sizing (video)"
+                "chunk sizing (media)"
             );
 
             let chunks_dir = job_dir.join("audio_chunks");
@@ -404,29 +449,78 @@ async fn run_once(
             .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
             .await?;
 
+        let show_context = match ai
+            .infer_show_context(&meta.name, &transcript.full_text)
+            .await
+        {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                tracing::warn!(error = %e, name=%meta.name, "show inference failed; proceeding without show context");
+                None
+            }
+        };
+
+        if let Some(ctx) = show_context.as_ref() {
+            tracing::info!(
+                message_id,
+                media_name = %meta.name,
+                show_name = ?ctx.show_name,
+                hosts = ?ctx.hosts,
+                guest = ?ctx.guest,
+                "inferred show context"
+            );
+        } else {
+            tracing::info!(message_id, media_name = %meta.name, "no explicit show context inferred");
+        }
+
         let variant_total = cfg.seo_variants.max(1);
         let selected_variant_instructions: Vec<String> = (0..variant_total)
             .map(|i| select_variant_instructions(seo_variant_blocks, i))
             .collect();
 
-        pb_thumbs.set_message("LLM (seo variants + thumbs)");
+        if is_video {
+            pb_thumbs.set_message("LLM (seo variants + thumbs)");
+        } else {
+            pb_thumbs.set_message("LLM (seo variants)");
+        }
+
+        let transcript_text = std::sync::Arc::new(transcript.full_text.clone());
+        let media_name = meta.name.clone();
         let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
-            |(i, inst)| ai.seo_variant_text(&transcript.full_text, inst.as_str(), i, variant_total),
+            |(i, inst)| {
+                let show_context = show_context.clone();
+                let media_name = media_name.clone();
+                let transcript_text = transcript_text.clone();
+                async move {
+                    ai.seo_variant_text_with_context(
+                        transcript_text.as_str(),
+                        inst.as_str(),
+                        i,
+                        variant_total,
+                        show_context.as_ref(),
+                        Some(media_name.as_str()),
+                    )
+                    .await
+                }
+            },
         ));
 
-        let (seo_texts_res, moments_res) = tokio::join!(
-            seo_fut,
-            ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
-        );
-        let seo_texts = seo_texts_res?;
-
-        let moments = match moments_res {
-            Ok(m) if !m.is_empty() => m,
-            Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
-            Err(e) => {
-                tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
-                fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
-            }
+        let (seo_texts, moments) = if is_video {
+            let (seo_texts_res, moments_res) =
+                tokio::join!(seo_fut, ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+            let seo_texts = seo_texts_res?;
+            let moments = match moments_res {
+                Ok(m) if !m.is_empty() => m,
+                Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
+                Err(e) => {
+                    tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
+                    fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
+                }
+            };
+            (seo_texts, moments)
+        } else {
+            let seo_texts = seo_fut.await?;
+            (seo_texts, Vec::new())
         };
 
         let mut attachments = Vec::new();
@@ -451,13 +545,17 @@ async fn run_once(
             .await;
         }
 
-        let subject_base = if attachments.is_empty() {
-            format!("{} SEO package: {}", cfg.result_subject_prefix, meta.name)
+        let subject_base = if is_video {
+            if attachments.is_empty() {
+                format!("{} SEO package: {}", cfg.result_subject_prefix, meta.name)
+            } else {
+                format!(
+                    "{} SEO package + thumbnails: {}",
+                    cfg.result_subject_prefix, meta.name
+                )
+            }
         } else {
-            format!(
-                "{} SEO package + thumbnails: {}",
-                cfg.result_subject_prefix, meta.name
-            )
+            format!("{} SEO package (audio): {}", cfg.result_subject_prefix, meta.name)
         };
 
         for (i, body) in seo_texts.iter().enumerate() {
@@ -477,7 +575,7 @@ async fn run_once(
         dedupe.insert(message_id).await?;
         tracing::info!("done");
 
-        // MVP: only process the newest matching *video* message.
+        // MVP: only process the newest matching media message.
         break;
     }
 
@@ -509,8 +607,28 @@ async fn run_local_once(
         .unwrap_or("local_media")
         .to_string();
     let lower = file_name.to_lowercase();
+
     let is_wav = lower.ends_with(".wav");
-    let is_video = lower.ends_with(".mp4") || !is_wav;
+    let is_audio = is_wav
+        || lower.ends_with(".mp3")
+        || lower.ends_with(".m4a")
+        || lower.ends_with(".aac")
+        || lower.ends_with(".flac")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".opus")
+        || lower.ends_with(".wma")
+        || lower.ends_with(".aiff")
+        || lower.ends_with(".aif");
+    let is_video = lower.ends_with(".mp4")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".mkv")
+        || lower.ends_with(".webm")
+        || lower.ends_with(".m4v")
+        || lower.ends_with(".avi");
+
+    if !is_video && !is_audio {
+        anyhow::bail!("local input is not a recognized audio/video file: {file_name}");
+    }
 
     if cfg.require_video && !is_video {
         anyhow::bail!("local input is not treated as video and REQUIRE_VIDEO=true: {file_name}");
@@ -566,7 +684,11 @@ async fn run_local_once(
     } else {
         let audio_path = job_dir.join("audio.m4a");
         if !audio_path.exists() {
-            media::extract_audio_m4a(&cfg.ffmpeg, &input_path, &audio_path).await?;
+            if is_video {
+                media::extract_audio_m4a(&cfg.ffmpeg, &input_path, &audio_path).await?;
+            } else {
+                media::transcode_audio_to_m4a(&cfg.ffmpeg, &input_path, &audio_path).await?;
+            }
         }
 
         let total_duration = media::duration_secs(&cfg.ffprobe, &audio_path)
@@ -576,7 +698,7 @@ async fn run_local_once(
         tracing::info!(
             total_secs = total_duration,
             chunk_secs,
-            "chunk sizing (video)"
+            "chunk sizing (media)"
         );
 
         let chunks_dir = job_dir.join("audio_chunks");
@@ -624,29 +746,73 @@ async fn run_local_once(
         .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
         .await?;
 
+    let show_context = match ai.infer_show_context(&file_name, &transcript.full_text).await {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            tracing::warn!(error = %e, file_name=%file_name, "show inference failed; proceeding without show context");
+            None
+        }
+    };
+
+    if let Some(ctx) = show_context.as_ref() {
+        tracing::info!(
+            media_name = %file_name,
+            show_name = ?ctx.show_name,
+            hosts = ?ctx.hosts,
+            guest = ?ctx.guest,
+            "inferred show context"
+        );
+    } else {
+        tracing::info!(media_name = %file_name, "no explicit show context inferred");
+    }
+
     let variant_total = cfg.seo_variants.max(1);
     let selected_variant_instructions: Vec<String> = (0..variant_total)
         .map(|i| select_variant_instructions(seo_variant_blocks, i))
         .collect();
 
-    pb_thumbs.set_message("LLM (seo variants + thumbs)");
+    if is_video {
+        pb_thumbs.set_message("LLM (seo variants + thumbs)");
+    } else {
+        pb_thumbs.set_message("LLM (seo variants)");
+    }
+    let transcript_text = std::sync::Arc::new(transcript.full_text.clone());
+    let media_name = file_name.clone();
     let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
-        |(i, inst)| ai.seo_variant_text(&transcript.full_text, inst.as_str(), i, variant_total),
+        |(i, inst)| {
+            let show_context = show_context.clone();
+            let media_name = media_name.clone();
+            let transcript_text = transcript_text.clone();
+            async move {
+                ai.seo_variant_text_with_context(
+                    transcript_text.as_str(),
+                    inst.as_str(),
+                    i,
+                    variant_total,
+                    show_context.as_ref(),
+                    Some(media_name.as_str()),
+                )
+                .await
+            }
+        },
     ));
 
-    let (seo_texts_res, moments_res) = tokio::join!(
-        seo_fut,
-        ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
-    );
-    let seo_texts = seo_texts_res?;
-
-    let moments = match moments_res {
-        Ok(m) if !m.is_empty() => m,
-        Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
-        Err(e) => {
-            tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
-            fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
-        }
+    let (seo_texts, moments) = if is_video {
+        let (seo_texts_res, moments_res) =
+            tokio::join!(seo_fut, ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+        let seo_texts = seo_texts_res?;
+        let moments = match moments_res {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs),
+            Err(e) => {
+                tracing::warn!(error = %e, "thumbnail moment selection failed; using deterministic fallback moments");
+                fallback_thumbnail_moments(cfg.thumbnail_slots, total_duration_secs)
+            }
+        };
+        (seo_texts, moments)
+    } else {
+        let seo_texts = seo_fut.await?;
+        (seo_texts, Vec::new())
     };
 
     let mut attachments = Vec::new();
@@ -670,13 +836,17 @@ async fn run_local_once(
     }
 
     let access_token = google.access_token().await?;
-    let subject_base = if attachments.is_empty() {
-        format!("{} SEO package: {}", cfg.result_subject_prefix, file_name)
+    let subject_base = if is_video {
+        if attachments.is_empty() {
+            format!("{} SEO package: {}", cfg.result_subject_prefix, file_name)
+        } else {
+            format!(
+                "{} SEO package + thumbnails: {}",
+                cfg.result_subject_prefix, file_name
+            )
+        }
     } else {
-        format!(
-            "{} SEO package + thumbnails: {}",
-            cfg.result_subject_prefix, file_name
-        )
+        format!("{} SEO package (audio): {}", cfg.result_subject_prefix, file_name)
     };
 
     for (i, body) in seo_texts.iter().enumerate() {

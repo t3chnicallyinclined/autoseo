@@ -1,5 +1,5 @@
 Video type: longform comedy podcast.
-Show: The Fighter and The Kid (TFATK) — Brendan Schaub + Bryan Callen.
+Show: [Comedy Podcast].
 
 Pick {{count}} thumbnail moments from the time-indexed transcript.
 

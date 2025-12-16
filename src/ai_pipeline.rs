@@ -37,6 +37,26 @@ pub struct Transcript {
     pub segments: Vec<TranscriptSegment>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ShowContext {
+    /// Canonical show name if explicitly supported by evidence.
+    #[serde(default)]
+    pub show_name: Option<String>,
+
+    /// Host names if explicitly supported by evidence.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+
+    /// Primary guest name if explicitly supported by evidence.
+    #[serde(default)]
+    pub guest: Option<String>,
+
+    /// Short evidence snippet(s) or notes (optional).
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
 impl AiPipeline {
     pub fn new(
         openai: OpenAiClient,
@@ -148,12 +168,66 @@ impl AiPipeline {
         })
     }
 
-    pub async fn seo_variant_text(
+    pub async fn infer_show_context(
+        &self,
+        media_name: &str,
+        transcript_text: &str,
+    ) -> anyhow::Result<ShowContext> {
+        // Keep this cheap: use the filename and just the beginning of the transcript.
+        let transcript_head = clamp_chars(transcript_text, 18_000);
+
+        let system = r#"You extract show metadata from weak signals.
+
+Hard rules:
+- Only output a show name/host/guest if it is explicitly present in the provided filename or transcript snippet.
+- If not explicit, use null/empty.
+- Do NOT guess based on style, topic, or vibes.
+
+Return JSON only."#;
+
+        let user = format!(
+            r#"Media filename:
+{media_name}
+
+Transcript snippet (start of episode):
+{transcript_head}
+
+Task:
+Infer the podcast/show context ONLY if explicitly stated.
+
+Return JSON with this shape:
+{{
+  "show_name": string|null,
+  "hosts": string[],
+  "guest": string|null,
+  "evidence": string[]
+}}
+
+Rules:
+- evidence: 0-3 short quotes or notes showing where you found it (filename or transcript).
+- If you only see an acronym, you may return it as show_name ONLY if it appears verbatim.
+"#
+        );
+
+        let json = self
+            .openai
+            .chat_json(&self.chat_model, system, &user)
+            .await
+            .context("infer_show_context LLM call")?;
+
+        let parsed: ShowContext =
+            serde_json::from_value(json).context("parse infer_show_context JSON")?;
+        Ok(parsed)
+    }
+
+    pub async fn seo_variant_text_with_context(
         &self,
         transcript_text: &str,
         variant_instructions: &str,
         variant_index: usize,
         variant_total: usize,
+        show_context: Option<&ShowContext>,
+        media_name: Option<&str>,
     ) -> anyhow::Result<String> {
         // Keep prompts bounded.
         let transcript_text = clamp_chars(transcript_text, 120_000);
@@ -167,6 +241,31 @@ impl AiPipeline {
             .replace("{{variant_instructions}}", variant_instructions)
             .replace("{{variant_index}}", &(variant_index + 1).to_string())
             .replace("{{variant_total}}", &variant_total.to_string());
+
+        if let Some(name) = media_name {
+            user = user.replace("{{media_name}}", name);
+        } else {
+            user = user.replace("{{media_name}}", "");
+        }
+
+        if let Some(ctx) = show_context {
+            let show_name = ctx.show_name.as_deref().unwrap_or("");
+            let hosts = if ctx.hosts.is_empty() {
+                "".to_string()
+            } else {
+                ctx.hosts.join(", ")
+            };
+            let guest = ctx.guest.as_deref().unwrap_or("");
+            user = user
+                .replace("{{show_name}}", show_name)
+                .replace("{{hosts}}", hosts.as_str())
+                .replace("{{guest}}", guest);
+        } else {
+            user = user
+                .replace("{{show_name}}", "")
+                .replace("{{hosts}}", "")
+                .replace("{{guest}}", "");
+        }
 
         let text = self
             .openai

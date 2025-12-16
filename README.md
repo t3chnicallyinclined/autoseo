@@ -1,6 +1,6 @@
 # autoseo (MVP)
 
-Polls Gmail for Google Drive “Item shared with you” emails, downloads the shared video from Drive, extracts/chunks audio with `ffmpeg`, transcribes via an OpenAI-compatible API, asks an OpenAI-compatible LLM for a YouTube SEO package, generates a few thumbnail screenshots, then sends the results back via Gmail API.
+Polls Gmail for Google Drive “Item shared with you” emails, downloads the shared media from Drive (video or audio), transcribes via an OpenAI-compatible API, asks an OpenAI-compatible LLM for YouTube SEO packages, optionally generates thumbnail screenshots for videos, then sends the results back via Gmail API.
 
 ## What you need installed
 
@@ -55,7 +55,7 @@ Set env vars:
 Optional:
 - `GMAIL_QUERY` (default: `from:drive-shares-dm-noreply@google.com subject:"Item shared with you" has:drive`)
 - `GMAIL_MAX_RESULTS` (default: `10`)
-- `REQUIRE_VIDEO` (default: `true`, skips non-video Drive files like old `.wav` shares)
+- `REQUIRE_VIDEO` (default: `false`, when `true` skips audio and only processes videos)
 - `OPENAI_CHAT_MODEL` (default: `gpt-5.2-pro-2025-12-11`)
 - `OPENAI_STT_MODEL` (default: `whisper-1`)
 - `SEO_VARIANTS` (default: `3`)
@@ -141,3 +141,7 @@ docker restart autoseo
 - If you want to narrow matching further, set:
    - `GMAIL_QUERY=from:drive-shares-dm-noreply@google.com subject:"Item shared with you" has:drive`
 - For 1–3 hour videos, transcription uploads are done as small audio chunks (default 15 minutes).
+- For audio-only files, the pipeline runs transcript + SEO only (no thumbnails).
+- Result email subject includes `(audio)` for audio-only inputs.
+- Show context (show name/hosts/guest) is inferred from the media filename + early transcript, but only when explicitly present; otherwise the SEO output stays generic.
+- `prompts/seo_user.txt` can use injected placeholders: `{{media_name}}`, `{{show_name}}`, `{{hosts}}`, `{{guest}}`.

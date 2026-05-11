@@ -13,9 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai_pipeline::AiPipeline;
 use crate::align::AlignedWord;
-use crate::candidates::CandidateGenerator;
+use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionStyle};
 use crate::config::Config;
+use crate::embed::Embedder;
 use crate::gmail::GmailClient;
 use crate::google_auth::GoogleAuth;
 use crate::media;
@@ -26,6 +27,7 @@ use crate::render::{self, RenderProfile};
 use crate::scene;
 use crate::show_config::DigestMode;
 use crate::vad;
+use crate::vlm_ranker::VlmReranker;
 
 pub async fn run_clipper_local_once(
     cfg: &Config,
@@ -165,11 +167,33 @@ pub async fn run_clipper_local_once(
         .ok();
 
     let cand_gen = CandidateGenerator::new();
-    let candidates = cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms);
+    let mut candidates =
+        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms);
     tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
 
     if candidates.is_empty() {
         anyhow::bail!("no candidate windows produced — episode may be too short or too quiet");
+    }
+
+    // Attach within-episode novelty scores. Non-fatal — if the embedder fails
+    // (network blip, missing model cache), we proceed without the signal.
+    match Embedder::from_config(cfg) {
+        Ok(embedder) => {
+            tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
+            if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
+                tracing::warn!(error = ?e, "novelty scoring failed; proceeding without it");
+            } else {
+                let with_scores = candidates.iter().filter(|c| c.novelty_score.is_some()).count();
+                tracing::info!(
+                    with_scores,
+                    total = candidates.len(),
+                    "clipper: novelty attached"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "embedder init failed; proceeding without novelty");
+        }
     }
 
     let ranker_system = tokio::fs::read_to_string(&cfg.clip_ranker_system_prompt_path)
@@ -200,16 +224,55 @@ pub async fn run_clipper_local_once(
         ranker_user_template,
     );
 
-    let top_k = cfg.clip_top_k.max(1);
+    let final_top_k = cfg.clip_top_k.max(1);
+    // If VLM re-rank is on, pass a wider top-K through the LLM ranker so the
+    // VLM has more to choose from before final truncation.
+    let llm_top_k = if cfg.vlm_rerank_enabled {
+        cfg.vlm_rerank_top_k.max(final_top_k)
+    } else {
+        final_top_k
+    };
     let ranked = ranker
-        .rank(&candidates, top_k, show_context.as_ref())
+        .rank(&candidates, llm_top_k, show_context.as_ref())
         .await
         .context("LLM rank")?;
-    tracing::info!(top_k = ranked.len(), "clipper: ranked clips");
+    tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
 
     if ranked.is_empty() {
         anyhow::bail!("LLM ranker returned no clips");
     }
+
+    // Optional: VLM re-rank top-N using frames + transcript.
+    let ranked = match VlmReranker::from_config(cfg) {
+        Some(reranker) => {
+            tracing::info!(
+                model = %cfg.vlm_model,
+                frames_per_clip = cfg.vlm_frames_per_clip,
+                blend_weight = cfg.vlm_blend_weight,
+                "clipper: VLM re-rank starting"
+            );
+            match reranker
+                .rerank(&cfg.ffmpeg, &input_path, ranked, cfg.vlm_rerank_top_k)
+                .await
+            {
+                Ok(re) => {
+                    tracing::info!(reranked = re.len(), "clipper: VLM re-rank complete");
+                    re
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
+                    // re-fetch from ranker since we moved it; just re-do the call cheaply
+                    ranker
+                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .await
+                        .context("LLM rank (refetch after VLM failure)")?
+                }
+            }
+        }
+        None => ranked,
+    };
+
+    let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
 
     // Render each ranked clip with burned captions.
     let clips_dir = job_dir.join("clips");

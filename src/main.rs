@@ -22,6 +22,7 @@ mod show_config;
 mod storage;
 mod thumbs;
 mod vad;
+mod vlm_ranker;
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

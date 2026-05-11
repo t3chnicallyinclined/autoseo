@@ -100,6 +100,54 @@ pub struct Config {
     #[arg(long, env = "CLIP_TOP_K", default_value_t = 10)]
     pub clip_top_k: usize,
 
+    /// Hugging Face API key (used for HF Inference Providers — embeddings + VLM re-rank).
+    /// When set, the clipper routes embeddings through HF instead of the local
+    /// `fastembed` ONNX model. Required to enable VLM re-rank.
+    #[arg(long, env = "HF_API_KEY")]
+    pub hf_api_key: Option<String>,
+
+    /// HF Inference Providers base URL (OpenAI-compatible). Default auto-routes
+    /// across providers (Together, Fireworks, Nebius, etc.).
+    #[arg(long, env = "HF_BASE_URL", default_value = "https://router.huggingface.co/v1")]
+    pub hf_base_url: String,
+
+    /// Embedding model id on HF (used when `HF_API_KEY` is set).
+    /// Qwen3-Embedding-0.6B is the current MTEB leader at its size class (Apache 2.0,
+    /// 1024-dim, 32K context — handles whole-episode embedding in one call).
+    #[arg(long, env = "EMBED_MODEL", default_value = "Qwen/Qwen3-Embedding-0.6B")]
+    pub embed_model: String,
+
+    /// Enable VLM-based re-rank of top candidates after the LLM ranker.
+    /// Sends frames + transcript to a vision-language model and blends the score.
+    /// Requires `HF_API_KEY`.
+    #[arg(long, env = "VLM_RERANK_ENABLED", default_value_t = false)]
+    pub vlm_rerank_enabled: bool,
+
+    /// Vision-language model id on HF (for re-rank). Qwen3-VL-8B-Instruct is the
+    /// current pick for long-video understanding at this size class.
+    #[arg(long, env = "VLM_MODEL", default_value = "Qwen/Qwen3-VL-8B-Instruct")]
+    pub vlm_model: String,
+
+    /// How many candidates the LLM ranker passes to the VLM re-rank pass.
+    /// VLM-re-ranked candidates are then truncated to `CLIP_TOP_K`.
+    #[arg(long, env = "VLM_RERANK_TOP_K", default_value_t = 20)]
+    pub vlm_rerank_top_k: usize,
+
+    /// Number of frames sampled from each candidate for the VLM (evenly spaced
+    /// across the clip window). 4-8 is the sweet spot.
+    #[arg(long, env = "VLM_FRAMES_PER_CLIP", default_value_t = 5)]
+    pub vlm_frames_per_clip: usize,
+
+    /// Max dimension (longer edge) of frames sent to the VLM. Smaller = faster +
+    /// cheaper; 512 keeps faces readable.
+    #[arg(long, env = "VLM_FRAME_MAX_DIM", default_value_t = 512)]
+    pub vlm_frame_max_dim: u32,
+
+    /// Weight (0..=1) of the VLM score in the final blended score.
+    /// final = (1 - w) * llm_score + w * vlm_score
+    #[arg(long, env = "VLM_BLEND_WEIGHT", default_value_t = 0.5)]
+    pub vlm_blend_weight: f64,
+
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]
     pub dump_dir: Option<String>,

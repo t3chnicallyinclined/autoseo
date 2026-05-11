@@ -9,6 +9,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
+fastembed = "4"
 futures-util = "0.3"
 hound = "3"
 rand = "0.8"

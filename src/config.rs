@@ -73,6 +73,12 @@ pub struct Config {
     #[arg(long, env = "SHOWS_DIR", default_value = "./prompts/shows")]
     pub shows_dir: String,
 
+    /// Cache directory for fastembed model files (MiniLM-L6-v2, ~90MB).
+    /// First run downloads from Hugging Face; subsequent runs reuse the cached files.
+    /// Set this under WORK_DIR so the download persists across container restarts.
+    #[arg(long, env = "EMBED_MODEL_DIR", default_value = "./work/models/fastembed")]
+    pub embed_model_dir: String,
+
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]
     pub dump_dir: Option<String>,

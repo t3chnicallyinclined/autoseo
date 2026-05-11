@@ -1,17 +1,21 @@
 mod ai_pipeline;
+mod align;
 mod config;
 mod drive;
+mod embed;
 mod gmail;
 mod google_auth;
 mod media;
 mod mime;
 mod openai;
 mod parse;
+mod prosody;
 mod rate_limit;
 mod scene;
 mod show_config;
 mod storage;
 mod thumbs;
+mod vad;
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

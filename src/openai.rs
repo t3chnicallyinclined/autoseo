@@ -28,16 +28,45 @@ impl OpenAiClient {
         audio_path: &std::path::Path,
     ) -> anyhow::Result<TranscriptionText> {
         match self
-            .transcribe_internal(model, audio_path, "verbose_json")
+            .transcribe_internal(model, audio_path, "verbose_json", &[])
             .await
         {
             Ok(SttResponse::Verbose(v)) => Ok(TranscriptionText {
                 text: v.text,
                 segments: v.segments,
+                words: v.words,
             }),
             Ok(SttResponse::Json(j)) => Ok(TranscriptionText {
                 text: j.text,
                 segments: Vec::new(),
+                words: Vec::new(),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Transcribe with word-level timestamps. Returns segments AND words.
+    /// Requires a provider that honors `timestamp_granularities[]=word` (e.g.
+    /// Groq's `whisper-large-v3-turbo`). OpenAI's `whisper-1` does not support
+    /// word-level granularity; the response will come back with an empty `words`.
+    pub async fn transcribe_words(
+        &self,
+        model: &str,
+        audio_path: &std::path::Path,
+    ) -> anyhow::Result<TranscriptionText> {
+        match self
+            .transcribe_internal(model, audio_path, "verbose_json", &["word"])
+            .await
+        {
+            Ok(SttResponse::Verbose(v)) => Ok(TranscriptionText {
+                text: v.text,
+                segments: v.segments,
+                words: v.words,
+            }),
+            Ok(SttResponse::Json(j)) => Ok(TranscriptionText {
+                text: j.text,
+                segments: Vec::new(),
+                words: Vec::new(),
             }),
             Err(e) => Err(e),
         }
@@ -48,14 +77,18 @@ impl OpenAiClient {
         model: &str,
         audio_path: &std::path::Path,
         primary_response_format: &str,
+        granularities: &[&str],
     ) -> anyhow::Result<SttResponse> {
         let url = format!("{}/v1/audio/transcriptions", self.base_url);
         let try_once =
             |response_format: &str, part: reqwest::multipart::Part| -> reqwest::RequestBuilder {
-                let form = reqwest::multipart::Form::new()
+                let mut form = reqwest::multipart::Form::new()
                     .text("model", model.to_string())
                     .text("response_format", response_format.to_string())
                     .part("file", part);
+                for g in granularities {
+                    form = form.text("timestamp_granularities[]", g.to_string());
+                }
                 self.auth(self.http.post(url.clone())).multipart(form)
             };
 
@@ -475,6 +508,7 @@ struct TranscriptionJson {
 pub struct TranscriptionText {
     pub text: String,
     pub segments: Vec<TranscriptionSegment>,
+    pub words: Vec<TranscriptionWord>,
 }
 
 fn guess_audio_mime(path: &std::path::Path) -> Option<&'static str> {
@@ -496,6 +530,18 @@ pub struct TranscriptionVerboseJson {
     pub text: String,
     #[serde(default)]
     pub segments: Vec<TranscriptionSegment>,
+    #[serde(default)]
+    pub words: Vec<TranscriptionWord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscriptionWord {
+    #[serde(default)]
+    pub word: String,
+    #[serde(default)]
+    pub start: f64,
+    #[serde(default)]
+    pub end: f64,
 }
 
 #[derive(Debug, Deserialize)]

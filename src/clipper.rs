@@ -19,15 +19,12 @@ use crate::config::Config;
 use crate::gmail::GmailClient;
 use crate::google_auth::GoogleAuth;
 use crate::media;
-use crate::mime::{Attachment, build_mime_email};
+use crate::mime::build_mime_email;
 use crate::prosody;
 use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
 use crate::scene;
 use crate::vad;
-
-const MAX_DIGEST_ATTACHMENT_BYTES_TOTAL: u64 = 20 * 1024 * 1024;
-const MAX_DIGEST_ATTACHMENT_BYTES_EACH: u64 = 18 * 1024 * 1024;
 
 pub async fn run_clipper_local_once(
     cfg: &Config,
@@ -272,8 +269,7 @@ pub async fn run_clipper_local_once(
         anyhow::bail!("all clip renders failed");
     }
 
-    let body = build_digest_body(&file_name, total_duration_secs, &rendered);
-    let attachments = build_attachments(&rendered).await;
+    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
 
     let subject = format!(
         "{} CLIPPER: {} clips for {}",
@@ -283,7 +279,7 @@ pub async fn run_clipper_local_once(
     );
 
     let access_token = google.access_token().await?;
-    let raw_mime = build_mime_email("me", result_to, &subject, &body, &attachments);
+    let raw_mime = build_mime_email("me", result_to, &subject, &body, &[]);
     let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
     let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
     tracing::info!(sent_message_id, "clipper: digest email sent");
@@ -297,7 +293,18 @@ struct RenderedClip {
     ranked: RankedClip,
 }
 
-fn build_digest_body(media_name: &str, total_duration_secs: f64, rendered: &[RenderedClip]) -> String {
+fn build_digest_body(
+    media_name: &str,
+    total_duration_secs: f64,
+    clips_dir: &std::path::Path,
+    rendered: &[RenderedClip],
+) -> String {
+    // Resolve to an absolute path if possible so the email reader can copy/paste
+    // it straight into a `vlc` / `open` command.
+    let abs_clips_dir = clips_dir
+        .canonicalize()
+        .unwrap_or_else(|_| clips_dir.to_path_buf());
+
     let mut out = String::new();
     out.push_str(&format!("Episode: {media_name}\n"));
     out.push_str(&format!(
@@ -305,18 +312,20 @@ fn build_digest_body(media_name: &str, total_duration_secs: f64, rendered: &[Ren
         fmt_hms(total_duration_secs)
     ));
     out.push_str(&format!("Clips produced: {}\n", rendered.len()));
-    out.push_str("\n");
+    out.push_str(&format!("Clips directory: {}\n", abs_clips_dir.display()));
+    out.push('\n');
     out.push_str(&"=".repeat(72));
     out.push('\n');
 
     for r in rendered {
         out.push_str(&format!(
-            "Clip {idx:02}  score {score}  {start}-{end}  ({dur}s)\n",
+            "Clip {idx:02}  score {score}  {start}-{end}  ({dur}s)  {size:.1}MB\n",
             idx = r.rank,
             score = r.ranked.score,
             start = to_mmss(r.ranked.start_secs),
             end = to_mmss(r.ranked.end_secs),
             dur = (r.ranked.end_secs - r.ranked.start_secs) as i64,
+            size = r.bytes as f64 / (1024.0 * 1024.0),
         ));
         if !r.ranked.hook.is_empty() {
             out.push_str(&format!("  hook: {}\n", r.ranked.hook));
@@ -324,66 +333,22 @@ fn build_digest_body(media_name: &str, total_duration_secs: f64, rendered: &[Ren
         if !r.ranked.reasoning.is_empty() {
             out.push_str(&format!("  why:  {}\n", r.ranked.reasoning));
         }
-        out.push_str(&format!(
-            "  file: {} ({:.1} MB)\n",
-            r.path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?"),
-            r.bytes as f64 / (1024.0 * 1024.0)
-        ));
-        out.push_str("\n");
+        let abs_path = r
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| r.path.clone());
+        out.push_str(&format!("  file: {}\n", abs_path.display()));
+        out.push('\n');
         out.push_str(&"-".repeat(72));
         out.push('\n');
     }
 
     out.push('\n');
-    out.push_str("Local job dir contains the clip MP4s; clips small enough to attach are\n");
-    out.push_str("included on this email. Larger clips are referenced by filename above.\n");
-    out
-}
-
-async fn build_attachments(rendered: &[RenderedClip]) -> Vec<Attachment> {
-    let mut out = Vec::new();
-    let mut total: u64 = 0;
-    for r in rendered {
-        if r.bytes > MAX_DIGEST_ATTACHMENT_BYTES_EACH {
-            tracing::info!(
-                clip = r.rank,
-                bytes = r.bytes,
-                "skipping attachment: clip exceeds per-file budget"
-            );
-            continue;
-        }
-        if total.saturating_add(r.bytes) > MAX_DIGEST_ATTACHMENT_BYTES_TOTAL {
-            tracing::info!(
-                clip = r.rank,
-                bytes = r.bytes,
-                total,
-                "skipping attachment: would exceed total digest budget"
-            );
-            continue;
-        }
-        let bytes = match tokio::fs::read(&r.path).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(clip = r.rank, error = ?e, "failed to read clip for attachment");
-                continue;
-            }
-        };
-        let filename = r
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("clip.mp4")
-            .to_string();
-        total += bytes.len() as u64;
-        out.push(Attachment {
-            filename,
-            content_type: "video/mp4".to_string(),
-            bytes,
-        });
-    }
+    out.push_str(
+        "Clips are on disk at the paths above (the clipper does not attach them to\n\
+         this email — the high-bitrate vertical renders are too large for Gmail's\n\
+         25 MB limit). Pick the winners and post them.\n",
+    );
     out
 }
 
@@ -518,7 +483,8 @@ mod tests {
             dummy_clip(1, 90, 60.0, 120.0, "first hook"),
             dummy_clip(2, 75, 240.0, 300.0, "second hook"),
         ];
-        let body = build_digest_body("episode.mp4", 7320.0, &clips);
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let body = build_digest_body("episode.mp4", 7320.0, &dir, &clips);
         assert!(body.contains("episode.mp4"));
         assert!(body.contains("2h"));
         assert!(body.contains("Clip 01"));
@@ -527,5 +493,8 @@ mod tests {
         assert!(body.contains("second hook"));
         assert!(body.contains("01:00-02:00"));
         assert!(body.contains("score 90"));
+        // File paths and clips directory should appear.
+        assert!(body.contains("clip_01.mp4"));
+        assert!(body.contains("Clips directory:"));
     }
 }

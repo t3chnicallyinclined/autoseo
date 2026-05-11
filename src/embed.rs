@@ -32,7 +32,8 @@ impl Embedder {
     pub fn from_config(cfg: &Config) -> anyhow::Result<Self> {
         if let Some(key) = cfg.hf_api_key.as_ref().filter(|k| !k.is_empty()) {
             Ok(Embedder::Hf(HfEmbedder::new(
-                cfg.hf_base_url.clone(),
+                cfg.hf_router_url.clone(),
+                cfg.hf_embed_provider.clone(),
                 key.clone(),
                 cfg.embed_model.clone(),
             )))
@@ -98,7 +99,8 @@ impl FastembedEmbedder {
 
 #[derive(Clone)]
 pub struct HfEmbedder {
-    base_url: String,
+    router_url: String,
+    provider: String,
     api_key: String,
     model: String,
     http: reqwest::Client,
@@ -106,14 +108,25 @@ pub struct HfEmbedder {
 }
 
 impl HfEmbedder {
-    pub fn new(base_url: String, api_key: String, model: String) -> Self {
+    /// `router_url` is the root (no `/v1`), e.g. `https://router.huggingface.co`.
+    /// `provider` routes the request, e.g. `hf-inference` or `scaleway`.
+    pub fn new(router_url: String, provider: String, api_key: String, model: String) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            router_url: router_url.trim_end_matches('/').to_string(),
+            provider: provider.trim_matches('/').to_string(),
             api_key,
             model,
             http: reqwest::Client::new(),
             batch_size: 32,
         }
+    }
+
+    fn endpoint_url(&self) -> String {
+        // Final URL: {router}/{provider}/models/{model}/pipeline/feature-extraction
+        format!(
+            "{}/{}/models/{}/pipeline/feature-extraction",
+            self.router_url, self.provider, self.model
+        )
     }
 
     pub async fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -131,10 +144,9 @@ impl HfEmbedder {
     }
 
     async fn embed_batch(&self, batch: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        let url = format!("{}/embeddings", self.base_url);
-        let body = EmbeddingsRequest {
-            model: self.model.clone(),
-            input: batch.clone(),
+        let url = self.endpoint_url();
+        let body = FeatureExtractionRequest {
+            inputs: batch.clone(),
         };
 
         const MAX_ATTEMPTS: usize = 5;
@@ -152,18 +164,20 @@ impl HfEmbedder {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
-                        let parsed: EmbeddingsResponse =
-                            r.json().await.context("parse hf embeddings response")?;
-                        let mut data = parsed.data;
-                        data.sort_by_key(|d| d.index);
-                        if data.len() != batch.len() {
+                        // The hf-inference feature-extraction task returns a bare
+                        // array of arrays — one vector per input, in order.
+                        let vecs: Vec<Vec<f32>> = r
+                            .json()
+                            .await
+                            .context("parse hf feature-extraction response")?;
+                        if vecs.len() != batch.len() {
                             anyhow::bail!(
-                                "hf embeddings returned {} vectors for {} inputs",
-                                data.len(),
+                                "hf feature-extraction returned {} vectors for {} inputs",
+                                vecs.len(),
                                 batch.len()
                             );
                         }
-                        return Ok(data.into_iter().map(|d| d.embedding).collect());
+                        return Ok(vecs);
                     }
 
                     let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
@@ -173,27 +187,27 @@ impl HfEmbedder {
                             attempt,
                             status = %status,
                             body = %truncate(&body_text, 400),
-                            "hf embeddings retryable; backing off"
+                            "hf feature-extraction retryable; backing off"
                         );
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(8));
                         continue;
                     }
                     let body_text = r.text().await.unwrap_or_default();
-                    anyhow::bail!("hf embeddings failed: {status} {body_text}");
+                    anyhow::bail!("hf feature-extraction failed: {status} {body_text}");
                 }
                 Err(e) => {
                     if attempt < MAX_ATTEMPTS {
-                        tracing::warn!(attempt, error = %e, "hf embeddings request error; backing off");
+                        tracing::warn!(attempt, error = %e, "hf feature-extraction request error; backing off");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(8));
                         continue;
                     }
-                    return Err(anyhow::Error::new(e)).context("hf embeddings POST");
+                    return Err(anyhow::Error::new(e)).context("hf feature-extraction POST");
                 }
             }
         }
-        anyhow::bail!("hf embeddings failed after {MAX_ATTEMPTS} attempts")
+        anyhow::bail!("hf feature-extraction failed after {MAX_ATTEMPTS} attempts")
     }
 }
 
@@ -205,20 +219,8 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 #[derive(Debug, Serialize)]
-struct EmbeddingsRequest {
-    model: String,
-    input: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingsResponse {
-    data: Vec<EmbeddingsItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingsItem {
-    embedding: Vec<f32>,
-    index: usize,
+struct FeatureExtractionRequest {
+    inputs: Vec<String>,
 }
 
 /// Cosine similarity. Tolerant of non-unit vectors (re-normalizes).
@@ -354,13 +356,17 @@ mod tests {
     }
 
     #[test]
-    fn hf_embedder_constructs_with_trimmed_base_url() {
+    fn hf_embedder_builds_native_url() {
         let e = HfEmbedder::new(
-            "https://example.com/v1/".into(),
+            "https://router.huggingface.co/".into(),
+            "hf-inference".into(),
             "k".into(),
-            "Qwen/Qwen3-Embedding-0.6B".into(),
+            "BAAI/bge-large-en-v1.5".into(),
         );
-        assert_eq!(e.base_url, "https://example.com/v1");
+        assert_eq!(
+            e.endpoint_url(),
+            "https://router.huggingface.co/hf-inference/models/BAAI/bge-large-en-v1.5/pipeline/feature-extraction"
+        );
     }
 
     // Integration test — requires HF_API_KEY in env. Skipped by default.
@@ -375,9 +381,10 @@ mod tests {
             }
         };
         let e = HfEmbedder::new(
-            "https://router.huggingface.co/v1".into(),
+            "https://router.huggingface.co".into(),
+            "hf-inference".into(),
             key,
-            "Qwen/Qwen3-Embedding-0.6B".into(),
+            "BAAI/bge-large-en-v1.5".into(),
         );
         let texts = vec![
             "The quarterback threw a perfect spiral.".to_string(),
@@ -386,7 +393,6 @@ mod tests {
         let vecs = e.embed(texts).await?;
         assert_eq!(vecs.len(), 2);
         assert!(vecs[0].len() >= 384, "embedding dim should be large; got {}", vecs[0].len());
-        // The two unrelated topics should have cosine similarity well below 1.0.
         let sim = cosine_similarity(&vecs[0], &vecs[1]);
         assert!(sim < 0.7, "unrelated texts should have low cosine; got {sim}");
         Ok(())

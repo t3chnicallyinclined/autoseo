@@ -39,8 +39,13 @@ impl VlmReranker {
             .as_ref()
             .filter(|k| !k.is_empty())?
             .clone();
+        // The OpenAI-compatible chat endpoint lives under {router}/v1.
+        let base_url = format!(
+            "{}/v1",
+            cfg.hf_router_url.trim_end_matches('/')
+        );
         Some(Self {
-            base_url: cfg.hf_base_url.trim_end_matches('/').to_string(),
+            base_url,
             api_key: key,
             model: cfg.vlm_model.clone(),
             http: reqwest::Client::new(),

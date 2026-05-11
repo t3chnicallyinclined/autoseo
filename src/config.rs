@@ -106,15 +106,23 @@ pub struct Config {
     #[arg(long, env = "HF_API_KEY")]
     pub hf_api_key: Option<String>,
 
-    /// HF Inference Providers base URL (OpenAI-compatible). Default auto-routes
-    /// across providers (Together, Fireworks, Nebius, etc.).
-    #[arg(long, env = "HF_BASE_URL", default_value = "https://router.huggingface.co/v1")]
-    pub hf_base_url: String,
+    /// HF Inference Providers router URL (root, no trailing /v1).
+    /// - VLM (chat) endpoint:    `{HF_ROUTER_URL}/v1/chat/completions`
+    /// - Embedding endpoint:     `{HF_ROUTER_URL}/{HF_EMBED_PROVIDER}/models/{EMBED_MODEL}/pipeline/feature-extraction`
+    #[arg(long, env = "HF_ROUTER_URL", default_value = "https://router.huggingface.co")]
+    pub hf_router_url: String,
+
+    /// Which HF Inference Provider to route embedding requests to. Most English
+    /// embedding models are on `hf-inference`; some larger Qwen variants are on
+    /// `scaleway`.
+    #[arg(long, env = "HF_EMBED_PROVIDER", default_value = "hf-inference")]
+    pub hf_embed_provider: String,
 
     /// Embedding model id on HF (used when `HF_API_KEY` is set).
-    /// Qwen3-Embedding-0.6B is the current MTEB leader at its size class (Apache 2.0,
-    /// 1024-dim, 32K context — handles whole-episode embedding in one call).
-    #[arg(long, env = "EMBED_MODEL", default_value = "Qwen/Qwen3-Embedding-0.6B")]
+    /// `BAAI/bge-large-en-v1.5` is the workhorse English embedder — 1024-dim,
+    /// reliably warm on hf-inference, MIT license. Swap to a multilingual or
+    /// larger model if your content demands it.
+    #[arg(long, env = "EMBED_MODEL", default_value = "BAAI/bge-large-en-v1.5")]
     pub embed_model: String,
 
     /// Enable VLM-based re-rank of top candidates after the LLM ranker.

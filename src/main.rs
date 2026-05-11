@@ -49,28 +49,53 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::parse();
 
     let mode = show_config::Mode::parse(&cfg.mode)?;
+    let digest_mode = show_config::DigestMode::parse(&cfg.digest_mode)?;
 
     // Print a minimal startup banner to stdout so `docker logs` is never empty.
     println!(
-        "autoseo starting (mode={:?}, poll_interval_secs={}, require_video={}, work_dir={}, clipper_db={})",
-        mode, cfg.poll_interval_secs, cfg.require_video, cfg.work_dir, cfg.clipper_db
+        "autoseo starting (mode={:?}, digest_mode={:?}, poll_interval_secs={}, work_dir={}, clipper_db={})",
+        mode, digest_mode, cfg.poll_interval_secs, cfg.work_dir, cfg.clipper_db
     );
 
-    if mode.produces_clips() {
-        tracing::warn!(
-            "MODE={} requested clip production but the clipper pipeline is not yet feature-complete \
-             (M1 in progress on feat/clipper). Clip stages will no-op for now.",
-            cfg.mode
-        );
-    }
-
-    let google = GoogleAuth::new(
-        cfg.google_client_id.clone(),
-        cfg.google_client_secret.clone(),
-        cfg.google_refresh_token.clone(),
-    );
+    // Build Google auth only if creds are all present; downstream code validates
+    // its own requirement and bails with a clear message if missing.
+    let google: Option<GoogleAuth> = match (
+        cfg.google_client_id.as_ref(),
+        cfg.google_client_secret.as_ref(),
+        cfg.google_refresh_token.as_ref(),
+    ) {
+        (Some(id), Some(secret), Some(token))
+            if !id.is_empty() && !secret.is_empty() && !token.is_empty() =>
+        {
+            Some(GoogleAuth::new(id.clone(), secret.clone(), token.clone()))
+        }
+        _ => None,
+    };
     let gmail = GmailClient::new();
     let drive = DriveClient::new();
+
+    // Validation matrix: which paths actually require Google?
+    //   - seo-only mode (always sends per-variant Gmail emails): requires Google + RESULT_TO
+    //   - clipper mode + DIGEST_MODE includes email: requires Google + RESULT_TO
+    //   - clipper mode + DIGEST_MODE=file (default): no Google required
+    //   - polling loop (no LOCAL_VIDEO_PATH) for seo-only: requires Google (Gmail/Drive ingest)
+    let needs_google = mode.produces_seo_emails()
+        || (mode.produces_clips() && digest_mode.sends_email());
+    if needs_google && google.is_none() {
+        anyhow::bail!(
+            "GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN are required \
+             for the requested MODE/DIGEST_MODE combination. Set them in .env or switch to \
+             MODE=clipper with DIGEST_MODE=file to run Google-free."
+        );
+    }
+    let needs_result_to = mode.produces_seo_emails()
+        || (mode.produces_clips() && digest_mode.sends_email());
+    if needs_result_to && cfg.result_to.as_deref().unwrap_or("").is_empty() && !cfg.dry_run {
+        anyhow::bail!(
+            "RESULT_TO is required when any code path sends email. Set it or use \
+             MODE=clipper DIGEST_MODE=file for disk-only output."
+        );
+    }
     let storage = Storage::open(&cfg.clipper_db).await?;
     let imported = storage.import_legacy_dedupe(&cfg.dedupe_file).await?;
     if imported > 0 {
@@ -157,18 +182,22 @@ async fn main() -> anyhow::Result<()> {
             let ai_ref = ai.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)")
             })?;
-            clipper::run_clipper_local_once(&cfg, &google, &gmail, ai_ref, local_path).await?;
-        }
-        if mode.produces_seo_emails() {
-            run_local_once(
+            clipper::run_clipper_local_once(
                 &cfg,
-                &google,
+                google.as_ref(),
                 &gmail,
-                ai.as_ref(),
+                ai_ref,
                 local_path,
-                &seo_variant_blocks,
+                digest_mode,
             )
             .await?;
+        }
+        if mode.produces_seo_emails() {
+            let g = google
+                .as_ref()
+                .expect("google creds validated at startup for seo-only path");
+            run_local_once(&cfg, g, &gmail, ai.as_ref(), local_path, &seo_variant_blocks)
+                .await?;
         }
         return Ok(());
     }
@@ -187,10 +216,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let g = google
+        .as_ref()
+        .expect("google creds validated at startup for polling path");
     loop {
         if let Err(e) = run_once(
             &cfg,
-            &google,
+            g,
             &gmail,
             &drive,
             ai.as_ref(),

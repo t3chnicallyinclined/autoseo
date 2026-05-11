@@ -237,17 +237,28 @@ pub struct Config {
     )]
     pub thumbnail_user_prompt_path: String,
 
-    /// Google OAuth client id.
+    /// Google OAuth client id. Required only when a code path actually talks to
+    /// Google (Gmail polling, Drive download, or email digest delivery). The
+    /// clipper's `DIGEST_MODE=file` path works without it.
     #[arg(long, env = "GOOGLE_CLIENT_ID")]
-    pub google_client_id: String,
+    pub google_client_id: Option<String>,
 
-    /// Google OAuth client secret.
+    /// Google OAuth client secret. Required alongside `google_client_id`.
     #[arg(long, env = "GOOGLE_CLIENT_SECRET")]
-    pub google_client_secret: String,
+    pub google_client_secret: Option<String>,
 
-    /// Google OAuth refresh token (from OAuth Playground).
+    /// Google OAuth refresh token (from OAuth Playground). Required alongside
+    /// `google_client_id`.
     #[arg(long, env = "GOOGLE_REFRESH_TOKEN")]
-    pub google_refresh_token: String,
+    pub google_refresh_token: Option<String>,
+
+    /// How the clipper delivers its summary: `file` writes `digest.md` to the
+    /// clips dir on disk (no external service needed); `email` sends via Gmail
+    /// (requires Google credentials + `RESULT_TO`); `both` does both. Defaults
+    /// to `file` so the clipper has no required external dependencies beyond
+    /// `OPENAI_API_KEY`.
+    #[arg(long, env = "DIGEST_MODE", default_value = "file")]
+    pub digest_mode: String,
 
     /// If set, run the pipeline on a local media file (e.g. .mp4 or .wav) and send the result email.
     /// This bypasses Gmail/Drive ingest and the dedupe list.

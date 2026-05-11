@@ -24,19 +24,27 @@ use crate::prosody;
 use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
 use crate::scene;
+use crate::show_config::DigestMode;
 use crate::vad;
 
 pub async fn run_clipper_local_once(
     cfg: &Config,
-    google: &GoogleAuth,
+    google: Option<&GoogleAuth>,
     gmail: &GmailClient,
     ai: &AiPipeline,
     local_path: &str,
+    digest_mode: DigestMode,
 ) -> Result<()> {
-    let result_to = cfg
-        .result_to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("RESULT_TO is required in clipper mode"))?;
+    if digest_mode.sends_email() {
+        if google.is_none() {
+            anyhow::bail!(
+                "DIGEST_MODE includes email but Google credentials are missing"
+            );
+        }
+        if cfg.result_to.as_deref().unwrap_or("").is_empty() {
+            anyhow::bail!("DIGEST_MODE includes email but RESULT_TO is unset");
+        }
+    }
 
     let input_path = PathBuf::from(local_path);
     if tokio::fs::metadata(&input_path).await.is_err() {
@@ -271,18 +279,36 @@ pub async fn run_clipper_local_once(
 
     let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
 
-    let subject = format!(
-        "{} CLIPPER: {} clips for {}",
-        cfg.result_subject_prefix,
-        rendered.len(),
-        file_name
-    );
+    if digest_mode.writes_file() {
+        let digest_path = clips_dir.join("digest.md");
+        tokio::fs::write(&digest_path, &body)
+            .await
+            .with_context(|| format!("write digest at {}", digest_path.display()))?;
+        let abs = digest_path.canonicalize().unwrap_or(digest_path);
+        tracing::info!(path = %abs.display(), "clipper: digest written to disk");
+    }
 
-    let access_token = google.access_token().await?;
-    let raw_mime = build_mime_email("me", result_to, &subject, &body, &[]);
-    let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
-    let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
-    tracing::info!(sent_message_id, "clipper: digest email sent");
+    if digest_mode.sends_email() {
+        let google = google.expect("validated at function entry");
+        let result_to = cfg
+            .result_to
+            .as_deref()
+            .expect("validated at function entry");
+
+        let subject = format!(
+            "{} CLIPPER: {} clips for {}",
+            cfg.result_subject_prefix,
+            rendered.len(),
+            file_name
+        );
+
+        let access_token = google.access_token().await?;
+        let raw_mime = build_mime_email("me", result_to, &subject, &body, &[]);
+        let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
+        let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
+        tracing::info!(sent_message_id, "clipper: digest email sent");
+    }
+
     Ok(())
 }
 
@@ -344,11 +370,7 @@ fn build_digest_body(
     }
 
     out.push('\n');
-    out.push_str(
-        "Clips are on disk at the paths above (the clipper does not attach them to\n\
-         this email — the high-bitrate vertical renders are too large for Gmail's\n\
-         25 MB limit). Pick the winners and post them.\n",
-    );
+    out.push_str("Clips are on disk at the paths above. Pick the winners and post them.\n");
     out
 }
 

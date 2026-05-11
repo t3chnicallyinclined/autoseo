@@ -132,6 +132,38 @@ impl Mode {
     }
 }
 
+/// How the clipper delivers its summary of rendered clips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestMode {
+    /// Write `digest.md` to the clips directory on disk. No external service required.
+    File,
+    /// Send a digest email via Gmail. Requires Google credentials + `RESULT_TO`.
+    Email,
+    /// Both — write the file AND send the email.
+    Both,
+}
+
+impl DigestMode {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "file" | "disk" | "local" => Ok(DigestMode::File),
+            "email" | "mail" | "gmail" => Ok(DigestMode::Email),
+            "both" | "all" => Ok(DigestMode::Both),
+            other => anyhow::bail!(
+                "invalid DIGEST_MODE='{other}'; expected one of file, email, both"
+            ),
+        }
+    }
+
+    pub fn writes_file(self) -> bool {
+        matches!(self, DigestMode::File | DigestMode::Both)
+    }
+
+    pub fn sends_email(self) -> bool {
+        matches!(self, DigestMode::Email | DigestMode::Both)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +188,19 @@ mod tests {
         assert_eq!(slugify("trailing___"), "trailing");
         assert_eq!(slugify(""), "");
         assert_eq!(slugify("!!!"), "");
+    }
+
+    #[test]
+    fn digest_mode_parses() {
+        assert_eq!(DigestMode::parse("file").unwrap(), DigestMode::File);
+        assert_eq!(DigestMode::parse("EMAIL").unwrap(), DigestMode::Email);
+        assert_eq!(DigestMode::parse(" both ").unwrap(), DigestMode::Both);
+        assert_eq!(DigestMode::parse("disk").unwrap(), DigestMode::File);
+        assert!(DigestMode::parse("nonsense").is_err());
+
+        assert!(DigestMode::File.writes_file() && !DigestMode::File.sends_email());
+        assert!(!DigestMode::Email.writes_file() && DigestMode::Email.sends_email());
+        assert!(DigestMode::Both.writes_file() && DigestMode::Both.sends_email());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+Episode show: {{show_name}}
+Hosts: {{hosts}}
+Guest: {{guest}}
+
+Below is a JSON array of candidate clip windows from this episode. Each
+candidate has:
+- index, start_secs, end_secs: where in the episode
+- transcript: the words spoken in the window
+- linguistic: marker counts + up to 2 quotable lines
+- prosody: rms_peak_db / rms_mean_db / speaking_rate_wps
+- novelty: 0..1, higher = unusual topic content relative to the episode mean
+
+Score each candidate. Return JSON exactly matching the schema in the system
+prompt — one clip entry per input candidate, indices preserved.
+
+CANDIDATES:
+{{candidates_json}}

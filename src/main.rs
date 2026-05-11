@@ -1,6 +1,7 @@
 mod ai_pipeline;
 mod align;
 mod candidates;
+mod captions;
 mod config;
 mod drive;
 mod embed;
@@ -12,7 +13,9 @@ mod mime;
 mod openai;
 mod parse;
 mod prosody;
+mod ranker;
 mod rate_limit;
+mod render;
 mod scene;
 mod show_config;
 mod storage;

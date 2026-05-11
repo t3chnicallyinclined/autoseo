@@ -2,6 +2,7 @@ mod ai_pipeline;
 mod align;
 mod candidates;
 mod captions;
+mod clipper;
 mod config;
 mod drive;
 mod embed;
@@ -152,15 +153,37 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if let Some(local_path) = cfg.local_video_path.as_deref() {
-        run_local_once(
-            &cfg,
-            &google,
-            &gmail,
-            ai.as_ref(),
-            local_path,
-            &seo_variant_blocks,
-        )
-        .await?;
+        if mode.produces_clips() {
+            let ai_ref = ai.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)")
+            })?;
+            clipper::run_clipper_local_once(&cfg, &google, &gmail, ai_ref, local_path).await?;
+        }
+        if mode.produces_seo_emails() {
+            run_local_once(
+                &cfg,
+                &google,
+                &gmail,
+                ai.as_ref(),
+                local_path,
+                &seo_variant_blocks,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    if mode.produces_clips() {
+        tracing::warn!(
+            "MODE={} but no LOCAL_VIDEO_PATH — the clipper polling-from-Gmail flow \
+             is M2; M1 only supports MODE=clipper with LOCAL_VIDEO_PATH. The SEO-email \
+             polling loop will run if MODE=both.",
+            cfg.mode
+        );
+    }
+
+    if !mode.produces_seo_emails() {
+        tracing::info!("MODE={} has no polling work; exiting.", cfg.mode);
         return Ok(());
     }
 

@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use crate::align::{self, AlignedWord};
 use crate::openai::OpenAiClient;
 use crate::rate_limit::RpmGate;
 
@@ -35,6 +36,15 @@ pub struct TranscriptSegment {
 pub struct Transcript {
     pub full_text: String,
     pub segments: Vec<TranscriptSegment>,
+}
+
+/// Like [`Transcript`] but also carries word-level timestamps in absolute episode time.
+/// Produced by [`AiPipeline::transcribe_word_chunks`] for the clipper pipeline.
+#[derive(Debug, Clone)]
+pub struct WordTranscript {
+    pub full_text: String,
+    pub segments: Vec<TranscriptSegment>,
+    pub words: Vec<AlignedWord>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -165,6 +175,95 @@ impl AiPipeline {
         Ok(Transcript {
             full_text: text_out,
             segments: segments_out,
+        })
+    }
+
+    /// Parallel STT over chunked audio with word-level timestamps. Mirrors
+    /// [`transcribe_chunks`] but uses [`OpenAiClient::transcribe_words`] (Groq's
+    /// `whisper-large-v3-turbo` or any provider that honors
+    /// `timestamp_granularities=word`). Word timestamps are shifted into the global
+    /// episode timeline.
+    pub async fn transcribe_word_chunks(
+        &self,
+        chunks: &[(std::path::PathBuf, f64, f64)],
+        progress: Option<ProgressBar>,
+    ) -> anyhow::Result<WordTranscript> {
+        if chunks.is_empty() {
+            anyhow::bail!("no audio chunks to transcribe");
+        }
+        let client = self.openai.clone();
+        let stt_model = self.stt_model.clone();
+        let concurrency = self.stt_concurrency;
+        let stt_rpm_gate = self.stt_rpm_gate.clone();
+        let total_chunks = chunks.len();
+
+        let progress = progress.unwrap_or_else(ProgressBar::hidden);
+        progress.set_length(total_chunks as u64);
+        progress.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} transcribing-words {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed_precise}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let results = stream::iter(chunks.iter().cloned().enumerate())
+            .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
+                let client = client.clone();
+                let stt_model = stt_model.clone();
+                let progress = progress.clone();
+                let completed = completed.clone();
+                let total_chunks = total_chunks;
+                let stt_rpm_gate = stt_rpm_gate.clone();
+                async move {
+                    let chunk_label = chunk_path.display().to_string();
+                    if let Some(gate) = stt_rpm_gate.as_ref() {
+                        gate.wait().await;
+                    }
+                    let tr = client
+                        .transcribe_words(&stt_model, &chunk_path)
+                        .await
+                        .with_context(|| format!("stt-words for {chunk_label}"))?;
+
+                    let segments =
+                        map_segments_or_synthesize_words(&tr, offset_secs, chunk_duration_secs);
+                    let words = align::shift_words(&tr.words, offset_secs);
+
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress.set_message(format!("chunk {done}/{total_chunks}"));
+                    progress.inc(1);
+                    Ok::<_, anyhow::Error>((idx, segments, words))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        progress.finish_with_message("word transcription complete");
+
+        let mut per_chunk = Vec::with_capacity(results.len());
+        for res in results {
+            per_chunk.push(res?);
+        }
+        per_chunk.sort_by_key(|(idx, _, _)| *idx);
+
+        let mut segments_out = Vec::new();
+        let mut words_out = Vec::new();
+        let mut text_out = String::new();
+        for (_, segs, words) in per_chunk {
+            for seg in segs {
+                if !seg.text.trim().is_empty() {
+                    text_out.push_str(seg.text.trim());
+                    text_out.push('\n');
+                    segments_out.push(seg);
+                }
+            }
+            words_out.extend(words);
+        }
+
+        Ok(WordTranscript {
+            full_text: text_out,
+            segments: segments_out,
+            words: words_out,
         })
     }
 
@@ -365,6 +464,28 @@ fn map_segments_or_synthesize(
                 start: s.start + offset_secs,
                 end: s.end + offset_secs,
                 text: s.text,
+            })
+            .collect();
+    }
+
+    synthesize_minute_segments(&tr.text, offset_secs, chunk_duration_secs)
+}
+
+/// Variant of `map_segments_or_synthesize` that borrows the response (we still need
+/// `tr.words` after this call for the word-shift pass).
+fn map_segments_or_synthesize_words(
+    tr: &crate::openai::TranscriptionText,
+    offset_secs: f64,
+    chunk_duration_secs: f64,
+) -> Vec<TranscriptSegment> {
+    if !tr.segments.is_empty() {
+        return tr
+            .segments
+            .iter()
+            .map(|s| TranscriptSegment {
+                start: s.start + offset_secs,
+                end: s.end + offset_secs,
+                text: s.text.clone(),
             })
             .collect();
     }

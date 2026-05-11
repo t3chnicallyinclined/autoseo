@@ -79,6 +79,27 @@ pub struct Config {
     #[arg(long, env = "EMBED_MODEL_DIR", default_value = "./work/models/fastembed")]
     pub embed_model_dir: String,
 
+    /// LLM clip-ranker system prompt path.
+    #[arg(
+        long,
+        env = "CLIP_RANKER_SYSTEM_PROMPT_PATH",
+        default_value = "./prompts/clips/ranker_system.txt"
+    )]
+    pub clip_ranker_system_prompt_path: String,
+
+    /// LLM clip-ranker user prompt template path. Supports `{{candidates_json}}`,
+    /// `{{show_name}}`, `{{hosts}}`, `{{guest}}`.
+    #[arg(
+        long,
+        env = "CLIP_RANKER_USER_PROMPT_PATH",
+        default_value = "./prompts/clips/ranker_user.txt"
+    )]
+    pub clip_ranker_user_prompt_path: String,
+
+    /// Number of top-ranked clips to render and include in the digest email.
+    #[arg(long, env = "CLIP_TOP_K", default_value_t = 10)]
+    pub clip_top_k: usize,
+
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]
     pub dump_dir: Option<String>,

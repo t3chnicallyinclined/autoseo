@@ -47,12 +47,31 @@ pub struct Config {
     pub work_dir: String,
 
     /// File-backed dedupe list (newline-delimited Gmail message IDs).
+    /// Read once on startup and imported into the SQLite jobs table; thereafter
+    /// dedupe lives in `clipper_db`.
     #[arg(
         long,
         env = "DEDUPE_FILE",
         default_value = "./work/processed_message_ids.txt"
     )]
     pub dedupe_file: String,
+
+    /// SQLite database path. Holds jobs/clips/posts/analytics/trends.
+    /// Survives container restarts when WORK_DIR is mounted.
+    #[arg(long, env = "CLIPPER_DB", default_value = "./work/clipper.db")]
+    pub clipper_db: String,
+
+    /// Pipeline mode. Accepted: "seo-only" (current behavior — emails SEO packages only),
+    /// "clipper" (new — produces clips and digest email; M1+), "both" (runs both).
+    /// Default keeps existing behavior unchanged until the clipper path is feature-complete.
+    #[arg(long, env = "MODE", default_value = "seo-only")]
+    pub mode: String,
+
+    /// Root directory for per-show prompt overrides.
+    /// Layout: {shows_dir}/{show_slug}/{seo_system,seo_user,seo_variants,thumbnail_system,thumbnail_user}.txt
+    /// A missing file falls back to the global prompt path.
+    #[arg(long, env = "SHOWS_DIR", default_value = "./prompts/shows")]
+    pub shows_dir: String,
 
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]

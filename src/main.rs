@@ -1,6 +1,5 @@
 mod ai_pipeline;
 mod config;
-mod dedupe;
 mod drive;
 mod gmail;
 mod google_auth;
@@ -9,6 +8,9 @@ mod mime;
 mod openai;
 mod parse;
 mod rate_limit;
+mod scene;
+mod show_config;
+mod storage;
 mod thumbs;
 
 use anyhow::Context;
@@ -19,13 +21,13 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use ai_pipeline::{AiPipeline, ThumbnailMoment};
 use config::Config;
-use dedupe::FileBackedDedupe;
 use drive::DriveClient;
 use gmail::GmailClient;
 use google_auth::GoogleAuth;
 use mime::build_mime_email;
 use openai::OpenAiClient;
 use std::time::{SystemTime, UNIX_EPOCH};
+use storage::Storage;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -36,11 +38,21 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::parse();
 
+    let mode = show_config::Mode::parse(&cfg.mode)?;
+
     // Print a minimal startup banner to stdout so `docker logs` is never empty.
     println!(
-        "autoseo starting (poll_interval_secs={}, require_video={}, work_dir={}, dedupe_file={})",
-        cfg.poll_interval_secs, cfg.require_video, cfg.work_dir, cfg.dedupe_file
+        "autoseo starting (mode={:?}, poll_interval_secs={}, require_video={}, work_dir={}, clipper_db={})",
+        mode, cfg.poll_interval_secs, cfg.require_video, cfg.work_dir, cfg.clipper_db
     );
+
+    if mode.produces_clips() {
+        tracing::warn!(
+            "MODE={} requested clip production but the clipper pipeline is not yet feature-complete \
+             (M1 in progress on feat/clipper). Clip stages will no-op for now.",
+            cfg.mode
+        );
+    }
 
     let google = GoogleAuth::new(
         cfg.google_client_id.clone(),
@@ -49,7 +61,16 @@ async fn main() -> anyhow::Result<()> {
     );
     let gmail = GmailClient::new();
     let drive = DriveClient::new();
-    let mut dedupe = FileBackedDedupe::load(&cfg.dedupe_file).await?;
+    let storage = Storage::open(&cfg.clipper_db).await?;
+    let imported = storage.import_legacy_dedupe(&cfg.dedupe_file).await?;
+    if imported > 0 {
+        tracing::info!(
+            imported,
+            dedupe_file = %cfg.dedupe_file,
+            clipper_db = %cfg.clipper_db,
+            "imported legacy dedupe entries into sqlite"
+        );
+    }
 
     let (ai, seo_variant_blocks) = if cfg.dry_run {
         (None, Vec::new())
@@ -141,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
             &gmail,
             &drive,
             ai.as_ref(),
-            &mut dedupe,
+            &storage,
             &seo_variant_blocks,
         )
         .await
@@ -164,7 +185,7 @@ async fn run_once(
     gmail: &GmailClient,
     drive: &DriveClient,
     ai: Option<&AiPipeline>,
-    dedupe: &mut FileBackedDedupe,
+    storage: &Storage,
     seo_variant_blocks: &[String],
 ) -> anyhow::Result<()> {
     let access_token = google.access_token().await?;
@@ -178,7 +199,7 @@ async fn run_once(
     }
 
     for message_id in message_ids {
-        if dedupe.contains(&message_id) {
+        if storage.job_exists(&message_id).await? {
             continue;
         }
 
@@ -219,7 +240,7 @@ async fn run_once(
         }
         if file_ids.is_empty() {
             tracing::info!(message_id, "no drive file ids found in message");
-            dedupe.insert(message_id).await?;
+            storage.mark_processed(&message_id).await?;
             continue;
         }
 
@@ -232,7 +253,7 @@ async fn run_once(
             Err(e) => {
                 // Common case: forwarded/old drive links or links you no longer have access to.
                 tracing::warn!(message_id, file_id, error=?e, "failed to fetch drive metadata; skipping");
-                dedupe.insert(message_id).await?;
+                storage.mark_processed(&message_id).await?;
                 continue;
             }
         };
@@ -240,7 +261,7 @@ async fn run_once(
 
         if cfg.dry_run {
             // Mark processed so repeated dry-runs don't spam the same message.
-            dedupe.insert(message_id).await?;
+            storage.mark_processed(&message_id).await?;
             continue;
         }
 
@@ -285,7 +306,7 @@ async fn run_once(
                 mime_type = %meta.mime_type,
                 "skipping non-video drive file (require_video=true)"
             );
-            dedupe.insert(message_id).await?;
+            storage.mark_processed(&message_id).await?;
             continue;
         }
 
@@ -297,7 +318,7 @@ async fn run_once(
                 mime_type = %meta.mime_type,
                 "skipping unrecognized media type (not audio/video)"
             );
-            dedupe.insert(message_id).await?;
+            storage.mark_processed(&message_id).await?;
             continue;
         }
 
@@ -572,7 +593,7 @@ async fn run_once(
         }
 
         // Mark as processed only after all variant emails are sent.
-        dedupe.insert(message_id).await?;
+        storage.mark_processed(&message_id).await?;
         tracing::info!("done");
 
         // MVP: only process the newest matching media message.

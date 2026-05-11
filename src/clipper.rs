@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ai_pipeline::AiPipeline;
 use crate::align::AlignedWord;
 use crate::candidates::{self, CandidateGenerator};
-use crate::captions::{self, CaptionStyle};
+use crate::captions::{self, CaptionStyle, OverlayStyle};
 use crate::config::Config;
 use crate::embed::Embedder;
 use crate::gmail::GmailClient;
@@ -26,6 +26,7 @@ use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
 use crate::scene;
 use crate::show_config::DigestMode;
+use crate::social_copy::{SocialCopy, SocialCopyGenerator};
 use crate::vad;
 use crate::vlm_ranker::VlmReranker;
 
@@ -274,19 +275,93 @@ pub async fn run_clipper_local_once(
 
     let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
 
-    // Render each ranked clip with burned captions.
+    // Generate per-platform social-media copy for each top clip. One LLM call
+    // per clip; non-fatal — a single failure logs and continues.
+    let social_copies: Vec<Option<SocialCopy>> = if cfg.clip_social_copy_disabled {
+        tracing::info!("clipper: social-copy generation disabled by config");
+        vec![None; ranked.len()]
+    } else {
+        let sys = tokio::fs::read_to_string(&cfg.clip_social_system_prompt_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "read social system prompt at {}",
+                    &cfg.clip_social_system_prompt_path
+                )
+            })?
+            .trim()
+            .to_string();
+        let user_tmpl = tokio::fs::read_to_string(&cfg.clip_social_user_prompt_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "read social user prompt at {}",
+                    &cfg.clip_social_user_prompt_path
+                )
+            })?
+            .trim()
+            .to_string();
+        let generator = SocialCopyGenerator::new(
+            ai.openai.clone(),
+            ai.chat_model.clone(),
+            sys,
+            user_tmpl,
+        );
+        tracing::info!(top_k = ranked.len(), "clipper: generating per-platform social copy");
+        let mut copies: Vec<Option<SocialCopy>> = Vec::with_capacity(ranked.len());
+        for (i, clip) in ranked.iter().enumerate() {
+            let candidate = candidates.get(clip.candidate_index);
+            let copy = match candidate {
+                Some(cand) => match generator.generate(clip, cand, show_context.as_ref()).await {
+                    Ok(c) => {
+                        tracing::info!(
+                            clip = i + 1,
+                            overlay = %c.overlay_hook,
+                            "social copy generated"
+                        );
+                        Some(c)
+                    }
+                    Err(e) => {
+                        tracing::warn!(clip = i + 1, error = ?e, "social copy failed");
+                        None
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        clip = i + 1,
+                        candidate_idx = clip.candidate_index,
+                        "social copy: candidate lookup failed"
+                    );
+                    None
+                }
+            };
+            copies.push(copy);
+        }
+        copies
+    };
+
+    // Render each ranked clip in every requested aspect ratio. Captions use a
+    // per-aspect style (font size + margins tuned for the frame).
     let clips_dir = job_dir.join("clips");
     tokio::fs::create_dir_all(&clips_dir).await.ok();
-    let profile = RenderProfile::shorts_vertical();
-    let style = CaptionStyle::default();
+
+    let formats = parse_render_formats(&cfg.clip_render_formats);
+    if formats.is_empty() {
+        anyhow::bail!(
+            "CLIP_RENDER_FORMATS produced no recognized formats (got '{}'); expected any of 9x16,1x1,16x9",
+            cfg.clip_render_formats
+        );
+    }
+    tracing::info!(
+        formats = ?formats.iter().map(|f| f.label).collect::<Vec<_>>(),
+        "clipper: render formats"
+    );
 
     let mut rendered: Vec<RenderedClip> = Vec::with_capacity(ranked.len());
-    for (i, clip) in ranked.iter().enumerate() {
+    for (i, (clip, social)) in ranked.iter().zip(social_copies.iter()).enumerate() {
         let idx = i + 1;
-        let basename = format!("clip_{idx:02}_{}-{}.mp4", to_mmss(clip.start_secs), to_mmss(clip.end_secs));
-        let out_path = clips_dir.join(&basename);
-        let ass_path = clips_dir.join(format!("clip_{idx:02}.ass"));
 
+        // Shift word timestamps into clip-local time once; reused for every aspect.
         let clip_words: Vec<AlignedWord> = transcript
             .words
             .iter()
@@ -298,42 +373,110 @@ pub async fn run_clipper_local_once(
             })
             .collect();
 
-        captions::write_ass(&ass_path, &clip_words, profile.width, profile.height, &style)
-            .await
-            .with_context(|| format!("write .ass for clip {idx}"))?;
+        let mut variants: Vec<RenderedVariant> = Vec::with_capacity(formats.len());
+        for spec in &formats {
+            let basename = format!(
+                "clip_{idx:02}_{}-{}_{}.mp4",
+                to_mmss(clip.start_secs),
+                to_mmss(clip.end_secs),
+                spec.label
+            );
+            let out_path = clips_dir.join(&basename);
+            let ass_path =
+                clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
-        let render_result = render::render_clip(
-            &cfg.ffmpeg,
-            &input_path,
-            clip.start_secs,
-            clip.end_secs,
-            &out_path,
-            &profile,
-            Some(&ass_path),
-        )
-        .await;
+            let profile = (spec.profile)();
+            let style = (spec.style)();
 
-        match render_result {
-            Ok(()) => {
-                let bytes = tokio::fs::metadata(&out_path).await.map(|m| m.len()).unwrap_or(0);
-                tracing::info!(
-                    clip = idx,
-                    path = %out_path.display(),
-                    score = clip.score,
-                    bytes,
-                    "rendered clip"
-                );
-                rendered.push(RenderedClip {
-                    rank: idx,
-                    path: out_path,
-                    bytes,
-                    ranked: clip.clone(),
-                });
+            if let Err(e) =
+                captions::write_ass(&ass_path, &clip_words, profile.width, profile.height, &style)
+                    .await
+            {
+                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(clip = idx, error = ?e, "render failed; skipping");
+
+            // Optional overlay hook .ass for the first ~1.5s. Only write if the
+            // social-copy LLM produced a hook. The render filter chain takes both
+            // (captions first, overlay second so it draws on top).
+            let overlay_ass_path = clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
+            let mut overlay_written = false;
+            if let Some(sc) = social {
+                let hook = sc.overlay_hook.trim();
+                if !hook.is_empty() {
+                    let overlay_style = (spec.overlay_style)();
+                    match captions::write_overlay_ass(
+                        &overlay_ass_path,
+                        hook,
+                        profile.width,
+                        profile.height,
+                        &overlay_style,
+                    )
+                    .await
+                    {
+                        Ok(()) => overlay_written = true,
+                        Err(e) => {
+                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                        }
+                    }
+                }
+            }
+
+            // Build subtitle layer list: captions first, overlay last so it draws on top.
+            let mut layers: Vec<&std::path::Path> = vec![ass_path.as_ref()];
+            if overlay_written {
+                layers.push(overlay_ass_path.as_ref());
+            }
+
+            let res = render::render_clip(
+                &cfg.ffmpeg,
+                &input_path,
+                clip.start_secs,
+                clip.end_secs,
+                &out_path,
+                &profile,
+                &layers,
+            )
+            .await;
+
+            match res {
+                Ok(()) => {
+                    let bytes = tokio::fs::metadata(&out_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    tracing::info!(
+                        clip = idx,
+                        format = spec.label,
+                        path = %out_path.display(),
+                        bytes,
+                        "rendered variant"
+                    );
+                    variants.push(RenderedVariant {
+                        label: spec.label.to_string(),
+                        path: out_path,
+                        bytes,
+                        width: profile.width,
+                        height: profile.height,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
+                }
             }
         }
+
+        if variants.is_empty() {
+            tracing::warn!(clip = idx, "no variants rendered for this clip");
+            continue;
+        }
+
+        rendered.push(RenderedClip {
+            rank: idx,
+            ranked: clip.clone(),
+            social: social.clone(),
+            variants,
+        });
     }
 
     if rendered.is_empty() {
@@ -349,6 +492,19 @@ pub async fn run_clipper_local_once(
             .with_context(|| format!("write digest at {}", digest_path.display()))?;
         let abs = digest_path.canonicalize().unwrap_or(digest_path);
         tracing::info!(path = %abs.display(), "clipper: digest written to disk");
+
+        // Structured manifest for the HTML viewer (rich UI loads this instead of
+        // regex-parsing digest.md).
+        let manifest_path = clips_dir.join("manifest.json");
+        let manifest =
+            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered);
+        let manifest_text = serde_json::to_string_pretty(&manifest)
+            .unwrap_or_else(|_| "{}".to_string());
+        if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
+            tracing::warn!(error = ?e, "manifest.json write failed (non-fatal)");
+        } else {
+            tracing::info!(path = %manifest_path.display(), "clipper: manifest.json written");
+        }
     }
 
     if digest_mode.sends_email() {
@@ -377,9 +533,65 @@ pub async fn run_clipper_local_once(
 
 struct RenderedClip {
     rank: usize,
+    ranked: RankedClip,
+    social: Option<SocialCopy>,
+    variants: Vec<RenderedVariant>,
+}
+
+struct RenderedVariant {
+    label: String, // "9x16" | "1x1" | "16x9"
     path: PathBuf,
     bytes: u64,
-    ranked: RankedClip,
+    width: u32,
+    height: u32,
+}
+
+/// One requested render format: aspect-ratio label + factories for the matching
+/// `RenderProfile`, `CaptionStyle`, and `OverlayStyle`.
+struct FormatSpec {
+    label: &'static str,
+    profile: fn() -> RenderProfile,
+    style: fn() -> CaptionStyle,
+    overlay_style: fn() -> OverlayStyle,
+}
+
+fn parse_render_formats(spec: &str) -> Vec<FormatSpec> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in spec.split(',') {
+        let label = raw.trim().to_ascii_lowercase();
+        if label.is_empty() || !seen.insert(label.clone()) {
+            continue;
+        }
+        let spec = match label.as_str() {
+            "9x16" | "vertical" | "shorts" => Some(FormatSpec {
+                label: "9x16",
+                profile: RenderProfile::shorts_vertical,
+                style: CaptionStyle::for_vertical,
+                overlay_style: OverlayStyle::for_vertical,
+            }),
+            "1x1" | "square" => Some(FormatSpec {
+                label: "1x1",
+                profile: RenderProfile::linkedin_square,
+                style: CaptionStyle::for_square,
+                overlay_style: OverlayStyle::for_square,
+            }),
+            "16x9" | "landscape" | "horizontal" => Some(FormatSpec {
+                label: "16x9",
+                profile: RenderProfile::bluesky_landscape,
+                style: CaptionStyle::for_landscape,
+                overlay_style: OverlayStyle::for_landscape,
+            }),
+            other => {
+                tracing::warn!(format = other, "unknown render format; ignoring");
+                None
+            }
+        };
+        if let Some(s) = spec {
+            out.push(s);
+        }
+    }
+    out
 }
 
 fn build_digest_body(
@@ -408,25 +620,37 @@ fn build_digest_body(
 
     for r in rendered {
         out.push_str(&format!(
-            "Clip {idx:02}  score {score}  {start}-{end}  ({dur}s)  {size:.1}MB\n",
+            "## Clip {idx:02}  score {score}  {start}-{end}  ({dur}s)\n",
             idx = r.rank,
             score = r.ranked.score,
             start = to_mmss(r.ranked.start_secs),
             end = to_mmss(r.ranked.end_secs),
             dur = (r.ranked.end_secs - r.ranked.start_secs) as i64,
-            size = r.bytes as f64 / (1024.0 * 1024.0),
         ));
         if !r.ranked.hook.is_empty() {
-            out.push_str(&format!("  hook: {}\n", r.ranked.hook));
+            out.push_str(&format!("  hook:    {}\n", r.ranked.hook));
         }
         if !r.ranked.reasoning.is_empty() {
-            out.push_str(&format!("  why:  {}\n", r.ranked.reasoning));
+            out.push_str(&format!("  why:     {}\n", r.ranked.reasoning));
         }
-        let abs_path = r
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| r.path.clone());
-        out.push_str(&format!("  file: {}\n", abs_path.display()));
+        out.push_str("  files:\n");
+        for v in &r.variants {
+            let abs = v.path.canonicalize().unwrap_or_else(|_| v.path.clone());
+            out.push_str(&format!(
+                "    [{}]  {wx}x{hx}  {sz:.1}MB  {p}\n",
+                v.label,
+                wx = v.width,
+                hx = v.height,
+                sz = v.bytes as f64 / (1024.0 * 1024.0),
+                p = abs.display(),
+            ));
+        }
+        if let Some(social) = &r.social {
+            if !social.overlay_hook.is_empty() {
+                out.push_str(&format!("  overlay: {}\n", social.overlay_hook));
+            }
+            append_social_copy(&mut out, social);
+        }
         out.push('\n');
         out.push_str(&"-".repeat(72));
         out.push('\n');
@@ -434,6 +658,179 @@ fn build_digest_body(
 
     out.push('\n');
     out.push_str("Clips are on disk at the paths above. Pick the winners and post them.\n");
+    out
+}
+
+fn append_social_copy(out: &mut String, s: &SocialCopy) {
+    out.push('\n');
+    out.push_str("  ── YouTube Shorts ──────────────\n");
+    if !s.youtube_shorts.title.is_empty() {
+        out.push_str(&format!("  Title:        {}\n", s.youtube_shorts.title));
+    }
+    if !s.youtube_shorts.description.is_empty() {
+        out.push_str(&indent_block("Description", &s.youtube_shorts.description));
+    }
+    if !s.youtube_shorts.hashtags.is_empty() {
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.youtube_shorts.hashtags.join(" ")
+        ));
+    }
+    if !s.youtube_shorts.pinned_comment.is_empty() {
+        out.push_str(&format!(
+            "  Pinned cmt:   {}\n",
+            s.youtube_shorts.pinned_comment
+        ));
+    }
+
+    out.push_str("\n  ── TikTok ──────────────────────\n");
+    if !s.tiktok.caption.is_empty() {
+        out.push_str(&indent_block("Caption", &s.tiktok.caption));
+    }
+    if !s.tiktok.hashtags.is_empty() {
+        out.push_str(&format!("  Hashtags:     {}\n", s.tiktok.hashtags.join(" ")));
+    }
+
+    out.push_str("\n  ── Instagram Reels ─────────────\n");
+    if !s.instagram_reels.caption.is_empty() {
+        out.push_str(&indent_block("Caption", &s.instagram_reels.caption));
+    }
+    if !s.instagram_reels.hashtags.is_empty() {
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.instagram_reels.hashtags.join(" ")
+        ));
+    }
+
+    out.push_str("\n  ── Threads ─────────────────────\n");
+    if !s.threads.text.is_empty() {
+        out.push_str(&indent_block("Text", &s.threads.text));
+    }
+    if !s.threads.hashtags.is_empty() {
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.threads.hashtags.join(" ")
+        ));
+    }
+
+    out.push_str("\n  ── LinkedIn ────────────────────\n");
+    if !s.linkedin.post_text.is_empty() {
+        out.push_str(&indent_block("Post", &s.linkedin.post_text));
+    }
+    if !s.linkedin.hashtags.is_empty() {
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.linkedin.hashtags.join(" ")
+        ));
+    }
+
+    out.push_str("\n  ── X / Twitter ─────────────────\n");
+    if !s.x.text.is_empty() {
+        out.push_str(&indent_block("Text", &s.x.text));
+    }
+    if !s.x.hashtags.is_empty() {
+        out.push_str(&format!("  Hashtags:     {}\n", s.x.hashtags.join(" ")));
+    }
+
+    out.push_str("\n  ── Bluesky ─────────────────────\n");
+    if !s.bluesky.text.is_empty() {
+        out.push_str(&indent_block("Text", &s.bluesky.text));
+    }
+    if !s.bluesky.hashtags.is_empty() {
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.bluesky.hashtags.join(" ")
+        ));
+    }
+}
+
+/// Structured manifest of a clipper run for downstream tools (HTML viewer,
+/// future posting bot, analytics). One per run; lives at `clips_dir/manifest.json`.
+fn build_manifest_json(
+    media_name: &str,
+    total_duration_secs: f64,
+    clips_dir: &std::path::Path,
+    rendered: &[RenderedClip],
+) -> serde_json::Value {
+    let abs_clips_dir = clips_dir
+        .canonicalize()
+        .unwrap_or_else(|_| clips_dir.to_path_buf());
+
+    let clips: Vec<serde_json::Value> = rendered
+        .iter()
+        .map(|r| {
+            let variants: Vec<serde_json::Value> = r
+                .variants
+                .iter()
+                .map(|v| {
+                    let abs = v.path.canonicalize().unwrap_or_else(|_| v.path.clone());
+                    serde_json::json!({
+                        "label": v.label,
+                        "filename": v.path.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(""),
+                        "abs_path": abs.display().to_string(),
+                        "width": v.width,
+                        "height": v.height,
+                        "bytes": v.bytes,
+                    })
+                })
+                .collect();
+
+            let social = r
+                .social
+                .as_ref()
+                .and_then(|s| serde_json::to_value(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+
+            serde_json::json!({
+                "rank": r.rank,
+                "score": r.ranked.score,
+                "start_secs": r.ranked.start_secs,
+                "end_secs": r.ranked.end_secs,
+                "duration_secs": (r.ranked.end_secs - r.ranked.start_secs).max(0.0),
+                "time_range_mmss": format!(
+                    "{}-{}",
+                    to_mmss(r.ranked.start_secs),
+                    to_mmss(r.ranked.end_secs),
+                ),
+                "hook": r.ranked.hook,
+                "reasoning": r.ranked.reasoning,
+                "variants": variants,
+                "social": social,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "schema_version": 1,
+        "episode": media_name,
+        "total_duration_secs": total_duration_secs,
+        "clips_dir": abs_clips_dir.display().to_string(),
+        "generated_at_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "clips": clips,
+    })
+}
+
+/// Pretty-print a multi-line block with consistent left padding.
+fn indent_block(label: &str, body: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for line in body.lines() {
+        if first {
+            out.push_str(&format!("  {label}: {pad}{line}\n", pad = " ".repeat(13_usize.saturating_sub(label.len() + 2))));
+            first = false;
+        } else {
+            out.push_str(&format!("  {pad}{line}\n", pad = " ".repeat(15)));
+        }
+    }
+    if first {
+        // Empty body — emit just the label.
+        out.push_str(&format!("  {label}:\n"));
+    }
     out
 }
 
@@ -549,8 +946,6 @@ mod tests {
     fn dummy_clip(rank: usize, score: i32, start: f64, end: f64, hook: &str) -> RenderedClip {
         RenderedClip {
             rank,
-            path: PathBuf::from(format!("/tmp/clip_{rank:02}.mp4")),
-            bytes: 2_500_000,
             ranked: RankedClip {
                 candidate_index: rank,
                 start_secs: start,
@@ -559,6 +954,14 @@ mod tests {
                 hook: hook.to_string(),
                 reasoning: "test".to_string(),
             },
+            social: None,
+            variants: vec![RenderedVariant {
+                label: "9x16".into(),
+                path: PathBuf::from(format!("/tmp/clip_{rank:02}_9x16.mp4")),
+                bytes: 2_500_000,
+                width: 1080,
+                height: 1920,
+            }],
         }
     }
 
@@ -578,8 +981,9 @@ mod tests {
         assert!(body.contains("second hook"));
         assert!(body.contains("01:00-02:00"));
         assert!(body.contains("score 90"));
-        // File paths and clips directory should appear.
-        assert!(body.contains("clip_01.mp4"));
+        // File entries should appear under each clip's variants block.
+        assert!(body.contains("clip_01_9x16.mp4"), "expected variant filename, got:\n{body}");
+        assert!(body.contains("[9x16]"));
         assert!(body.contains("Clips directory:"));
     }
 }

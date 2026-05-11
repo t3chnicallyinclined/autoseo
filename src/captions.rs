@@ -32,15 +32,52 @@ pub struct CaptionStyle {
 
 impl Default for CaptionStyle {
     fn default() -> Self {
+        Self::for_vertical()
+    }
+}
+
+impl CaptionStyle {
+    /// Caption style tuned for 9:16 vertical (1080×1920). Large font, bottom-center
+    /// with a thumb-safe margin from the bottom edge.
+    pub fn for_vertical() -> Self {
         Self {
             font_name: "Montserrat".into(),
             font_size_pt: 80,
-            primary_bgr: 0xFFFFFF, // white
-            outline_bgr: 0x000000, // black
+            primary_bgr: 0xFFFFFF,
+            outline_bgr: 0x000000,
             outline_px: 4,
             margin_v_px: 200,
             max_words_per_phrase: 4,
             max_chars_per_phrase: 28,
+        }
+    }
+
+    /// Caption style tuned for 1:1 square (1080×1080). Smaller font, tighter margin.
+    pub fn for_square() -> Self {
+        Self {
+            font_name: "Montserrat".into(),
+            font_size_pt: 60,
+            primary_bgr: 0xFFFFFF,
+            outline_bgr: 0x000000,
+            outline_px: 3,
+            margin_v_px: 80,
+            max_words_per_phrase: 5,
+            max_chars_per_phrase: 36,
+        }
+    }
+
+    /// Caption style tuned for 16:9 landscape (1920×1080). Smaller font (more
+    /// horizontal real estate, longer phrases possible).
+    pub fn for_landscape() -> Self {
+        Self {
+            font_name: "Montserrat".into(),
+            font_size_pt: 50,
+            primary_bgr: 0xFFFFFF,
+            outline_bgr: 0x000000,
+            outline_px: 3,
+            margin_v_px: 60,
+            max_words_per_phrase: 7,
+            max_chars_per_phrase: 52,
         }
     }
 }
@@ -64,6 +101,123 @@ pub async fn write_ass(
         .await
         .with_context(|| format!("write ass file {}", path.display()))?;
     Ok(())
+}
+
+/// Overlay style — for the "WAIT FOR IT"-style hook shown over the first
+/// ~1.5 seconds of a clip. Big, bold, centered, fades in/out.
+#[derive(Debug, Clone)]
+pub struct OverlayStyle {
+    pub font_name: String,
+    pub font_size_pt: u32,
+    pub primary_bgr: u32,
+    pub outline_bgr: u32,
+    pub outline_px: u32,
+    /// Vertical margin used as a hint (ASS alignment 5 is middle-center, so this is unused;
+    /// kept for future flexibility).
+    pub margin_v_px: u32,
+    /// Total on-screen duration in seconds (default 1.5).
+    pub duration_secs: f64,
+    /// Fade in / fade out duration in seconds (default 0.3 each).
+    pub fade_secs: f64,
+}
+
+impl OverlayStyle {
+    pub fn for_vertical() -> Self {
+        Self {
+            font_name: "Montserrat".into(),
+            font_size_pt: 130,
+            primary_bgr: 0xFFFFFF,
+            outline_bgr: 0x000000,
+            outline_px: 5,
+            margin_v_px: 0,
+            duration_secs: 1.5,
+            fade_secs: 0.3,
+        }
+    }
+
+    pub fn for_square() -> Self {
+        Self {
+            font_size_pt: 100,
+            ..Self::for_vertical()
+        }
+    }
+
+    pub fn for_landscape() -> Self {
+        Self {
+            font_size_pt: 80,
+            ..Self::for_vertical()
+        }
+    }
+}
+
+/// Write an overlay-only `.ass` file containing a single Dialogue event for
+/// the hook text, centered in the frame with a fade-in/out animation.
+pub async fn write_overlay_ass(
+    path: &Path,
+    hook: &str,
+    play_res_w: u32,
+    play_res_h: u32,
+    style: &OverlayStyle,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let body = render_overlay_ass(hook, play_res_w, play_res_h, style);
+    tokio::fs::write(path, body)
+        .await
+        .with_context(|| format!("write overlay ass {}", path.display()))?;
+    Ok(())
+}
+
+/// Pure function: produce the overlay `.ass` text for a single hook event.
+pub fn render_overlay_ass(
+    hook: &str,
+    play_res_w: u32,
+    play_res_h: u32,
+    style: &OverlayStyle,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&header(play_res_w, play_res_h));
+    out.push_str(&overlay_style_block(style));
+    out.push_str("[Events]\n");
+    out.push_str(
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    );
+
+    let text = sanitize_text(hook.trim());
+    if text.is_empty() {
+        return out;
+    }
+    let start = format_ass_time(0.0);
+    let end = format_ass_time(style.duration_secs.max(0.1));
+    let fade_ms = (style.fade_secs.max(0.0) * 1000.0).round() as u64;
+    let fade_tag = if fade_ms > 0 {
+        format!("{{\\fade({fade_ms},{fade_ms})}}")
+    } else {
+        String::new()
+    };
+    // Layer 1 so overlay draws above any captions burned via a later subtitles filter.
+    out.push_str(&format!(
+        "Dialogue: 1,{start},{end},Overlay,,0,0,0,,{fade_tag}{text}\n"
+    ));
+    out
+}
+
+fn overlay_style_block(style: &OverlayStyle) -> String {
+    let primary = format!("&H00{:06X}", style.primary_bgr & 0xFFFFFF);
+    let outline = format!("&H00{:06X}", style.outline_bgr & 0xFFFFFF);
+    // Alignment 5 = middle-center.
+    format!(
+        "[V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Overlay,{font},{size},{primary},{primary},{outline},&H80000000,-1,0,0,0,100,100,0,0,1,{out_px},0,5,40,40,0,1\n\
+         \n",
+        font = style.font_name,
+        size = style.font_size_pt,
+        primary = primary,
+        outline = outline,
+        out_px = style.outline_px,
+    )
 }
 
 /// Pure function for testability: produce the full `.ass` text.
@@ -348,5 +502,41 @@ mod tests {
         let body = tokio::fs::read_to_string(&path).await?;
         assert!(body.contains("Dialogue: "));
         Ok(())
+    }
+
+    #[test]
+    fn overlay_ass_emits_single_event_with_fade() {
+        let body = render_overlay_ass("WAIT FOR IT", 1080, 1920, &OverlayStyle::for_vertical());
+        assert!(body.contains("[Script Info]"));
+        assert!(body.contains("Style: Overlay,Montserrat,130"));
+        // Alignment 5 = middle-center.
+        assert!(body.contains(",5,"));
+        // Single Dialogue with fade tag.
+        let dialogue_count = body.matches("Dialogue: ").count();
+        assert_eq!(dialogue_count, 1);
+        assert!(body.contains("WAIT FOR IT"));
+        assert!(body.contains("\\fade(300,300)"));
+        // Duration 1.5s → end at 0:00:01.50.
+        assert!(body.contains("0:00:01.50"));
+    }
+
+    #[test]
+    fn overlay_with_empty_hook_produces_no_dialogue() {
+        let body = render_overlay_ass("   ", 1080, 1920, &OverlayStyle::for_vertical());
+        assert!(body.contains("[Events]"));
+        assert!(!body.contains("Dialogue: "));
+    }
+
+    #[test]
+    fn overlay_aspect_specific_sizes_differ() {
+        assert_eq!(OverlayStyle::for_vertical().font_size_pt, 130);
+        assert_eq!(OverlayStyle::for_square().font_size_pt, 100);
+        assert_eq!(OverlayStyle::for_landscape().font_size_pt, 80);
+    }
+
+    #[test]
+    fn overlay_sanitizes_braces_in_hook() {
+        let body = render_overlay_ass("{tricky}", 1080, 1920, &OverlayStyle::for_vertical());
+        assert!(body.contains(r"\{tricky\}"));
     }
 }

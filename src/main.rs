@@ -19,6 +19,7 @@ mod rate_limit;
 mod render;
 mod scene;
 mod show_config;
+mod social_copy;
 mod storage;
 mod thumbs;
 mod vad;

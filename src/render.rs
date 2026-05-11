@@ -82,7 +82,9 @@ impl RenderProfile {
 
 /// Render a single clip with cut + center-crop reformat + loudnorm + libx264.
 /// `start_secs` and `end_secs` are episode-time bounds (>= 0, end > start).
-/// `subtitle_path` is an optional `.ass` file to burn into the video.
+/// `subtitle_paths` is a list of `.ass` files to burn into the video, in order
+/// (later files draw on top — pass captions before the overlay if you want the
+/// overlay to win, or use Layer numbers inside the .ass for finer control).
 pub async fn render_clip(
     ffmpeg: &str,
     input: &Path,
@@ -90,7 +92,7 @@ pub async fn render_clip(
     end_secs: f64,
     output: &Path,
     profile: &RenderProfile,
-    subtitle_path: Option<&Path>,
+    subtitle_paths: &[&Path],
 ) -> anyhow::Result<()> {
     if !(end_secs > start_secs) {
         anyhow::bail!(
@@ -102,7 +104,7 @@ pub async fn render_clip(
     }
 
     let duration = end_secs - start_secs;
-    let vf = build_video_filter(profile, subtitle_path);
+    let vf = build_video_filter(profile, subtitle_paths);
     let af = build_audio_filter(profile);
 
     let status = Command::new(ffmpeg)
@@ -128,7 +130,7 @@ pub async fn render_clip(
     Ok(())
 }
 
-fn build_video_filter(profile: &RenderProfile, subtitle_path: Option<&Path>) -> String {
+fn build_video_filter(profile: &RenderProfile, subtitle_paths: &[&Path]) -> String {
     let (w, h) = (profile.width, profile.height);
     let crop_then_scale = match profile.aspect {
         // For 9:16 from any wider source: crop centered to 9:16 first, then scale.
@@ -151,9 +153,8 @@ fn build_video_filter(profile: &RenderProfile, subtitle_path: Option<&Path>) -> 
     // Force a common pixel format for browser/app players.
     chain.push("format=yuv420p".to_string());
 
-    // Burn subtitles last so they overlay the final framing.
-    if let Some(sub_path) = subtitle_path {
-        // libass needs the .ass path; escape single quotes for the filter graph.
+    // Burn each subtitle layer; later filters draw on top of earlier ones.
+    for sub_path in subtitle_paths {
         let escaped = sub_path.display().to_string().replace('\'', r"\'");
         chain.push(format!("subtitles='{escaped}'"));
     }
@@ -187,7 +188,7 @@ mod tests {
     #[test]
     fn vertical_filter_uses_crop_then_scale() {
         let p = RenderProfile::shorts_vertical();
-        let f = build_video_filter(&p, None);
+        let f = build_video_filter(&p, &[]);
         assert!(f.contains("crop=ih*9/16:ih"), "got: {f}");
         assert!(f.contains("scale=1080:1920"));
         assert!(f.contains("format=yuv420p"));
@@ -197,14 +198,26 @@ mod tests {
     #[test]
     fn subtitles_appended_when_provided() {
         let p = RenderProfile::shorts_vertical();
-        let f = build_video_filter(&p, Some(Path::new("/tmp/clip.ass")));
+        let f = build_video_filter(&p, &[Path::new("/tmp/clip.ass")]);
         assert!(f.ends_with("subtitles='/tmp/clip.ass'"), "got: {f}");
+    }
+
+    #[test]
+    fn multiple_subtitle_paths_chain_in_order() {
+        let p = RenderProfile::shorts_vertical();
+        let f = build_video_filter(
+            &p,
+            &[Path::new("/tmp/overlay.ass"), Path::new("/tmp/captions.ass")],
+        );
+        let overlay_pos = f.find("/tmp/overlay.ass").expect("overlay in filter");
+        let captions_pos = f.find("/tmp/captions.ass").expect("captions in filter");
+        assert!(overlay_pos < captions_pos, "overlay should burn before captions");
     }
 
     #[test]
     fn square_filter_crops_to_min_dimension() {
         let p = RenderProfile::linkedin_square();
-        let f = build_video_filter(&p, None);
+        let f = build_video_filter(&p, &[]);
         assert!(f.contains("min(iw,ih)"));
         assert!(f.contains("scale=1080:1080"));
     }
@@ -212,7 +225,7 @@ mod tests {
     #[test]
     fn landscape_filter_letterboxes_without_crop() {
         let p = RenderProfile::bluesky_landscape();
-        let f = build_video_filter(&p, None);
+        let f = build_video_filter(&p, &[]);
         assert!(f.contains("pad=1920:1080"));
         assert!(!f.contains("crop="));
     }
@@ -255,7 +268,7 @@ mod tests {
         anyhow::ensure!(status.success(), "synthetic mp4 generation failed");
 
         let profile = RenderProfile::shorts_vertical();
-        render_clip("ffmpeg", &src, 1.0, 4.0, &out, &profile, None).await?;
+        render_clip("ffmpeg", &src, 1.0, 4.0, &out, &profile, &[]).await?;
 
         let meta = tokio::fs::metadata(&out).await?;
         assert!(meta.len() > 0, "output is empty");
@@ -285,7 +298,7 @@ mod tests {
         let dummy_in = dir.path().join("in.mp4");
         let dummy_out = dir.path().join("out.mp4");
         let profile = RenderProfile::shorts_vertical();
-        let err = render_clip("ffmpeg", &dummy_in, 5.0, 5.0, &dummy_out, &profile, None)
+        let err = render_clip("ffmpeg", &dummy_in, 5.0, 5.0, &dummy_out, &profile, &[])
             .await
             .expect_err("expected error on zero duration");
         let msg = format!("{err:?}");

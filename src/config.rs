@@ -100,6 +100,34 @@ pub struct Config {
     #[arg(long, env = "CLIP_TOP_K", default_value_t = 10)]
     pub clip_top_k: usize,
 
+    /// System prompt for the per-clip social-media copy generator.
+    #[arg(
+        long,
+        env = "CLIP_SOCIAL_SYSTEM_PROMPT_PATH",
+        default_value = "./prompts/clips/social_system.txt"
+    )]
+    pub clip_social_system_prompt_path: String,
+
+    /// User prompt template for the per-clip social-media copy generator.
+    /// Supports `{{show_name}}`, `{{hosts}}`, `{{guest}}`, `{{time_range}}`,
+    /// `{{duration_secs}}`, `{{hook}}`, `{{reasoning}}`, `{{transcript}}`.
+    #[arg(
+        long,
+        env = "CLIP_SOCIAL_USER_PROMPT_PATH",
+        default_value = "./prompts/clips/social_user.txt"
+    )]
+    pub clip_social_user_prompt_path: String,
+
+    /// Disable per-clip social copy generation (saves ~10 LLM calls per episode).
+    #[arg(long, env = "CLIP_SOCIAL_COPY_DISABLED", default_value_t = false)]
+    pub clip_social_copy_disabled: bool,
+
+    /// Which aspect ratios to render per clip. Comma-separated list of any of:
+    /// `9x16` (Shorts/TikTok/Reels/Threads), `1x1` (LinkedIn/X feed),
+    /// `16x9` (LinkedIn landscape / Bluesky / YouTube re-upload).
+    #[arg(long, env = "CLIP_RENDER_FORMATS", default_value = "9x16,1x1,16x9")]
+    pub clip_render_formats: String,
+
     /// Hugging Face API key (used for HF Inference Providers — embeddings + VLM re-rank).
     /// When set, the clipper routes embeddings through HF instead of the local
     /// `fastembed` ONNX model. Required to enable VLM re-rank.

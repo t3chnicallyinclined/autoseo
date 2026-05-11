@@ -1,0 +1,21 @@
+Show: {{show_name}}
+Hosts: {{hosts}}
+Guest: {{guest}}
+
+The pipeline already ranked this clip and produced a one-line hook + the
+reasoning for the score. Use them as context — you may keep the same hook
+or rephrase it, but stay faithful to the clip transcript.
+
+CLIP CONTEXT
+- Time in episode: {{time_range}}
+- Duration: {{duration_secs}}s
+- LLM hook: {{hook}}
+- LLM reasoning: {{reasoning}}
+
+CLIP TRANSCRIPT (verbatim — every claim, name, and storyline you produce
+must be supported by something in this transcript)
+
+{{transcript}}
+
+Produce the JSON described in the system prompt — per-platform copy plus
+the 2–5 word overlay_hook for the burned-in first-1.5s overlay.

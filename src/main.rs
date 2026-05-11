@@ -1,10 +1,12 @@
 mod ai_pipeline;
 mod align;
+mod candidates;
 mod config;
 mod drive;
 mod embed;
 mod gmail;
 mod google_auth;
+mod linguistic_markers;
 mod media;
 mod mime;
 mod openai;

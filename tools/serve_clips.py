@@ -101,6 +101,33 @@ video {
   font-weight: 600;
   letter-spacing: 0.02em;
 }
+.posts {
+  margin: 1em 0;
+  padding: 0.7em 0.9em;
+  background: #0e0e10;
+  border-radius: 6px;
+  border: 1px solid #2a2a2e;
+}
+.posts-label { color: #888; font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5em; }
+.post-row { display: flex; align-items: center; gap: 0.6em; margin: 0.3em 0; font-size: 0.9em; }
+.post-status {
+  display: inline-block;
+  padding: 0.15em 0.55em;
+  border-radius: 4px;
+  font: 600 0.72em ui-monospace, SF Mono, monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  min-width: 64px;
+  text-align: center;
+}
+.post-status.posted  { background: #1e3a26; color: #6fc77f; border: 1px solid #2c5535; }
+.post-status.dry_run { background: #2a2545; color: #b39dff; border: 1px solid #3d3568; }
+.post-status.skipped { background: #2a2a2e; color: #888; border: 1px solid #3a3a3e; }
+.post-status.failed  { background: #3a1f24; color: #ff7585; border: 1px solid #5a2c33; }
+.post-platform { color: #c8c8d0; font-weight: 500; min-width: 80px; }
+.post-detail { color: #adadb8; font-size: 0.9em; word-break: break-all; }
+.post-detail a { color: #9eb4ff; text-decoration: none; }
+.post-detail a:hover { text-decoration: underline; }
 .platform-tabs { display: flex; gap: 0.3em; flex-wrap: wrap; margin: 1em 0 0.8em; }
 .platform-tab {
   padding: 0.35em 0.8em;
@@ -295,6 +322,38 @@ def render_clip_card(clip: dict) -> str:
         else ""
     )
 
+    posts = clip.get("posts", []) or []
+    if posts:
+        rows = []
+        for p in posts:
+            status = (p.get("status") or "skipped").lower()
+            url = p.get("external_url")
+            ext_id = p.get("external_id")
+            err = p.get("error")
+            detail = ""
+            if status == "posted":
+                if url:
+                    detail = f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener">{escape(url)}</a>'
+                elif ext_id:
+                    detail = escape(ext_id)
+            elif status in ("skipped", "failed"):
+                detail = escape(err or "")
+            rows.append(
+                f'<div class="post-row">'
+                f'<span class="post-status {status}">{escape(status)}</span>'
+                f'<span class="post-platform">{escape(p.get("platform", ""))}</span>'
+                f'<span class="post-detail">{detail}</span>'
+                f'</div>'
+            )
+        posts_html = (
+            '<div class="posts">'
+            '<div class="posts-label">Posts</div>'
+            + "".join(rows)
+            + "</div>"
+        )
+    else:
+        posts_html = ""
+
     vlm_html = (
         f'<div class="vlm"><b>VLM:</b> {escape(vlm_why.strip())}</div>'
         if vlm_why.strip()
@@ -358,6 +417,7 @@ def render_clip_card(clip: dict) -> str:
           <div class="llm"><b>LLM:</b> {escape(llm_why.strip())}</div>
           {vlm_html}
         </div>
+        {posts_html}
         <div class="platform-tabs">{''.join(platform_tabs)}</div>
         {''.join(platform_panels)}
       </div>

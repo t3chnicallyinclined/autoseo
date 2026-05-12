@@ -24,6 +24,8 @@ use crate::mime::build_mime_email;
 use crate::prosody;
 use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
+use crate::platforms::{self, PostResult, PostStatus};
+use crate::posting;
 use crate::scene;
 use crate::show_config::DigestMode;
 use crate::social_copy::{SocialCopy, SocialCopyGenerator};
@@ -476,11 +478,47 @@ pub async fn run_clipper_local_once(
             ranked: clip.clone(),
             social: social.clone(),
             variants,
+            posts: Vec::new(),
         });
     }
 
     if rendered.is_empty() {
         anyhow::bail!("all clip renders failed");
+    }
+
+    // Post each clip to enabled platforms (default: no platforms enabled,
+    // POST_DRY_RUN=true). The 9x16 variant is used for both YouTube Shorts and
+    // Bluesky video posts.
+    let platforms = platforms::Platform::from_config(cfg, google);
+    if !platforms.is_empty() {
+        let platform_names: Vec<&str> = platforms.iter().map(|p| p.name()).collect();
+        tracing::info!(
+            platforms = ?platform_names,
+            dry_run = cfg.post_dry_run,
+            "clipper: posting starting"
+        );
+        for r in rendered.iter_mut() {
+            let video_9x16 = r
+                .variants
+                .iter()
+                .find(|v| v.label == "9x16")
+                .map(|v| v.path.as_path());
+            let results = posting::post_one_clip(
+                &platforms,
+                cfg.post_dry_run,
+                r.rank,
+                video_9x16,
+                r.social.as_ref(),
+            )
+            .await;
+            r.posts = results;
+        }
+        let total_posted = rendered
+            .iter()
+            .flat_map(|r| &r.posts)
+            .filter(|p| p.status == PostStatus::Posted)
+            .count();
+        tracing::info!(total_posted, "clipper: posting complete");
     }
 
     let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
@@ -536,6 +574,7 @@ struct RenderedClip {
     ranked: RankedClip,
     social: Option<SocialCopy>,
     variants: Vec<RenderedVariant>,
+    posts: Vec<PostResult>,
 }
 
 struct RenderedVariant {
@@ -650,6 +689,29 @@ fn build_digest_body(
                 out.push_str(&format!("  overlay: {}\n", social.overlay_hook));
             }
             append_social_copy(&mut out, social);
+        }
+        if !r.posts.is_empty() {
+            out.push_str("\n  ── Posts ──────────────────────\n");
+            for p in &r.posts {
+                let tag = match p.status {
+                    PostStatus::Posted => "POSTED ",
+                    PostStatus::DryRun => "DRYRUN ",
+                    PostStatus::Skipped => "SKIPPED",
+                    PostStatus::Failed => "FAILED ",
+                };
+                let detail = match p.status {
+                    PostStatus::Posted => p
+                        .external_url
+                        .clone()
+                        .or_else(|| p.external_id.clone())
+                        .unwrap_or_default(),
+                    PostStatus::Skipped | PostStatus::Failed => {
+                        p.error.clone().unwrap_or_default()
+                    }
+                    PostStatus::DryRun => String::new(),
+                };
+                out.push_str(&format!("  [{tag}] {:<10} {detail}\n", p.platform));
+            }
         }
         out.push('\n');
         out.push_str(&"-".repeat(72));
@@ -783,6 +845,12 @@ fn build_manifest_json(
                 .and_then(|s| serde_json::to_value(s).ok())
                 .unwrap_or(serde_json::Value::Null);
 
+            let posts: Vec<serde_json::Value> = r
+                .posts
+                .iter()
+                .filter_map(|p| serde_json::to_value(p).ok())
+                .collect();
+
             serde_json::json!({
                 "rank": r.rank,
                 "score": r.ranked.score,
@@ -798,6 +866,7 @@ fn build_manifest_json(
                 "reasoning": r.ranked.reasoning,
                 "variants": variants,
                 "social": social,
+                "posts": posts,
             })
         })
         .collect();
@@ -962,6 +1031,7 @@ mod tests {
                 width: 1080,
                 height: 1920,
             }],
+            posts: Vec::new(),
         }
     }
 

@@ -13,6 +13,8 @@ mod media;
 mod mime;
 mod openai;
 mod parse;
+mod platforms;
+mod posting;
 mod prosody;
 mod ranker;
 mod rate_limit;

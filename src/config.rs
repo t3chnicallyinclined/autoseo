@@ -128,6 +128,50 @@ pub struct Config {
     #[arg(long, env = "CLIP_RENDER_FORMATS", default_value = "9x16,1x1,16x9")]
     pub clip_render_formats: String,
 
+    /// Which platforms to post to. Comma-separated, any of: `youtube`, `bluesky`.
+    /// Default empty (no posting). Posting also requires `POST_DRY_RUN=false`
+    /// to actually send — both knobs are opt-in for safety.
+    #[arg(long, env = "POST_ENABLED_PLATFORMS", default_value = "")]
+    pub post_enabled_platforms: String,
+
+    /// Safety net. When true (default), posting code constructs platforms and
+    /// resolves credentials but does NOT actually POST — every result is
+    /// `DryRun`. Flip to `false` to enable real posting.
+    #[arg(long, env = "POST_DRY_RUN", default_value_t = true)]
+    pub post_dry_run: bool,
+
+    /// YouTube Shorts privacy on upload: `unlisted` (default — link-only),
+    /// `private` (only you), or `public`.
+    #[arg(long, env = "YOUTUBE_PRIVACY_STATUS", default_value = "unlisted")]
+    pub youtube_privacy_status: String,
+
+    /// YouTube category id. Common values: `22` (People & Blogs), `24`
+    /// (Entertainment), `23` (Comedy), `17` (Sports).
+    #[arg(long, env = "YOUTUBE_CATEGORY_ID", default_value = "24")]
+    pub youtube_category_id: String,
+
+    /// Bluesky handle (e.g. `you.bsky.social` or your custom domain).
+    #[arg(long, env = "BLUESKY_HANDLE")]
+    pub bluesky_handle: Option<String>,
+
+    /// Bluesky app password (`xxxx-xxxx-xxxx-xxxx`). Generate at
+    /// https://bsky.app/settings/app-passwords. NOT your main login password.
+    #[arg(long, env = "BLUESKY_APP_PASSWORD")]
+    pub bluesky_app_password: Option<String>,
+
+    /// Bluesky PDS (Personal Data Server) URL. Default: bsky.social. Override
+    /// only if you self-host an ATProto PDS.
+    #[arg(long, env = "BLUESKY_PDS_URL", default_value = "https://bsky.social")]
+    pub bluesky_pds_url: String,
+
+    /// Bluesky video service URL. Default: video.bsky.app.
+    #[arg(
+        long,
+        env = "BLUESKY_VIDEO_SERVICE_URL",
+        default_value = "https://video.bsky.app"
+    )]
+    pub bluesky_video_service_url: String,
+
     /// Hugging Face API key (used for HF Inference Providers — embeddings + VLM re-rank).
     /// When set, the clipper routes embeddings through HF instead of the local
     /// `fastembed` ONNX model. Required to enable VLM re-rank.

@@ -146,6 +146,13 @@ pub async fn run_clipper_local_once(
         vad::detect_silences(&cfg.ffmpeg, &audio_path, -30.0, 0.3),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
+
+    // F0 pitch extraction via aubio — non-fatal, returns empty vec if unavailable.
+    let f0 = prosody::f0_curve("aubio", &audio_path).await;
+    if f0.is_empty() {
+        tracing::info!("clipper: F0 features unavailable (aubio not on PATH or failed)");
+    }
+
     pb_features.finish_with_message("scene + vad + prosody complete");
 
     tracing::info!(
@@ -153,6 +160,7 @@ pub async fn run_clipper_local_once(
         shots = shots.len(),
         silences = silences.len(),
         rms_windows = rms.len(),
+        f0_samples = f0.len(),
         "clipper: feature extraction complete"
     );
 
@@ -171,7 +179,7 @@ pub async fn run_clipper_local_once(
 
     let cand_gen = CandidateGenerator::new();
     let mut candidates =
-        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms);
+        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
     tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
 
     if candidates.is_empty() {

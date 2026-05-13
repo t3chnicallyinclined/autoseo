@@ -1,7 +1,6 @@
-use clap::Parser;
+use clap::Args;
 
-#[derive(Parser, Debug, Clone)]
-#[command(name = "autoseo")]
+#[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Gmail search query used to find candidate messages.
     #[arg(

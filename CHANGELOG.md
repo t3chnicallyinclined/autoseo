@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-05-13
+- **Dashboard slice 0 — foundation.** New `dashboard` and `all` subcommands on the `autoseo` binary. Legacy invocations (`autoseo --once --dry-run` with no subcommand) keep working: the default subcommand is `worker`. Same binary, same tokio runtime.
+- Added `axum = "0.8"`, `tower`, `tower-http` (trace, compression, limit, cors, timeout). `Config` derives `clap::Args` instead of `Parser` so it can flatten into the new top-level `Cli`.
+- `src/dashboard/` module scaffold: `config::DashboardArgs` (bind addr + `--insecure`), `error::DashboardError` (uniform JSON 4xx/5xx), `state::{AppState, SchedulerStatus}`, `prelude` (handler imports), `middleware` (stub for slice 2), `routes/health.rs`. `server::run` boots axum with `TraceLayer`/`CompressionLayer`/`TimeoutLayer`, gracefully shuts down on Ctrl-C / SIGTERM.
+- `GET /health` returns `{ok, version, schema, scheduler}` — liveness + self-report for reverse proxies and the operator.
+- See `PLAN`: full multi-slice roadmap at [/home/tris/.claude/plans/ok-great-lets-write-zazzy-hellman.md](file:///home/tris/.claude/plans/ok-great-lets-write-zazzy-hellman.md). Architecture includes SaaS-readiness seams (`workspace_id` on every user-owned table, repo traits, OIDC-shaped session payload, `/media/...` signed-URL redirect, `clip_embeddings` BLOB table, `events` table as ur-NATS, ULID primary keys).
+- Tests: 112 pass, 2 ignored.
+
 ## 2026-05-11
 - Started clipper-agent extension on `feat/clipper` branch — turning autoseo into an autonomous clipper that produces N platform-specific short clips per episode. See [PLAN.md](PLAN.md) for the locked-in design.
 - Added SQLite storage layer (`src/storage.rs`) backed by bundled `rusqlite`. Schema covers the full M1 surface: `jobs`, `clips`, `clip_renders`, `posts`, `analytics`, `trends`. WAL mode + foreign keys enabled. Idempotent migration via `PRAGMA user_version`.

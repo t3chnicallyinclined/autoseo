@@ -4,6 +4,7 @@ mod candidates;
 mod captions;
 mod clipper;
 mod config;
+mod dashboard;
 mod drive;
 mod embed;
 mod gmail;
@@ -29,7 +30,7 @@ mod vlm_ranker;
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::future::try_join_all;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -44,14 +45,55 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use storage::Storage;
 use tracing_subscriber::EnvFilter;
 
+/// Top-level CLI. Worker config flattens at the root so legacy invocations
+/// like `autoseo --once --dry-run` keep working without a subcommand.
+#[derive(Parser, Debug)]
+#[command(name = "autoseo", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    config: Config,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the clipper / SEO worker (default if no subcommand given).
+    Worker,
+    /// Run the admin dashboard HTTP server.
+    Dashboard(dashboard::DashboardArgs),
+    /// Run the worker AND the dashboard in the same process.
+    All(dashboard::DashboardArgs),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Ensure we always get useful logs in Docker (even if RUST_LOG is unset/invalid).
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let cfg = Config::parse();
+    let cli = Cli::parse();
+    let cfg = cli.config;
 
+    match cli.command.unwrap_or(Command::Worker) {
+        Command::Worker => run_worker(cfg).await,
+        Command::Dashboard(args) => dashboard::run(cfg, args).await,
+        Command::All(args) => {
+            let worker_cfg = cfg.clone();
+            let worker_handle = tokio::spawn(async move {
+                if let Err(e) = run_worker(worker_cfg).await {
+                    tracing::error!(error = ?e, "worker exited with error");
+                }
+            });
+            let res = dashboard::run(cfg, args).await;
+            worker_handle.abort();
+            res
+        }
+    }
+}
+
+async fn run_worker(cfg: Config) -> anyhow::Result<()> {
     let mode = show_config::Mode::parse(&cfg.mode)?;
     let digest_mode = show_config::DigestMode::parse(&cfg.digest_mode)?;
 

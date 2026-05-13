@@ -28,6 +28,35 @@ You cannot use an API key to read a private Gmail inbox or download private Driv
    - Exchange authorization code for tokens
    - Copy the **refresh_token** (this is your long-lived secret)
 
+### Refreshing an expired / revoked refresh token
+
+If the worker logs show `invalid_grant` during token refresh, your `GOOGLE_REFRESH_TOKEN` is no longer valid and you need to mint a new one.
+
+Fastest way (OAuth 2.0 Playground):
+
+1. Open OAuth 2.0 Playground: https://developers.google.com/oauthplayground
+2. Click the gear icon (top-right) and check **Use your own OAuth credentials**.
+3. Paste your `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+4. In Step 1, select and authorize these scopes:
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.send`
+   - `https://www.googleapis.com/auth/drive.readonly`
+5. Complete the Google consent flow.
+6. In Step 2, click **Exchange authorization code for tokens**.
+7. Copy the new `refresh_token` and update your `.env`:
+
+```bash
+GOOGLE_REFRESH_TOKEN="<new refresh token>"
+```
+
+Then restart:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Note: if your OAuth consent screen is in “Testing”, Google may expire refresh tokens after a short period. If you need truly long-lived tokens, you may need to switch the consent screen to “In production” (subject to Google’s verification / policy requirements for the scopes you’re using).
+
 ## OpenAI-compatible setup
 
 You need an OpenAI-compatible base URL + API key:
@@ -112,19 +141,31 @@ Build:
 docker build -t autoseo:release .
 ```
 
-Run as a long-lived poller with persisted work + dedupe:
+Run as a long-lived poller with persisted work + dedupe (survives reboots):
 
 ```bash
 mkdir -p work
 
 docker rm -f autoseo 2>/dev/null || true
-docker run -d --rm --name autoseo \
+docker run -d --restart unless-stopped --name autoseo \
    -v "$PWD/work:/work" \
    --env-file .env \
    -e WORK_DIR=/work \
    -e DEDUPE_FILE=/work/processed_message_ids.txt \
    autoseo:release
 ```
+
+Alternatively (recommended): Docker Compose (also survives reboots)
+
+```bash
+mkdir -p work
+docker compose up -d --build
+```
+
+Notes for reboot reliability:
+
+- Make sure Docker starts on boot: `sudo systemctl enable --now docker`
+- If you previously ran with `--rm`, the container was deleted on stop/reboot; recreate it using one of the commands above.
 
 Logs / ops:
 

@@ -1,0 +1,14 @@
+services:
+  autoseo:
+    build:
+      context: .
+    image: autoseo:release
+    container_name: autoseo
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WORK_DIR: /work
+      DEDUPE_FILE: /work/processed_message_ids.txt
+    volumes:
+      - ./work:/work

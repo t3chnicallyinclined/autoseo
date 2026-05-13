@@ -201,6 +201,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Clone the inner `Arc<Mutex<Connection>>` for use in
+    /// `spawn_blocking` calls from the dashboard repo layer. All DB
+    /// access must still go through `blocking_lock()` inside a blocking
+    /// task — this is just a convenience to keep call sites tight.
+    pub(crate) fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     /// Has this gmail message_id been seen before (any status)?
     pub async fn job_exists(&self, message_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
@@ -232,8 +240,237 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.pragma_update(None, "user_version", 1)
             .context("set user_version=1")?;
     }
+    if version < 2 {
+        apply_v2(conn).context("apply schema v2")?;
+        conn.pragma_update(None, "user_version", 2)
+            .context("set user_version=2")?;
+    }
     Ok(())
 }
+
+/// Schema v2 — dashboard tables + workspace_id extensions to v1 tables.
+/// See [/home/tris/.claude/plans/ok-great-lets-write-zazzy-hellman.md] for design.
+fn apply_v2(conn: &Connection) -> anyhow::Result<()> {
+    // ALTER TABLE … ADD COLUMN is per-statement and not idempotent on older
+    // SQLite. apply_alter_safe swallows "duplicate column name" so re-runs
+    // are no-ops.
+    for stmt in SCHEMA_V2_ALTERS {
+        apply_alter_safe(conn, stmt)?;
+    }
+    conn.execute_batch(SCHEMA_V2_NEW_TABLES)
+        .context("apply v2 new tables")?;
+
+    // Seed the default workspace if no rows exist. v1 always uses 'ws_default';
+    // v2 (SaaS) will create real workspaces on signup.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(1) FROM workspaces", [], |r| r.get(0))
+        .context("count workspaces")?;
+    if count == 0 {
+        let now = unix_now();
+        conn.execute(
+            "INSERT INTO workspaces (id, slug, name, created_at, updated_at) \
+             VALUES ('ws_default', 'default', 'Default Workspace', ?1, ?1)",
+            [now],
+        )
+        .context("seed ws_default workspace")?;
+    }
+    Ok(())
+}
+
+/// Run an `ALTER TABLE … ADD COLUMN` statement. SQLite ≤ 3.45 doesn't support
+/// `IF NOT EXISTS` on ADD COLUMN, so we swallow the specific "duplicate column
+/// name" error to make migrations idempotent across re-runs.
+fn apply_alter_safe(conn: &Connection, sql: &str) -> anyhow::Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("apply_alter_safe: {sql}")),
+    }
+}
+
+const SCHEMA_V2_ALTERS: &[&str] = &[
+    // Existing v1 tables get workspace_id + dashboard-aware columns.
+    "ALTER TABLE jobs ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default'",
+    "ALTER TABLE jobs ADD COLUMN show_id TEXT",
+    "ALTER TABLE jobs ADD COLUMN source_kind TEXT",
+    "ALTER TABLE jobs ADD COLUMN source_ref TEXT",
+    "ALTER TABLE jobs ADD COLUMN clips_dir TEXT",
+    "ALTER TABLE jobs ADD COLUMN duration_secs REAL",
+    "ALTER TABLE jobs ADD COLUMN manifest_json TEXT",
+    "ALTER TABLE clips ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default'",
+    "ALTER TABLE clips ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE clips ADD COLUMN overlay_hook TEXT",
+    "ALTER TABLE clips ADD COLUMN social_json TEXT",
+    "ALTER TABLE clips ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE clips ADD COLUMN last_edited_at INTEGER",
+    "ALTER TABLE clips ADD COLUMN last_edited_by TEXT",
+    "ALTER TABLE posts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default'",
+    "ALTER TABLE posts ADD COLUMN skipped_by_user INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE posts ADD COLUMN schedule_id TEXT",
+    "ALTER TABLE posts ADD COLUMN updated_at INTEGER",
+];
+
+const SCHEMA_V2_NEW_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS workspaces (
+    id              TEXT PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_workspace ON jobs(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clips_workspace ON clips(workspace_id, job_id);
+CREATE INDEX IF NOT EXISTS idx_clips_approval  ON clips(workspace_id, approval_status);
+CREATE INDEX IF NOT EXISTS idx_posts_workspace ON posts(workspace_id, status);
+
+CREATE TABLE IF NOT EXISTS shows (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    clip_top_k      INTEGER NOT NULL DEFAULT 10,
+    render_formats  TEXT    NOT NULL DEFAULT '9x16,1x1,16x9',
+    vlm_rerank      INTEGER NOT NULL DEFAULT 0,
+    youtube_privacy TEXT    NOT NULL DEFAULT 'unlisted',
+    prompt_overrides_json   TEXT,
+    default_post_platforms  TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE(workspace_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_shows_workspace ON shows(workspace_id);
+
+CREATE TABLE IF NOT EXISTS users (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    password_hash   TEXT NOT NULL,
+    display_name    TEXT,
+    role            TEXT NOT NULL DEFAULT 'admin',
+    created_at      INTEGER NOT NULL,
+    last_login_at   INTEGER,
+    UNIQUE(workspace_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_users_workspace ON users(workspace_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    last_seen_at    INTEGER NOT NULL,
+    user_agent      TEXT,
+    ip              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    platform        TEXT NOT NULL,
+    profile_name    TEXT NOT NULL DEFAULT 'default',
+    ciphertext      TEXT NOT NULL,
+    last_test_at    INTEGER,
+    last_test_ok    INTEGER NOT NULL DEFAULT 0,
+    last_test_msg   TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE(workspace_id, platform, profile_name)
+);
+
+CREATE TABLE IF NOT EXISTS clip_edits (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    clip_id         TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    user_id         TEXT REFERENCES users(id),
+    patch_json      TEXT NOT NULL,
+    resolved_json   TEXT NOT NULL,
+    needs_rerender  INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clip_edits_clip ON clip_edits(clip_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS clip_history (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    clip_id         TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    edit_id         TEXT REFERENCES clip_edits(id) ON DELETE SET NULL,
+    field_path      TEXT NOT NULL,
+    before_value    TEXT,
+    after_value     TEXT,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clip_history_clip ON clip_history(clip_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    clip_id         TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    platform        TEXT NOT NULL,
+    scheduled_at    INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    last_attempt_at INTEGER,
+    external_url    TEXT,
+    created_by      TEXT REFERENCES users(id),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_due  ON schedules(workspace_id, status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_schedules_clip ON schedules(clip_id);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    user_id         TEXT REFERENCES users(id),
+    actor           TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    target_kind     TEXT,
+    target_id       TEXT,
+    metadata_json   TEXT,
+    ip              TEXT,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(workspace_id, target_kind, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_recent ON audit_log(workspace_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS clip_embeddings (
+    clip_id         TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    workspace_id    TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    dim             INTEGER NOT NULL,
+    embedding       BLOB NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (clip_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_clip_embeddings_workspace ON clip_embeddings(workspace_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    id              TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    target_kind     TEXT,
+    target_id       TEXT,
+    payload_json    TEXT,
+    created_at      INTEGER NOT NULL,
+    consumed_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_events_workspace_topic ON events(workspace_id, topic, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_unconsumed
+    ON events(workspace_id, created_at) WHERE consumed_at IS NULL;
+
+CREATE VIEW IF NOT EXISTS analytics_latest AS
+SELECT clip_id, platform, MAX(fetched_at) AS fetched_at, views, ctr, watch_pct
+FROM analytics
+GROUP BY clip_id, platform;
+"#;
 
 fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -294,6 +531,49 @@ mod tests {
         // Second call must not error.
         storage.mark_processed("msg_x").await?;
         assert!(storage.job_exists("msg_x").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_applies_v2() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let storage = Storage::open(&db_path).await?;
+
+        // user_version must be at 2 after migration.
+        let conn = storage.conn();
+        let (version, ws_count, has_audit, has_events, jobs_has_workspace) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, i64, bool, bool, bool)> {
+                let conn = conn.blocking_lock();
+                let v: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let n: i64 = conn.query_row("SELECT COUNT(1) FROM workspaces", [], |r| r.get(0))?;
+                let audit: i64 = conn.query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='audit_log'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let events: i64 = conn.query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='events'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let cols: i64 = conn.query_row(
+                    "SELECT COUNT(1) FROM pragma_table_info('jobs') WHERE name='workspace_id'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((v, n, audit > 0, events > 0, cols > 0))
+            })
+            .await??;
+
+        assert_eq!(version, 2, "schema should be at v2");
+        assert_eq!(ws_count, 1, "ws_default should be seeded once");
+        assert!(has_audit, "audit_log table should exist");
+        assert!(has_events, "events table should exist");
+        assert!(jobs_has_workspace, "jobs.workspace_id column should exist");
+
+        // Idempotent re-open.
+        let _storage2 = Storage::open(&db_path).await?;
         Ok(())
     }
 

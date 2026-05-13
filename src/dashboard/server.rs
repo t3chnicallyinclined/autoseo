@@ -29,7 +29,7 @@ pub async fn run(cfg: Config, args: DashboardArgs) -> anyhow::Result<()> {
     let state = AppState {
         storage,
         version: env!("CARGO_PKG_VERSION"),
-        schema_version: 1, // bumped to 2 by Slice 1's migration
+        schema_version: 2, // bumped from 1 in Slice 1's migration
         scheduler_status: SchedulerStatus::Disabled, // → Running after Slice 6 wiring
     };
 

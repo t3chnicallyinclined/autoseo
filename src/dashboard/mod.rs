@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod middleware;
 pub mod prelude;
+pub mod repo;
 pub mod routes;
 pub mod server;
 pub mod state;

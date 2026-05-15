@@ -491,4 +491,29 @@ pub struct Config {
         default_value = "https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593/resolve/main/onnx/model.onnx"
     )]
     pub ast_model_url: String,
+    /// Enable the Google Trends poller. When true, fetches daily trending
+    /// searches and stores them in the `trends` table for ranker context.
+    #[arg(long, env = "GOOGLE_TRENDS_ENABLED", default_value_t = false)]
+    pub google_trends_enabled: bool,
+
+    /// Google Trends RSS feed base URL (without query params).
+    #[arg(
+        long,
+        env = "GOOGLE_TRENDS_RSS_URL",
+        default_value = "https://trends.google.com/trending/rss"
+    )]
+    pub google_trends_rss_url: String,
+
+    /// ISO 3166-1 alpha-2 geo code for Google Trends (e.g. US, GB, CA).
+    #[arg(long, env = "GOOGLE_TRENDS_GEO", default_value = "US")]
+    pub google_trends_geo: String,
+
+    /// Google Trends poll RPM limit. Google is aggressive about rate-limiting;
+    /// keep this low (1-2) to avoid 429s.
+    #[arg(long, env = "GOOGLE_TRENDS_RPM", default_value_t = 1)]
+    pub google_trends_rpm: u32,
+
+    /// How often to refresh Google Trends, in seconds. Default 86400 (daily).
+    #[arg(long, env = "GOOGLE_TRENDS_REFRESH_SECS", default_value_t = 86400)]
+    pub google_trends_refresh_secs: u64,
 }

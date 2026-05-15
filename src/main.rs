@@ -47,7 +47,8 @@ use google_auth::GoogleAuth;
 use mime::build_mime_email;
 use openai::OpenAiClient;
 use std::time::{SystemTime, UNIX_EPOCH};
-use show_config::DigestMode;
+use show_config::{DigestMode, GlobalPromptPaths, PromptLoader, PromptName};
+use std::path::PathBuf;
 use storage::{JobStatus, Storage};
 use tracing_subscriber::EnvFilter;
 
@@ -132,103 +133,33 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let (ai, seo_variant_blocks) = if cfg.dry_run {
-        (None, Vec::new())
+    let openai_client = if cfg.dry_run {
+        None
     } else {
         let api_key = cfg
             .openai_api_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("OPENAI_API_KEY is required unless --dry-run"))?;
-        let openai = OpenAiClient::new(cfg.openai_base_url.clone(), api_key);
-
-        let seo_system_prompt = tokio::fs::read_to_string(&cfg.seo_system_prompt_path)
-            .await
-            .with_context(|| format!("read seo system prompt at {}", &cfg.seo_system_prompt_path))?
-            .trim()
-            .to_string();
-
-        let thumbnail_system_prompt = tokio::fs::read_to_string(&cfg.thumbnail_system_prompt_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "read thumbnail system prompt at {}",
-                    &cfg.thumbnail_system_prompt_path
-                )
-            })?
-            .trim()
-            .to_string();
-
-        let seo_user_prompt_template = tokio::fs::read_to_string(&cfg.seo_user_prompt_path)
-            .await
-            .with_context(|| format!("read seo user prompt at {}", &cfg.seo_user_prompt_path))?
-            .trim()
-            .to_string();
-
-        let thumbnail_user_prompt_template =
-            tokio::fs::read_to_string(&cfg.thumbnail_user_prompt_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "read thumbnail user prompt at {}",
-                        &cfg.thumbnail_user_prompt_path
-                    )
-                })?
-                .trim()
-                .to_string();
-
-        let variants_raw = tokio::fs::read_to_string(&cfg.seo_variants_prompt_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "read seo variants prompt at {}",
-                    &cfg.seo_variants_prompt_path
-                )
-            })?;
-        let seo_variant_blocks = parse_variants_prompt_file(&variants_raw);
-
-        let stt_backend = SttBackend::parse(&cfg.stt_backend)?;
-        #[allow(unused_mut)]
-        let mut pipeline = AiPipeline::new(
-            openai,
-            cfg.openai_stt_model.clone(),
-            cfg.openai_chat_model.clone(),
-            cfg.stt_concurrency,
-            cfg.stt_rpm_limit,
-            seo_system_prompt,
-            thumbnail_system_prompt,
-            seo_user_prompt_template,
-            thumbnail_user_prompt_template,
-        )
-        .with_stt_backend(stt_backend.clone())
-        .with_ffmpeg_path(cfg.ffmpeg.clone());
-
-        #[cfg(feature = "local-stt")]
-        if stt_backend == SttBackend::Local {
-            let model_path = match cfg.whisper_model_path.as_deref() {
-                Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
-                _ => whisper_local::WhisperLocal::default_model_path(&cfg.work_dir),
-            };
-            tracing::info!(model_path = %model_path.display(), "loading local whisper model");
-            let wl = whisper_local::WhisperLocal::load(&model_path)?;
-            pipeline = pipeline.with_whisper_local(wl);
-        }
-
-        #[cfg(not(feature = "local-stt"))]
-        if stt_backend == SttBackend::Local {
-            anyhow::bail!(
-                "STT_BACKEND=local requires the `local-stt` cargo feature. \
-                 Recompile with: cargo build --features local-stt"
-            );
-        }
-
-        (Some(pipeline), seo_variant_blocks)
+        Some(OpenAiClient::new(cfg.openai_base_url.clone(), api_key))
     };
+
+    let prompt_loader = PromptLoader::new(
+        &cfg.shows_dir,
+        GlobalPromptPaths {
+            seo_system: PathBuf::from(&cfg.seo_system_prompt_path),
+            seo_user: PathBuf::from(&cfg.seo_user_prompt_path),
+            seo_variants: PathBuf::from(&cfg.seo_variants_prompt_path),
+            thumbnail_system: PathBuf::from(&cfg.thumbnail_system_prompt_path),
+            thumbnail_user: PathBuf::from(&cfg.thumbnail_user_prompt_path),
+        },
+    );
 
     if let Some(local_path) = cfg.local_video_path.as_deref() {
         if mode.produces_clips() {
-            let ai_ref = ai.as_ref().ok_or_else(|| {
+            let openai_ref = openai_client.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)")
             })?;
+            let ai_for_clipper = build_ai_pipeline(&cfg, openai_ref, &prompt_loader, None).await?;
             // Generate a stable job ID from the local file path so retries
             // reuse the same row.
             let job_id = format!("local:{}", sanitize_filename(
@@ -242,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                 &cfg,
                 google.as_ref(),
                 &gmail,
-                ai_ref,
+                &ai_for_clipper,
                 local_path,
                 digest_mode,
                 Some(&storage),
@@ -254,7 +185,10 @@ async fn main() -> anyhow::Result<()> {
             let g = google
                 .as_ref()
                 .expect("google creds validated at startup for seo-only path");
-            run_local_once(&cfg, g, &gmail, ai.as_ref(), local_path, &seo_variant_blocks)
+            let openai_ref = openai_client
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("AI pipeline not configured"))?;
+            run_local_once(&cfg, g, &gmail, openai_ref, &prompt_loader, local_path)
                 .await?;
         }
         return Ok(());
@@ -279,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
     let g = google
         .as_ref()
         .expect("google creds validated above for polling path");
+    let openai_ref = openai_client
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("AI pipeline not configured for polling"))?;
     loop {
         if mode.produces_seo_emails()
             && let Err(e) = run_once(
@@ -286,9 +223,9 @@ async fn main() -> anyhow::Result<()> {
                 g,
                 &gmail,
                 &drive,
-                ai.as_ref(),
+                openai_ref,
+                &prompt_loader,
                 &storage,
-                &seo_variant_blocks,
             )
             .await
         {
@@ -301,7 +238,8 @@ async fn main() -> anyhow::Result<()> {
                 g,
                 &gmail,
                 &drive,
-                ai.as_ref().expect("AI pipeline required for clipper mode"),
+                openai_ref,
+                &prompt_loader,
                 &storage,
                 digest_mode,
             )
@@ -319,14 +257,74 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build an `AiPipeline` with prompts resolved via `PromptLoader`.
+/// When `show_slug` is `Some`, per-show prompt overrides are checked first.
+async fn build_ai_pipeline(
+    cfg: &Config,
+    openai: &OpenAiClient,
+    loader: &PromptLoader,
+    show_slug: Option<&str>,
+) -> anyhow::Result<AiPipeline> {
+    let seo_system = loader.load(PromptName::SeoSystem, show_slug).await?;
+    let seo_user = loader.load(PromptName::SeoUser, show_slug).await?;
+    let thumbnail_system = loader.load(PromptName::ThumbnailSystem, show_slug).await?;
+    let thumbnail_user = loader.load(PromptName::ThumbnailUser, show_slug).await?;
+
+    let stt_backend = SttBackend::parse(&cfg.stt_backend)?;
+    #[allow(unused_mut)]
+    let mut pipeline = AiPipeline::new(
+        openai.clone(),
+        cfg.openai_stt_model.clone(),
+        cfg.openai_chat_model.clone(),
+        cfg.stt_concurrency,
+        cfg.stt_rpm_limit,
+        seo_system,
+        thumbnail_system,
+        seo_user,
+        thumbnail_user,
+    )
+    .with_stt_backend(stt_backend.clone())
+    .with_ffmpeg_path(cfg.ffmpeg.clone());
+
+    #[cfg(feature = "local-stt")]
+    if stt_backend == SttBackend::Local {
+        let model_path = match cfg.whisper_model_path.as_deref() {
+            Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => whisper_local::WhisperLocal::default_model_path(&cfg.work_dir),
+        };
+        pipeline = pipeline.with_whisper_local(
+            whisper_local::WhisperLocal::load(&model_path)?
+        );
+    }
+
+    #[cfg(not(feature = "local-stt"))]
+    if stt_backend == SttBackend::Local {
+        anyhow::bail!(
+            "STT_BACKEND=local requires the `local-stt` cargo feature. \
+             Recompile with: cargo build --features local-stt"
+        );
+    }
+
+    Ok(pipeline)
+}
+
+/// Load and parse the SEO variant blocks via `PromptLoader`.
+async fn load_variant_blocks(
+    loader: &PromptLoader,
+    show_slug: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let raw = loader.load(PromptName::SeoVariants, show_slug).await?;
+    Ok(parse_variants_prompt_file(&raw))
+}
+
 async fn run_once(
     cfg: &Config,
     google: &GoogleAuth,
     gmail: &GmailClient,
     drive: &DriveClient,
-    ai: Option<&AiPipeline>,
+    openai: &OpenAiClient,
+    prompt_loader: &PromptLoader,
     storage: &Storage,
-    seo_variant_blocks: &[String],
 ) -> anyhow::Result<()> {
     let access_token = google.access_token().await?;
 
@@ -405,7 +403,6 @@ async fn run_once(
             continue;
         }
 
-        let ai = ai.ok_or_else(|| anyhow::anyhow!("AI pipeline not configured"))?;
         let result_to = cfg
             .result_to
             .as_deref()
@@ -606,11 +603,14 @@ async fn run_once(
         pb_thumbs.set_message("waiting");
         pb_thumbs.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        let transcript = ai
+        // Build a baseline AiPipeline (global prompts) for transcription + show inference.
+        let ai_global = build_ai_pipeline(cfg, openai, prompt_loader, None).await?;
+
+        let transcript = ai_global
             .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
             .await?;
 
-        let show_context = match ai
+        let show_context = match ai_global
             .infer_show_context(&meta.name, &transcript.full_text)
             .await
         {
@@ -621,6 +621,13 @@ async fn run_once(
             }
         };
 
+        // Derive show slug for per-show prompt overrides.
+        let show_slug: Option<String> = show_context
+            .as_ref()
+            .and_then(|ctx| ctx.show_name.as_deref())
+            .map(show_config::slugify)
+            .filter(|s| !s.is_empty());
+
         if let Some(ctx) = show_context.as_ref() {
             tracing::info!(
                 message_id,
@@ -628,15 +635,24 @@ async fn run_once(
                 show_name = ?ctx.show_name,
                 hosts = ?ctx.hosts,
                 guest = ?ctx.guest,
+                show_slug = ?show_slug,
                 "inferred show context"
             );
         } else {
             tracing::info!(message_id, media_name = %meta.name, "no explicit show context inferred");
         }
 
+        // Rebuild AiPipeline with per-show prompt overrides (falls back to global when no override exists).
+        let ai = if show_slug.is_some() {
+            build_ai_pipeline(cfg, openai, prompt_loader, show_slug.as_deref()).await?
+        } else {
+            ai_global
+        };
+        let seo_variant_blocks = load_variant_blocks(prompt_loader, show_slug.as_deref()).await?;
+
         let variant_total = cfg.seo_variants.max(1);
         let selected_variant_instructions: Vec<String> = (0..variant_total)
-            .map(|i| select_variant_instructions(seo_variant_blocks, i))
+            .map(|i| select_variant_instructions(&seo_variant_blocks, i))
             .collect();
 
         if is_video {
@@ -647,13 +663,14 @@ async fn run_once(
 
         let transcript_text = std::sync::Arc::new(transcript.full_text.clone());
         let media_name = meta.name.clone();
+        let ai_ref = &ai;
         let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
             |(i, inst)| {
                 let show_context = show_context.clone();
                 let media_name = media_name.clone();
                 let transcript_text = transcript_text.clone();
                 async move {
-                    ai.seo_variant_text_with_context(
+                    ai_ref.seo_variant_text_with_context(
                         transcript_text.as_str(),
                         inst.as_str(),
                         i,
@@ -668,7 +685,7 @@ async fn run_once(
 
         let (seo_texts, moments) = if is_video {
             let (seo_texts_res, moments_res) =
-                tokio::join!(seo_fut, ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+                tokio::join!(seo_fut, ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
             let seo_texts = seo_texts_res?;
             let moments = match moments_res {
                 Ok(m) if !m.is_empty() => m,
@@ -754,7 +771,8 @@ async fn run_clipper_once(
     google: &GoogleAuth,
     gmail: &GmailClient,
     drive: &DriveClient,
-    ai: &AiPipeline,
+    openai: &OpenAiClient,
+    prompt_loader: &PromptLoader,
     storage: &Storage,
     digest_mode: DigestMode,
 ) -> anyhow::Result<()> {
@@ -891,6 +909,9 @@ async fn run_clipper_once(
             .update_job_status(&job_id, JobStatus::Pending, None)
             .await?;
 
+        // Build a global AI pipeline for the clipper path.
+        let ai = build_ai_pipeline(cfg, openai, prompt_loader, None).await?;
+
         // Run the full clipper pipeline with job status tracking.
         // Errors are caught inside run_clipper_from_drive and the job is
         // marked failed — we log but don't bail so the loop can continue.
@@ -898,7 +919,7 @@ async fn run_clipper_once(
             cfg,
             Some(google),
             gmail,
-            ai,
+            &ai,
             storage,
             &job_id,
             &video_path,
@@ -921,11 +942,10 @@ async fn run_local_once(
     cfg: &Config,
     google: &GoogleAuth,
     gmail: &GmailClient,
-    ai: Option<&AiPipeline>,
+    openai: &OpenAiClient,
+    prompt_loader: &PromptLoader,
     local_path: &str,
-    seo_variant_blocks: &[String],
 ) -> anyhow::Result<()> {
-    let ai = ai.ok_or_else(|| anyhow::anyhow!("AI pipeline not configured"))?;
     let result_to = cfg
         .result_to
         .as_deref()
@@ -1077,11 +1097,14 @@ async fn run_local_once(
     pb_thumbs.set_message("waiting");
     pb_thumbs.enable_steady_tick(std::time::Duration::from_millis(120));
 
-    let transcript = ai
+    // Build a baseline AiPipeline (global prompts) for transcription + show inference.
+    let ai_global = build_ai_pipeline(cfg, openai, prompt_loader, None).await?;
+
+    let transcript = ai_global
         .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
         .await?;
 
-    let show_context = match ai.infer_show_context(&file_name, &transcript.full_text).await {
+    let show_context = match ai_global.infer_show_context(&file_name, &transcript.full_text).await {
         Ok(ctx) => Some(ctx),
         Err(e) => {
             tracing::warn!(error = %e, file_name=%file_name, "show inference failed; proceeding without show context");
@@ -1089,21 +1112,37 @@ async fn run_local_once(
         }
     };
 
+    // Derive show slug for per-show prompt overrides.
+    let show_slug: Option<String> = show_context
+        .as_ref()
+        .and_then(|ctx| ctx.show_name.as_deref())
+        .map(show_config::slugify)
+        .filter(|s| !s.is_empty());
+
     if let Some(ctx) = show_context.as_ref() {
         tracing::info!(
             media_name = %file_name,
             show_name = ?ctx.show_name,
             hosts = ?ctx.hosts,
             guest = ?ctx.guest,
+            show_slug = ?show_slug,
             "inferred show context"
         );
     } else {
         tracing::info!(media_name = %file_name, "no explicit show context inferred");
     }
 
+    // Rebuild AiPipeline with per-show prompt overrides.
+    let ai = if show_slug.is_some() {
+        build_ai_pipeline(cfg, openai, prompt_loader, show_slug.as_deref()).await?
+    } else {
+        ai_global
+    };
+    let seo_variant_blocks = load_variant_blocks(prompt_loader, show_slug.as_deref()).await?;
+
     let variant_total = cfg.seo_variants.max(1);
     let selected_variant_instructions: Vec<String> = (0..variant_total)
-        .map(|i| select_variant_instructions(seo_variant_blocks, i))
+        .map(|i| select_variant_instructions(&seo_variant_blocks, i))
         .collect();
 
     if is_video {
@@ -1113,13 +1152,14 @@ async fn run_local_once(
     }
     let transcript_text = std::sync::Arc::new(transcript.full_text.clone());
     let media_name = file_name.clone();
+    let ai_ref = &ai;
     let seo_fut = try_join_all(selected_variant_instructions.iter().enumerate().map(
         |(i, inst)| {
             let show_context = show_context.clone();
             let media_name = media_name.clone();
             let transcript_text = transcript_text.clone();
             async move {
-                ai.seo_variant_text_with_context(
+                ai_ref.seo_variant_text_with_context(
                     transcript_text.as_str(),
                     inst.as_str(),
                     i,
@@ -1134,7 +1174,7 @@ async fn run_local_once(
 
     let (seo_texts, moments) = if is_video {
         let (seo_texts_res, moments_res) =
-            tokio::join!(seo_fut, ai.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+            tokio::join!(seo_fut, ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
         let seo_texts = seo_texts_res?;
         let moments = match moments_res {
             Ok(m) if !m.is_empty() => m,

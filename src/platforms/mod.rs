@@ -142,6 +142,15 @@ impl Platform {
         out
     }
 
+    /// Veto (remove/unlist) a previously posted clip. Platform-specific:
+    /// YouTube sets privacy to "private"; Bluesky deletes the record.
+    pub async fn veto(&self, external_id: &str) -> anyhow::Result<()> {
+        match self {
+            Platform::YouTube(p) => p.set_private(external_id).await,
+            Platform::Bluesky(p) => p.delete_record(external_id).await,
+        }
+    }
+
     /// Post one clip to this platform. Caller selects which rendered variant
     /// (typically 9:16) to upload; platform extracts the right copy fields from
     /// `social`.
@@ -152,7 +161,10 @@ impl Platform {
         dry_run: bool,
     ) -> PostResult {
         if dry_run {
-            tracing::info!(platform = self.name(), "POST_DRY_RUN — not actually posting");
+            tracing::info!(
+                platform = self.name(),
+                "POST_DRY_RUN — not actually posting"
+            );
             return PostResult::dry_run(self.name());
         }
         match self {

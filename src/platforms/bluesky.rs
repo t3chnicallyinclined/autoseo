@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::social_copy::BlueskyCopy;
 use crate::platforms::PostResult;
+use crate::social_copy::BlueskyCopy;
 
 const JOB_POLL_INTERVAL_SECS: u64 = 3;
 const JOB_POLL_MAX_ATTEMPTS: u32 = 60; // ~3 minutes total
@@ -62,7 +62,10 @@ impl BlueskyPoster {
         if text.is_empty() {
             return PostResult::skipped("bluesky", "post text was empty");
         }
-        match self.post_inner(handle, app_password, video_path, &text).await {
+        match self
+            .post_inner(handle, app_password, video_path, &text)
+            .await
+        {
             Ok((uri, _cid)) => {
                 let url = at_uri_to_web_url(&uri, handle).unwrap_or(uri.clone());
                 PostResult::posted("bluesky", uri, url)
@@ -110,13 +113,69 @@ impl BlueskyPoster {
         Ok((create.uri, create.cid))
     }
 
-    async fn create_session(&self, handle: &str, app_password: &str) -> Result<CreateSessionResponse> {
+    /// Veto (delete) a Bluesky post by its AT URI.
+    pub async fn delete_record(&self, at_uri: &str) -> Result<()> {
+        let handle = self
+            .handle
+            .as_deref()
+            .context("BLUESKY_HANDLE not set for veto")?;
+        let app_password = self
+            .app_password
+            .as_deref()
+            .context("BLUESKY_APP_PASSWORD not set for veto")?;
+
+        let session = self.create_session(handle, app_password).await?;
+
+        // Parse AT URI: at://did:plc:xxx/app.bsky.feed.post/rkey
+        let stripped = at_uri
+            .strip_prefix("at://")
+            .context("invalid AT URI for veto")?;
+        let parts: Vec<&str> = stripped.splitn(3, '/').collect();
+        if parts.len() < 3 {
+            anyhow::bail!("cannot parse AT URI into repo/collection/rkey: {at_uri}");
+        }
+        let (repo, collection, rkey) = (parts[0], parts[1], parts[2]);
+
+        let url = format!("{}/xrpc/com.atproto.repo.deleteRecord", self.pds_url);
+        let body = serde_json::json!({
+            "repo": repo,
+            "collection": collection,
+            "rkey": rkey,
+        });
+        let res = self
+            .http
+            .post(&url)
+            .bearer_auth(&session.access_jwt)
+            .json(&body)
+            .send()
+            .await
+            .context("POST deleteRecord (veto)")?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("bluesky deleteRecord (veto) failed: {status} {body}");
+        }
+        tracing::info!(at_uri, "bluesky: record deleted (vetoed)");
+        Ok(())
+    }
+
+    async fn create_session(
+        &self,
+        handle: &str,
+        app_password: &str,
+    ) -> Result<CreateSessionResponse> {
         let url = format!("{}/xrpc/com.atproto.server.createSession", self.pds_url);
         let body = serde_json::json!({
             "identifier": handle,
             "password": app_password,
         });
-        let res = self.http.post(&url).json(&body).send().await
+        let res = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .context("POST createSession")?;
         if !res.status().is_success() {
             let status = res.status();
@@ -416,7 +475,10 @@ mod tests {
     fn at_uri_to_web_url_extracts_rkey() {
         let uri = "at://did:plc:abc/app.bsky.feed.post/3kxyz789";
         let url = at_uri_to_web_url(uri, "user.bsky.social").unwrap();
-        assert_eq!(url, "https://bsky.app/profile/user.bsky.social/post/3kxyz789");
+        assert_eq!(
+            url,
+            "https://bsky.app/profile/user.bsky.social/post/3kxyz789"
+        );
 
         assert!(at_uri_to_web_url("not-a-valid-uri", "u").is_none());
     }

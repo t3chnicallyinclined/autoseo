@@ -28,8 +28,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 whisper-rs = { version = "0.13", optional = true }
 indicatif = "0.17"
-
 ndarray = "0.16"
+ort = "2.0.0-rc.9"
+rustfft = "6"
 
 [features]
 default = []

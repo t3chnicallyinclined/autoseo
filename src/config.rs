@@ -476,4 +476,19 @@ pub struct Config {
     /// when no show history exists or the show is unknown.
     #[arg(long, env = "LOUDNESS_PER_SHOW", default_value_t = true)]
     pub loudness_per_show: bool,
+
+    /// Enable AST (Audio Spectrogram Transformer) audio-event detection.
+    /// When enabled, classifies audio windows for laughter, applause, music, and
+    /// speech as a tier-2 ranking signal. Requires the ONNX model file.
+    #[arg(long, env = "AST_ENABLED", default_value_t = false)]
+    pub ast_enabled: bool,
+
+    /// URL to download the AST ONNX model from on first use.
+    /// The model is saved to `{WORK_DIR}/models/ast/model.onnx`.
+    #[arg(
+        long,
+        env = "AST_MODEL_URL",
+        default_value = "https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593/resolve/main/onnx/model.onnx"
+    )]
+    pub ast_model_url: String,
 }

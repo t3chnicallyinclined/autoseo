@@ -16,6 +16,7 @@
 use anyhow::Result;
 
 use crate::align::{self, AlignedWord};
+use crate::ast::{self, AudioEvents, ScoredWindow};
 use crate::embed::{self, Embedder};
 use crate::linguistic_markers::{self, LinguisticFeatures};
 use crate::prosody::{self, F0Sample, RmsWindow};
@@ -37,6 +38,8 @@ pub struct CandidateWindow {
     pub speaking_rate_wps: Option<f64>,
     /// 0..=1, set by [`attach_novelty`]. `None` until the embedding pass runs.
     pub novelty_score: Option<f64>,
+    /// Per-window audio event scores from AST. `None` until the AST pass runs.
+    pub audio_events: Option<AudioEvents>,
 }
 
 impl CandidateWindow {
@@ -228,6 +231,18 @@ fn build_window(
         f0_peak_hz: f0_stats.map(|s| s.peak_hz),
         speaking_rate_wps,
         novelty_score: None,
+        audio_events: None,
+    }
+}
+
+/// Attach AST audio-event scores to each candidate by aggregating overlapping
+/// scored windows. Mutates in place.
+pub fn attach_audio_events(
+    windows: &mut [CandidateWindow],
+    scored: &[ScoredWindow],
+) {
+    for w in windows.iter_mut() {
+        w.audio_events = ast::aggregate_events(scored, w.start_secs, w.end_secs);
     }
 }
 

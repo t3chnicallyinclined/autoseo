@@ -26,6 +26,8 @@ mod storage;
 mod thumbs;
 mod vad;
 mod vlm_ranker;
+#[cfg(feature = "local-stt")]
+mod whisper_local;
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -33,7 +35,7 @@ use clap::Parser;
 use futures_util::future::try_join_all;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use ai_pipeline::{AiPipeline, ThumbnailMoment};
+use ai_pipeline::{AiPipeline, SttBackend, ThumbnailMoment};
 use config::Config;
 use drive::DriveClient;
 use gmail::GmailClient;
@@ -165,20 +167,42 @@ async fn main() -> anyhow::Result<()> {
             })?;
         let seo_variant_blocks = parse_variants_prompt_file(&variants_raw);
 
-        (
-            Some(AiPipeline::new(
-                openai,
-                cfg.openai_stt_model.clone(),
-                cfg.openai_chat_model.clone(),
-                cfg.stt_concurrency,
-                cfg.stt_rpm_limit,
-                seo_system_prompt,
-                thumbnail_system_prompt,
-                seo_user_prompt_template,
-                thumbnail_user_prompt_template,
-            )),
-            seo_variant_blocks,
+        let stt_backend = SttBackend::parse(&cfg.stt_backend)?;
+        #[allow(unused_mut)]
+        let mut pipeline = AiPipeline::new(
+            openai,
+            cfg.openai_stt_model.clone(),
+            cfg.openai_chat_model.clone(),
+            cfg.stt_concurrency,
+            cfg.stt_rpm_limit,
+            seo_system_prompt,
+            thumbnail_system_prompt,
+            seo_user_prompt_template,
+            thumbnail_user_prompt_template,
         )
+        .with_stt_backend(stt_backend.clone())
+        .with_ffmpeg_path(cfg.ffmpeg.clone());
+
+        #[cfg(feature = "local-stt")]
+        if stt_backend == SttBackend::Local {
+            let model_path = match cfg.whisper_model_path.as_deref() {
+                Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                _ => whisper_local::WhisperLocal::default_model_path(&cfg.work_dir),
+            };
+            tracing::info!(model_path = %model_path.display(), "loading local whisper model");
+            let wl = whisper_local::WhisperLocal::load(&model_path)?;
+            pipeline = pipeline.with_whisper_local(wl);
+        }
+
+        #[cfg(not(feature = "local-stt"))]
+        if stt_backend == SttBackend::Local {
+            anyhow::bail!(
+                "STT_BACKEND=local requires the `local-stt` cargo feature. \
+                 Recompile with: cargo build --features local-stt"
+            );
+        }
+
+        (Some(pipeline), seo_variant_blocks)
     };
 
     if let Some(local_path) = cfg.local_video_path.as_deref() {

@@ -23,7 +23,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "pro
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+whisper-rs = { version = "0.13", optional = true }
 indicatif = "0.17"
+
+[features]
+default = []
+local-stt = ["whisper-rs"]
 
 [dev-dependencies]
 tempfile = "3"

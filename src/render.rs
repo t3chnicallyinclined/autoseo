@@ -155,7 +155,16 @@ fn build_video_filter(profile: &RenderProfile, subtitle_paths: &[&Path]) -> Stri
 
     // Burn each subtitle layer; later filters draw on top of earlier ones.
     for sub_path in subtitle_paths {
-        let escaped = sub_path.display().to_string().replace('\'', r"\'");
+        // ffmpeg's subtitles filter (libass) has its own escaping rules:
+        //  - backslashes are escape chars → convert to forward slashes
+        //  - colons are option separators → escape as \:
+        //  - single quotes delimit the filename → escape as \'
+        let escaped = sub_path
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace(':', r"\:")
+            .replace('\'', r"\'");
         chain.push(format!("subtitles='{escaped}'"));
     }
 

@@ -2,4 +2,5 @@
 /target
 /work
 *.log
+*.onnx
 .env

@@ -185,7 +185,15 @@ async fn run_clipper_pipeline_inner(
     let (transcript, shots, silences, rms) = tokio::try_join!(
         ai.transcribe_word_chunks(&chunks, Some(pb_transcribe.clone())),
         scene::detect_shots(&cfg.ffmpeg, input_path, 0.4),
-        vad::detect_silences(&cfg.ffmpeg, &audio_path, -30.0, 0.3),
+        vad::detect_silences(
+            &cfg.ffmpeg,
+            &audio_path,
+            -30.0,
+            0.3,
+            vad::VadBackend::from_config(&cfg.vad_backend),
+            &cfg.vad_model_path,
+            cfg.vad_threshold,
+        ),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
 
@@ -702,7 +710,15 @@ async fn run_clipper_inner(
     let (transcript, shots, silences, rms) = tokio::try_join!(
         ai.transcribe_word_chunks(&chunks, Some(pb_transcribe.clone())),
         scene::detect_shots(&cfg.ffmpeg, &input_path, 0.4),
-        vad::detect_silences(&cfg.ffmpeg, &audio_path, -30.0, 0.3),
+        vad::detect_silences(
+            &cfg.ffmpeg,
+            &audio_path,
+            -30.0,
+            0.3,
+            vad::VadBackend::from_config(&cfg.vad_backend),
+            &cfg.vad_model_path,
+            cfg.vad_threshold,
+        ),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
 

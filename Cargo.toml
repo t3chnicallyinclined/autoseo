@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fastembed = "4"
 futures-util = "0.3"
 hound = "3"
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray"] }
 rand = "0.8"
 regex = "1"
 percent-encoding = "2"
@@ -27,6 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 whisper-rs = { version = "0.13", optional = true }
 indicatif = "0.17"
+
+ndarray = "0.16"
 
 [features]
 default = []

@@ -455,4 +455,12 @@ pub struct Config {
     /// `MODE=server` or `--serve-api`.
     #[arg(long, env = "SERVE_API", default_value_t = false)]
     pub serve_api: bool,
+
+    /// Enable per-show loudness persistence. When true (default), the clipper
+    /// measures integrated LUFS on the first episode of a show, stores it in
+    /// the database, and reuses it for subsequent episodes so all clips from the
+    /// same show have consistent audio levels. Falls back to platform defaults
+    /// when no show history exists or the show is unknown.
+    #[arg(long, env = "LOUDNESS_PER_SHOW", default_value_t = true)]
+    pub loudness_per_show: bool,
 }

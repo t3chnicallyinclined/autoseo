@@ -360,6 +360,55 @@ where
     }
 }
 
+/// Measure integrated loudness (LUFS) of a media file using ffmpeg's loudnorm filter.
+/// Returns the measured integrated loudness in LUFS (a negative number, e.g. -16.2).
+pub async fn measure_loudness(
+    ffmpeg: &str,
+    media_path: &std::path::Path,
+) -> anyhow::Result<f64> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-nostats"])
+        .arg("-i")
+        .arg(media_path)
+        .args(["-af", "loudnorm=print_format=json"])
+        .args(["-f", "null"])
+        .arg("-")
+        .output()
+        .await
+        .with_context(|| format!("run ffmpeg loudnorm measurement on {}", media_path.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffmpeg loudnorm measurement failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // loudnorm prints JSON to stderr; find the JSON block containing "input_i".
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json_start = stderr
+        .find('{')
+        .context("loudnorm output missing JSON block")?;
+    let json_end = stderr[json_start..]
+        .find('}')
+        .context("loudnorm output missing closing brace")?
+        + json_start
+        + 1;
+    let json_str = &stderr[json_start..json_end];
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).context("parse loudnorm JSON")?;
+    let input_i = parsed
+        .get("input_i")
+        .and_then(|v| v.as_str())
+        .context("loudnorm JSON missing input_i")?;
+    let lufs: f64 = input_i
+        .trim()
+        .parse()
+        .with_context(|| format!("parse input_i '{input_i}' as f64"))?;
+    Ok(lufs)
+}
+
 pub async fn screenshot_jpeg(
     ffmpeg: &str,
     video_path: &std::path::Path,

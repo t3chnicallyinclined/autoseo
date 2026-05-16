@@ -109,6 +109,7 @@ pub enum Mode {
     SeoOnly,
     Clipper,
     Both,
+    Server,
 }
 
 impl Mode {
@@ -117,8 +118,9 @@ impl Mode {
             "seo-only" | "seo_only" | "seo" => Ok(Mode::SeoOnly),
             "clipper" | "clip" | "clips" => Ok(Mode::Clipper),
             "both" | "all" => Ok(Mode::Both),
+            "server" | "api" => Ok(Mode::Server),
             other => anyhow::bail!(
-                "invalid MODE='{other}'; expected one of seo-only, clipper, both"
+                "invalid MODE='{other}'; expected one of seo-only, clipper, both, server"
             ),
         }
     }

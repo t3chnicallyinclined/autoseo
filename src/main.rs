@@ -15,6 +15,7 @@ mod gmail;
 mod google_auth;
 mod linguistic_markers;
 mod media;
+mod media_server;
 mod mime;
 mod openai;
 mod parse;
@@ -123,6 +124,22 @@ async fn main() -> anyhow::Result<()> {
              MODE=clipper DIGEST_MODE=file for disk-only output."
         );
     }
+    // Start the media API server in the background if API_PORT is set.
+    if let Some(port) = cfg.api_port {
+        let work_dir = std::path::PathBuf::from(&cfg.work_dir);
+        let bind_addr = format!("{}:{}", cfg.api_bind, port);
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("bind API server to {bind_addr}"))?;
+        tracing::info!(bind = %bind_addr, "media API server starting");
+        let app = media_server::router(work_dir);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "media API server exited with error");
+            }
+        });
+    }
+
     let storage = Storage::open(&cfg.clipper_db).await?;
     let imported = storage.import_legacy_dedupe(&cfg.dedupe_file).await?;
     if imported > 0 {

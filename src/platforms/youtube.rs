@@ -179,9 +179,10 @@ impl YouTubePoster {
             .await
             .context("refresh Google access token")?;
 
-        let video_bytes = tokio::fs::read(video_path)
+        let video_bytes: bytes::Bytes = tokio::fs::read(video_path)
             .await
-            .with_context(|| format!("read video: {}", video_path.display()))?;
+            .with_context(|| format!("read video: {}", video_path.display()))?
+            .into();
         let content_length = video_bytes.len() as u64;
 
         let metadata = self.build_metadata(copy);

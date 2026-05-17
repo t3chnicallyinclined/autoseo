@@ -156,7 +156,7 @@ impl TrendCache {
                 Err(e) => warn!(source = name, error = %e, "skipping source"),
             }
         }
-        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| b.score.total_cmp(&a.score));
         Ok(all)
     }
 

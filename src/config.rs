@@ -275,6 +275,19 @@ pub struct Config {
     #[arg(long, env = "AUTO_CHUNK_MAX_SECS", default_value_t = 1800)]
     pub auto_chunk_max_secs: u64,
 
+    /// STT backend. `api` sends audio to the OpenAI-compatible STT endpoint
+    /// (Groq, OpenAI, etc.). `local` uses whisper.cpp via whisper-rs (requires
+    /// the `local-stt` cargo feature). Default: `api`.
+    #[arg(long, env = "STT_BACKEND", default_value = "api")]
+    pub stt_backend: String,
+
+    /// Path to a GGML whisper model file (e.g. `ggml-large-v3-turbo.bin`).
+    /// When `STT_BACKEND=local`, the model is loaded from this path. If it
+    /// does not exist the pipeline errors with download instructions.
+    /// Default: `{WORK_DIR}/models/whisper/ggml-large-v3-turbo.bin`.
+    #[arg(long, env = "WHISPER_MODEL_PATH")]
+    pub whisper_model_path: Option<String>,
+
     /// Maximum number of concurrent STT requests (limits Whisper RPM usage).
     #[arg(long, env = "STT_CONCURRENCY", default_value_t = 500)]
     pub stt_concurrency: usize,

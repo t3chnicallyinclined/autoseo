@@ -11,6 +11,27 @@ use crate::align::{self, AlignedWord};
 use crate::openai::OpenAiClient;
 use crate::rate_limit::RpmGate;
 
+/// Which STT backend to use for transcription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SttBackend {
+    /// Remote OpenAI-compatible API (Groq, OpenAI, etc.).
+    Api,
+    /// Local whisper.cpp via whisper-rs (requires `local-stt` feature).
+    Local,
+}
+
+impl SttBackend {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "api" => Ok(Self::Api),
+            "local" => Ok(Self::Local),
+            other => anyhow::bail!(
+                "invalid STT_BACKEND={other:?} — expected \"api\" or \"local\""
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AiPipeline {
     pub openai: OpenAiClient,
@@ -22,6 +43,10 @@ pub struct AiPipeline {
     thumbnail_system_prompt: String,
     seo_user_prompt_template: String,
     thumbnail_user_prompt_template: String,
+    stt_backend: SttBackend,
+    #[cfg(feature = "local-stt")]
+    whisper_local: Option<crate::whisper_local::WhisperLocal>,
+    ffmpeg_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +119,30 @@ impl AiPipeline {
             thumbnail_system_prompt,
             seo_user_prompt_template,
             thumbnail_user_prompt_template,
+            stt_backend: SttBackend::Api,
+            #[cfg(feature = "local-stt")]
+            whisper_local: None,
+            ffmpeg_path: "ffmpeg".to_string(),
         }
+    }
+
+    /// Set the STT backend and (for `Local`) the loaded whisper model.
+    pub fn with_stt_backend(mut self, backend: SttBackend) -> Self {
+        self.stt_backend = backend;
+        self
+    }
+
+    /// Set the ffmpeg path (needed for local STT to convert audio to 16kHz WAV).
+    pub fn with_ffmpeg_path(mut self, path: String) -> Self {
+        self.ffmpeg_path = path;
+        self
+    }
+
+    /// Attach a loaded local whisper model. Only available with `local-stt` feature.
+    #[cfg(feature = "local-stt")]
+    pub fn with_whisper_local(mut self, wl: crate::whisper_local::WhisperLocal) -> Self {
+        self.whisper_local = Some(wl);
+        self
     }
 
     pub async fn transcribe_chunks(
@@ -102,10 +150,6 @@ impl AiPipeline {
         chunks: &[(std::path::PathBuf, f64, f64)],
         progress: Option<ProgressBar>,
     ) -> anyhow::Result<Transcript> {
-        let client = self.openai.clone();
-        let stt_model = self.stt_model.clone();
-        let concurrency = self.stt_concurrency;
-        let stt_rpm_gate = self.stt_rpm_gate.clone();
         if chunks.is_empty() {
             anyhow::bail!("no audio chunks to transcribe");
         }
@@ -122,36 +166,47 @@ impl AiPipeline {
         progress.set_message("starting");
         let completed = Arc::new(AtomicUsize::new(0));
 
-        let results = stream::iter(chunks.iter().cloned().enumerate())
-            .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
-                let client = client.clone();
-                let stt_model = stt_model.clone();
-                let progress = progress.clone();
-                let completed = completed.clone();
-                let total_chunks = total_chunks;
-                let stt_rpm_gate = stt_rpm_gate.clone();
-                async move {
-                    let chunk_label = chunk_path.display().to_string();
-                    tracing::debug!(chunk=%chunk_label, offset_secs, "transcribing audio chunk");
+        let results = match self.stt_backend {
+            SttBackend::Api => {
+                let client = self.openai.clone();
+                let stt_model = self.stt_model.clone();
+                let concurrency = self.stt_concurrency;
+                let stt_rpm_gate = self.stt_rpm_gate.clone();
+                stream::iter(chunks.iter().cloned().enumerate())
+                    .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
+                        let client = client.clone();
+                        let stt_model = stt_model.clone();
+                        let progress = progress.clone();
+                        let completed = completed.clone();
+                        let total_chunks = total_chunks;
+                        let stt_rpm_gate = stt_rpm_gate.clone();
+                        async move {
+                            let chunk_label = chunk_path.display().to_string();
+                            tracing::debug!(chunk=%chunk_label, offset_secs, "transcribing audio chunk");
 
-                    if let Some(gate) = stt_rpm_gate.as_ref() {
-                        gate.wait().await;
-                    }
-                    let tr = client
-                        .transcribe_text(&stt_model, &chunk_path)
-                        .await
-                        .with_context(|| format!("stt for {chunk_label}"))?;
+                            if let Some(gate) = stt_rpm_gate.as_ref() {
+                                gate.wait().await;
+                            }
+                            let tr = client
+                                .transcribe_text(&stt_model, &chunk_path)
+                                .await
+                                .with_context(|| format!("stt for {chunk_label}"))?;
 
-                    let mapped = map_segments_or_synthesize(tr, offset_secs, chunk_duration_secs);
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    progress.set_message(format!("chunk {done}/{total_chunks}"));
-                    progress.inc(1);
-                    Ok::<_, anyhow::Error>((idx, mapped))
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
+                            let mapped = map_segments_or_synthesize(tr, offset_secs, chunk_duration_secs);
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            progress.set_message(format!("chunk {done}/{total_chunks}"));
+                            progress.inc(1);
+                            Ok::<_, anyhow::Error>((idx, mapped))
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect::<Vec<_>>()
+                    .await
+            }
+            SttBackend::Local => {
+                self.transcribe_chunks_local(chunks, &progress, &completed, total_chunks).await?
+            }
+        };
         progress.finish_with_message("transcription complete");
 
         let mut per_chunk = Vec::with_capacity(results.len());
@@ -191,10 +246,6 @@ impl AiPipeline {
         if chunks.is_empty() {
             anyhow::bail!("no audio chunks to transcribe");
         }
-        let client = self.openai.clone();
-        let stt_model = self.stt_model.clone();
-        let concurrency = self.stt_concurrency;
-        let stt_rpm_gate = self.stt_rpm_gate.clone();
         let total_chunks = chunks.len();
 
         let progress = progress.unwrap_or_else(ProgressBar::hidden);
@@ -207,37 +258,48 @@ impl AiPipeline {
         );
         let completed = Arc::new(AtomicUsize::new(0));
 
-        let results = stream::iter(chunks.iter().cloned().enumerate())
-            .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
-                let client = client.clone();
-                let stt_model = stt_model.clone();
-                let progress = progress.clone();
-                let completed = completed.clone();
-                let total_chunks = total_chunks;
-                let stt_rpm_gate = stt_rpm_gate.clone();
-                async move {
-                    let chunk_label = chunk_path.display().to_string();
-                    if let Some(gate) = stt_rpm_gate.as_ref() {
-                        gate.wait().await;
-                    }
-                    let tr = client
-                        .transcribe_words(&stt_model, &chunk_path)
-                        .await
-                        .with_context(|| format!("stt-words for {chunk_label}"))?;
+        let results: Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>> = match self.stt_backend {
+            SttBackend::Api => {
+                let client = self.openai.clone();
+                let stt_model = self.stt_model.clone();
+                let concurrency = self.stt_concurrency;
+                let stt_rpm_gate = self.stt_rpm_gate.clone();
+                stream::iter(chunks.iter().cloned().enumerate())
+                    .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
+                        let client = client.clone();
+                        let stt_model = stt_model.clone();
+                        let progress = progress.clone();
+                        let completed = completed.clone();
+                        let total_chunks = total_chunks;
+                        let stt_rpm_gate = stt_rpm_gate.clone();
+                        async move {
+                            let chunk_label = chunk_path.display().to_string();
+                            if let Some(gate) = stt_rpm_gate.as_ref() {
+                                gate.wait().await;
+                            }
+                            let tr = client
+                                .transcribe_words(&stt_model, &chunk_path)
+                                .await
+                                .with_context(|| format!("stt-words for {chunk_label}"))?;
 
-                    let segments =
-                        map_segments_or_synthesize_words(&tr, offset_secs, chunk_duration_secs);
-                    let words = align::shift_words(&tr.words, offset_secs);
+                            let segments =
+                                map_segments_or_synthesize_words(&tr, offset_secs, chunk_duration_secs);
+                            let words = align::shift_words(&tr.words, offset_secs);
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    progress.set_message(format!("chunk {done}/{total_chunks}"));
-                    progress.inc(1);
-                    Ok::<_, anyhow::Error>((idx, segments, words))
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            progress.set_message(format!("chunk {done}/{total_chunks}"));
+                            progress.inc(1);
+                            Ok::<_, anyhow::Error>((idx, segments, words))
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect::<Vec<_>>()
+                    .await
+            }
+            SttBackend::Local => {
+                self.transcribe_word_chunks_local(chunks, &progress, &completed, total_chunks).await?
+            }
+        };
         progress.finish_with_message("word transcription complete");
 
         let mut per_chunk = Vec::with_capacity(results.len());
@@ -265,6 +327,95 @@ impl AiPipeline {
             segments: segments_out,
             words: words_out,
         })
+    }
+
+    // ── Local STT helpers ─────────────────────────────────────────────────
+
+    #[cfg(feature = "local-stt")]
+    async fn transcribe_chunks_local(
+        &self,
+        chunks: &[(std::path::PathBuf, f64, f64)],
+        progress: &ProgressBar,
+        completed: &Arc<AtomicUsize>,
+        total_chunks: usize,
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>), anyhow::Error>>> {
+        let wl = self.whisper_local.as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "STT_BACKEND=local but no whisper model loaded. Compile with --features local-stt \
+                 and set WHISPER_MODEL_PATH."
+            ))?;
+        let mut results = Vec::with_capacity(chunks.len());
+        // Local inference is CPU-bound; run sequentially to avoid thrashing.
+        for (idx, (chunk_path, offset_secs, chunk_duration_secs)) in chunks.iter().enumerate() {
+            let wav_path = convert_to_wav16k(&self.ffmpeg_path, chunk_path).await?;
+            let tr = wl.transcribe(&wav_path).await
+                .with_context(|| format!("local stt for {}", chunk_path.display()))?;
+            // Clean up temp wav
+            tokio::fs::remove_file(&wav_path).await.ok();
+            let mapped = map_segments_or_synthesize(tr, *offset_secs, *chunk_duration_secs);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.set_message(format!("chunk {done}/{total_chunks}"));
+            progress.inc(1);
+            results.push(Ok((idx, mapped)));
+        }
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "local-stt"))]
+    async fn transcribe_chunks_local(
+        &self,
+        _chunks: &[(std::path::PathBuf, f64, f64)],
+        _progress: &ProgressBar,
+        _completed: &Arc<AtomicUsize>,
+        _total_chunks: usize,
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>), anyhow::Error>>> {
+        anyhow::bail!(
+            "STT_BACKEND=local requires the `local-stt` cargo feature. \
+             Recompile with: cargo build --features local-stt"
+        );
+    }
+
+    #[cfg(feature = "local-stt")]
+    async fn transcribe_word_chunks_local(
+        &self,
+        chunks: &[(std::path::PathBuf, f64, f64)],
+        progress: &ProgressBar,
+        completed: &Arc<AtomicUsize>,
+        total_chunks: usize,
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>> {
+        let wl = self.whisper_local.as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "STT_BACKEND=local but no whisper model loaded. Compile with --features local-stt \
+                 and set WHISPER_MODEL_PATH."
+            ))?;
+        let mut results = Vec::with_capacity(chunks.len());
+        for (idx, (chunk_path, offset_secs, chunk_duration_secs)) in chunks.iter().enumerate() {
+            let wav_path = convert_to_wav16k(&self.ffmpeg_path, chunk_path).await?;
+            let tr = wl.transcribe(&wav_path).await
+                .with_context(|| format!("local stt-words for {}", chunk_path.display()))?;
+            tokio::fs::remove_file(&wav_path).await.ok();
+            let segments = map_segments_or_synthesize_words(&tr, *offset_secs, *chunk_duration_secs);
+            let words = align::shift_words(&tr.words, *offset_secs);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.set_message(format!("chunk {done}/{total_chunks}"));
+            progress.inc(1);
+            results.push(Ok((idx, segments, words)));
+        }
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "local-stt"))]
+    async fn transcribe_word_chunks_local(
+        &self,
+        _chunks: &[(std::path::PathBuf, f64, f64)],
+        _progress: &ProgressBar,
+        _completed: &Arc<AtomicUsize>,
+        _total_chunks: usize,
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>> {
+        anyhow::bail!(
+            "STT_BACKEND=local requires the `local-stt` cargo feature. \
+             Recompile with: cargo build --features local-stt"
+        );
     }
 
     pub async fn infer_show_context(
@@ -558,6 +709,50 @@ fn minute_index(segments: &[TranscriptSegment], max_minutes: usize) -> String {
         ));
     }
     out
+}
+
+/// Convert any audio file to 16kHz mono WAV (what whisper.cpp expects).
+/// Returns the path to the converted file (placed next to the original with a
+/// `_16k.wav` suffix). If the input is already a 16kHz mono WAV we still
+/// normalize through ffmpeg for safety — the cost is negligible compared to
+/// inference.
+async fn convert_to_wav16k(
+    ffmpeg: &str,
+    input: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chunk");
+    let out = input.with_file_name(format!("{stem}_16k.wav"));
+
+    let status = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-y",
+            "-i",
+            &input.display().to_string(),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            &out.display().to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("spawn ffmpeg to convert {} to 16kHz wav", input.display()))?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "ffmpeg failed (exit {}) converting {} to 16kHz wav",
+            status.code().unwrap_or(-1),
+            input.display()
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]

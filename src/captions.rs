@@ -2,10 +2,12 @@
 //! transcript timestamps. ffmpeg burns the result via `subtitles='path.ass'` —
 //! see [`crate::render::render_clip`].
 //!
-//! M1 style: "popping" phrase captions — 2–4 words per phrase, replaced when the
-//! next phrase starts. No active-word color highlight; uniform white text with a
-//! bold black outline at the bottom-center. Karaoke `{\k}` tag highlighting is
-//! a future polish, not required to ship M1.
+//! Supports two modes:
+//! - **Phrase-only** (M1): uniform white text, no per-word highlight. Used when
+//!   word-level timestamps are unavailable or all words in a phrase share the
+//!   same timing.
+//! - **Karaoke** (M3): each word lights up as it's spoken via ASS `{\k}` tags.
+//!   The highlight color is configurable via [`CaptionStyle::highlight_bgr`].
 
 use anyhow::Context;
 use std::path::Path;
@@ -28,6 +30,10 @@ pub struct CaptionStyle {
     pub max_words_per_phrase: usize,
     /// Soft cap on phrase character count before forcing a flush.
     pub max_chars_per_phrase: usize,
+    /// 0xBBGGRR — highlight (active-word) color for karaoke mode.
+    /// When set to `Some`, per-word `{\k}` tags are emitted.
+    /// `None` disables karaoke and produces plain phrase captions (M1 behavior).
+    pub highlight_bgr: Option<u32>,
 }
 
 impl Default for CaptionStyle {
@@ -49,6 +55,7 @@ impl CaptionStyle {
             margin_v_px: 200,
             max_words_per_phrase: 4,
             max_chars_per_phrase: 28,
+            highlight_bgr: Some(0x00FFFF), // yellow in BGR
         }
     }
 
@@ -63,6 +70,7 @@ impl CaptionStyle {
             margin_v_px: 80,
             max_words_per_phrase: 5,
             max_chars_per_phrase: 36,
+            highlight_bgr: Some(0x00FFFF),
         }
     }
 
@@ -78,6 +86,7 @@ impl CaptionStyle {
             margin_v_px: 60,
             max_words_per_phrase: 7,
             max_chars_per_phrase: 52,
+            highlight_bgr: Some(0x00FFFF),
         }
     }
 }
@@ -228,6 +237,7 @@ pub fn render_ass(
     style: &CaptionStyle,
 ) -> String {
     let phrases = group_into_phrases(words, style.max_words_per_phrase, style.max_chars_per_phrase);
+    let karaoke = style.highlight_bgr.is_some();
 
     let mut out = String::new();
     out.push_str(&header(play_res_w, play_res_h));
@@ -236,10 +246,14 @@ pub fn render_ass(
     out.push_str(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
     );
-    for p in phrases {
+    for p in &phrases {
         let start = format_ass_time(p.start_secs);
         let end = format_ass_time(p.end_secs);
-        let text = sanitize_text(&p.text);
+        let text = if karaoke && p.has_word_timing() {
+            build_karaoke_text(&p.words)
+        } else {
+            sanitize_text(&p.text)
+        };
         out.push_str(&format!(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
         ));
@@ -247,11 +261,55 @@ pub fn render_ass(
     out
 }
 
+/// Build ASS dialogue text with per-word `{\kN}` (karaoke fill) tags.
+/// `N` is the word duration in centiseconds.
+fn build_karaoke_text(words: &[PhraseWord]) -> String {
+    let mut out = String::new();
+    for (i, pw) in words.iter().enumerate() {
+        let dur_cs = ((pw.end_secs - pw.start_secs).max(0.0) * 100.0).round() as u64;
+        // {\kN} — karaoke fill: text transitions from SecondaryColour to
+        // PrimaryColour over N centiseconds.
+        out.push_str(&format!("{{\\k{dur_cs}}}"));
+        out.push_str(&sanitize_word(&pw.text));
+        if i + 1 < words.len() {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Sanitize a single word for use inside a karaoke-tagged dialogue line.
+/// Unlike `sanitize_text`, we do NOT escape `{` / `}` because those are our
+/// own override tags — but we still escape backslashes and strip newlines.
+fn sanitize_word(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', " ")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PhraseWord {
+    text: String,
+    start_secs: f64,
+    end_secs: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Phrase {
     start_secs: f64,
     end_secs: f64,
     text: String,
+    words: Vec<PhraseWord>,
+}
+
+impl Phrase {
+    /// Returns true if words have distinct timing (i.e. not all identical).
+    fn has_word_timing(&self) -> bool {
+        if self.words.len() <= 1 {
+            return self.words.len() == 1;
+        }
+        // Check that at least two words have different start times.
+        let first_start = self.words[0].start_secs;
+        self.words.iter().any(|w| (w.start_secs - first_start).abs() > 0.001)
+    }
 }
 
 fn group_into_phrases(
@@ -272,10 +330,18 @@ fn group_into_phrases(
         }
         let start = buf.first().unwrap().start_secs;
         let end = buf.last().unwrap().end_secs;
-        let text = buf
+        let phrase_words: Vec<PhraseWord> = buf
             .iter()
-            .map(|w| w.text.trim())
-            .filter(|t| !t.is_empty())
+            .filter(|w| !w.text.trim().is_empty())
+            .map(|w| PhraseWord {
+                text: w.text.trim().to_string(),
+                start_secs: w.start_secs,
+                end_secs: w.end_secs,
+            })
+            .collect();
+        let text = phrase_words
+            .iter()
+            .map(|w| w.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         if end > start && !text.is_empty() {
@@ -283,6 +349,7 @@ fn group_into_phrases(
                 start_secs: start,
                 end_secs: end,
                 text,
+                words: phrase_words,
             });
         }
         buf.clear();
@@ -331,19 +398,29 @@ fn header(w: u32, h: u32) -> String {
 fn style_block(style: &CaptionStyle) -> String {
     // ASS color literal: &HAABBGGRR — alpha is the first byte, 00 = opaque.
     let primary = format!("&H00{:06X}", reverse_bytes_24(style.primary_bgr));
-    // Secondary is unused for the "popping" style; reuse primary.
-    let secondary = primary.clone();
+    // In karaoke mode SecondaryColour is the "before highlight" color (dimmed text);
+    // PrimaryColour is the "after highlight" (lit-up) color. We swap roles:
+    // the highlight color becomes Primary so words glow as {\k} sweeps through,
+    // and the original text color stays as Secondary (the pre-highlight state).
+    let (primary_col, secondary_col) = if let Some(hl) = style.highlight_bgr {
+        let highlight = format!("&H00{:06X}", reverse_bytes_24(hl));
+        // ASS \k fills from SecondaryColour → PrimaryColour over the duration.
+        // So PrimaryColour = highlight (lit), SecondaryColour = normal (unlit).
+        (highlight, primary.clone())
+    } else {
+        (primary.clone(), primary.clone())
+    };
     let outline = format!("&H00{:06X}", reverse_bytes_24(style.outline_bgr));
     let back = "&H80000000".to_string(); // semi-transparent black shadow
     format!(
         "[V4+ Styles]\n\
          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Default,{font},{size},{primary},{secondary},{outline},{back},-1,0,0,0,100,100,0,0,1,{out_px},0,2,40,40,{margin_v},1\n\
+         Style: Default,{font},{size},{primary_col},{secondary_col},{outline},{back},-1,0,0,0,100,100,0,0,1,{out_px},0,2,40,40,{margin_v},1\n\
          \n",
         font = style.font_name,
         size = style.font_size_pt,
-        primary = primary,
-        secondary = secondary,
+        primary_col = primary_col,
+        secondary_col = secondary_col,
         outline = outline,
         back = back,
         out_px = style.outline_px,
@@ -538,5 +615,92 @@ mod tests {
     fn overlay_sanitizes_braces_in_hook() {
         let body = render_overlay_ass("{tricky}", 1080, 1920, &OverlayStyle::for_vertical());
         assert!(body.contains(r"\{tricky\}"));
+    }
+
+    // ── Karaoke tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn karaoke_emits_k_tags_per_word() {
+        let words = vec![
+            w("Hello", 0.0, 0.3),
+            w("world", 0.3, 0.7),
+            w("today", 0.7, 1.0),
+        ];
+        let style = CaptionStyle::default(); // highlight_bgr = Some(...)
+        let body = render_ass(&words, 1080, 1920, &style);
+
+        // Each word should have a {\kN} tag.
+        assert!(body.contains("{\\k30}Hello"), "body: {body}");
+        assert!(body.contains("{\\k40}world"), "body: {body}");
+        assert!(body.contains("{\\k30}today"), "body: {body}");
+    }
+
+    #[test]
+    fn karaoke_disabled_when_highlight_none() {
+        let words = vec![
+            w("Hello", 0.0, 0.3),
+            w("world", 0.3, 0.7),
+        ];
+        let mut style = CaptionStyle::default();
+        style.highlight_bgr = None;
+        let body = render_ass(&words, 1080, 1920, &style);
+
+        // No karaoke tags — plain text.
+        assert!(!body.contains("{\\k"), "body: {body}");
+        assert!(body.contains("Hello world"), "body: {body}");
+    }
+
+    #[test]
+    fn karaoke_style_block_has_highlight_primary() {
+        let style = CaptionStyle::default();
+        let block = style_block(&style);
+        // highlight_bgr = 0x00FFFF → reversed = 0x00FFFF → &H0000FFFF
+        assert!(block.contains("&H0000FFFF"), "block: {block}");
+    }
+
+    #[test]
+    fn karaoke_preserves_phrase_grouping() {
+        let words = vec![
+            w("one", 0.0, 0.2),
+            w("two", 0.2, 0.4),
+            w("three", 0.4, 0.6),
+            w("four", 0.6, 0.8),
+            w("five", 0.8, 1.0),
+        ];
+        let mut style = CaptionStyle::default();
+        style.max_words_per_phrase = 3;
+        style.max_chars_per_phrase = 100;
+        let body = render_ass(&words, 1080, 1920, &style);
+
+        // Should have 2 Dialogue lines (3 + 2 words).
+        let dialogue_count = body.matches("Dialogue: ").count();
+        assert_eq!(dialogue_count, 2, "body: {body}");
+
+        // First phrase: words with {\k} tags.
+        assert!(body.contains("{\\k20}one {\\k20}two {\\k20}three"), "body: {body}");
+        // Second phrase.
+        assert!(body.contains("{\\k20}four {\\k20}five"), "body: {body}");
+    }
+
+    #[test]
+    fn karaoke_word_timing_centisecond_rounding() {
+        let words = vec![
+            w("fast", 0.0, 0.05),   // 5cs
+            w("slow", 0.05, 1.555), // ~150cs
+        ];
+        let body = render_ass(&words, 1080, 1920, &CaptionStyle::default());
+        assert!(body.contains("{\\k5}fast"), "body: {body}");
+        assert!(body.contains("{\\k150}slow") || body.contains("{\\k151}slow"), "body: {body}");
+    }
+
+    #[test]
+    fn build_karaoke_text_handles_single_word() {
+        let words = vec![PhraseWord {
+            text: "alone".into(),
+            start_secs: 0.0,
+            end_secs: 0.5,
+        }];
+        let text = build_karaoke_text(&words);
+        assert_eq!(text, "{\\k50}alone");
     }
 }

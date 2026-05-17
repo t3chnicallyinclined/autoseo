@@ -11,7 +11,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ai_pipeline::AiPipeline;
+use crate::ai_pipeline::{AiPipeline, TranscriptSegment};
 use crate::align::AlignedWord;
 use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionStyle, OverlayStyle};
@@ -29,8 +29,20 @@ use crate::posting;
 use crate::scene;
 use crate::show_config::DigestMode;
 use crate::social_copy::{SocialCopy, SocialCopyGenerator};
+use crate::storage::{JobStatus, Storage};
 use crate::vad;
 use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
+
+/// Update job status in storage if both storage and job_id are provided.
+/// Errors from the status update itself are logged but not propagated,
+/// so a DB hiccup never masks the real pipeline error.
+async fn set_job_status(storage: Option<&Storage>, job_id: Option<&str>, status: JobStatus, error: Option<&str>) {
+    if let (Some(st), Some(jid)) = (storage, job_id) {
+        if let Err(e) = st.update_job_status(jid, status, error).await {
+            tracing::warn!(job_id = jid, status = status.as_str(), error = ?e, "failed to update job status");
+        }
+    }
+}
 
 pub async fn run_clipper_local_once(
     cfg: &Config,
@@ -39,6 +51,26 @@ pub async fn run_clipper_local_once(
     ai: &AiPipeline,
     local_path: &str,
     digest_mode: DigestMode,
+    storage: Option<&Storage>,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let result = run_clipper_inner(cfg, google, gmail, ai, local_path, digest_mode, storage, job_id).await;
+    if let Err(ref e) = result {
+        let msg = format!("{e:#}");
+        set_job_status(storage, job_id, JobStatus::Failed, Some(&msg)).await;
+    }
+    result
+}
+
+async fn run_clipper_inner(
+    cfg: &Config,
+    google: Option<&GoogleAuth>,
+    gmail: &GmailClient,
+    ai: &AiPipeline,
+    local_path: &str,
+    digest_mode: DigestMode,
+    storage: Option<&Storage>,
+    job_id: Option<&str>,
 ) -> Result<()> {
     if digest_mode.sends_email() {
         if google.is_none() {
@@ -146,6 +178,13 @@ pub async fn run_clipper_local_once(
         vad::detect_silences(&cfg.ffmpeg, &audio_path, -30.0, 0.3),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
+
+    // F0 pitch extraction via aubio — non-fatal, returns empty vec if unavailable.
+    let f0 = prosody::f0_curve("aubio", &audio_path).await;
+    if f0.is_empty() {
+        tracing::info!("clipper: F0 features unavailable (aubio not on PATH or failed)");
+    }
+
     pb_features.finish_with_message("scene + vad + prosody complete");
 
     tracing::info!(
@@ -153,6 +192,7 @@ pub async fn run_clipper_local_once(
         shots = shots.len(),
         silences = silences.len(),
         rms_windows = rms.len(),
+        f0_samples = f0.len(),
         "clipper: feature extraction complete"
     );
 
@@ -164,6 +204,9 @@ pub async fn run_clipper_local_once(
         );
     }
 
+    // ── Status: transcribed ──
+    set_job_status(storage, job_id, JobStatus::Transcribed, None).await;
+
     let show_context = ai
         .infer_show_context(&file_name, &transcript.full_text)
         .await
@@ -171,7 +214,7 @@ pub async fn run_clipper_local_once(
 
     let cand_gen = CandidateGenerator::new();
     let mut candidates =
-        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms);
+        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
     tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
 
     if candidates.is_empty() {
@@ -243,6 +286,33 @@ pub async fn run_clipper_local_once(
 
     if ranked.is_empty() {
         anyhow::bail!("LLM ranker returned no clips");
+    }
+
+    // ── Status: ranked ──
+    set_job_status(storage, job_id, JobStatus::Ranked, None).await;
+
+    // Write clip rows to DB now that we have ranked clips.
+    if let (Some(st), Some(jid)) = (storage, job_id) {
+        for (i, clip) in ranked.iter().enumerate() {
+            let clip_id = format!("{jid}_clip_{}", i + 1);
+            let start_ms = (clip.start_secs * 1000.0) as i64;
+            let end_ms = (clip.end_secs * 1000.0) as i64;
+            if let Err(e) = st
+                .insert_clip(
+                    &clip_id,
+                    jid,
+                    start_ms,
+                    end_ms,
+                    Some((i + 1) as i64),
+                    Some(clip.score as f64),
+                    Some(&clip.hook),
+                    Some(&clip.reasoning),
+                )
+                .await
+            {
+                tracing::warn!(clip = i + 1, error = ?e, "failed to write clip to DB");
+            }
+        }
     }
 
     // Optional: VLM re-rank top-N using frames + transcript.
@@ -503,17 +573,98 @@ pub async fn run_clipper_local_once(
             continue;
         }
 
+        // Select the best cover frame for this clip using thumbnail_windows LLM
+        // logic. The cover image is used by Instagram Reels and as a preview
+        // thumbnail in the manifest.
+        let cover_frame_path = {
+            let clip_segments: Vec<TranscriptSegment> = transcript
+                .words
+                .iter()
+                .filter(|w| w.start_secs >= clip.start_secs && w.end_secs <= clip.end_secs + 0.5)
+                .map(|w| TranscriptSegment {
+                    start: w.start_secs,
+                    end: w.end_secs,
+                    text: w.text.clone(),
+                })
+                .collect();
+
+            let cover_path = clips_dir.join(format!("clip_{idx:02}_cover.jpg"));
+            match ai.thumbnail_windows(&clip_segments, 1).await {
+                Ok(moments) if !moments.is_empty() => {
+                    let ts = moments[0].center_seconds;
+                    match media::screenshot_jpeg(
+                        &cfg.ffmpeg,
+                        &input_path,
+                        ts,
+                        &cover_path,
+                        0,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                clip = idx,
+                                timestamp = ts,
+                                path = %cover_path.display(),
+                                "cover frame extracted"
+                            );
+                            Some(cover_path)
+                        }
+                        Err(e) => {
+                            tracing::warn!(clip = idx, error = ?e, "cover frame screenshot failed");
+                            None
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(clip = idx, "thumbnail_windows returned no moments for cover");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(clip = idx, error = ?e, "cover frame selection failed");
+                    None
+                }
+            }
+        };
+
         rendered.push(RenderedClip {
             rank: idx,
             ranked: clip.clone(),
             social: social.clone(),
             variants,
+            cover_frame_path,
             posts: Vec::new(),
         });
     }
 
     if rendered.is_empty() {
         anyhow::bail!("all clip renders failed");
+    }
+
+    // ── Status: rendered ──
+    set_job_status(storage, job_id, JobStatus::Rendered, None).await;
+
+    // Write clip_renders rows to DB.
+    if let (Some(st), Some(jid)) = (storage, job_id) {
+        for r in &rendered {
+            let clip_id = format!("{jid}_clip_{}", r.rank);
+            for v in &r.variants {
+                let path_str = v.path.display().to_string();
+                let dur_ms = r.ranked.end_secs - r.ranked.start_secs;
+                if let Err(e) = st
+                    .insert_clip_render(
+                        &clip_id,
+                        &v.label,
+                        &path_str,
+                        Some(v.bytes as i64),
+                        Some((dur_ms * 1000.0) as i64),
+                    )
+                    .await
+                {
+                    tracing::warn!(clip = r.rank, variant = %v.label, error = ?e, "failed to write clip_render to DB");
+                }
+            }
+        }
     }
 
     // Post each clip to enabled platforms (default: no platforms enabled,
@@ -549,6 +700,38 @@ pub async fn run_clipper_local_once(
             .filter(|p| p.status == PostStatus::Posted)
             .count();
         tracing::info!(total_posted, "clipper: posting complete");
+
+        // ── Status: posted ──
+        set_job_status(storage, job_id, JobStatus::Posted, None).await;
+
+        // Write post rows to DB.
+        if let (Some(st), Some(jid)) = (storage, job_id) {
+            for r in &rendered {
+                let clip_id = format!("{jid}_clip_{}", r.rank);
+                for p in &r.posts {
+                    let status_str = match p.status {
+                        PostStatus::Posted => "posted",
+                        PostStatus::DryRun => "dry_run",
+                        PostStatus::Skipped => "skipped",
+                        PostStatus::Failed => "failed",
+                    };
+                    if let Err(e) = st
+                        .insert_post(
+                            &clip_id,
+                            &p.platform,
+                            status_str,
+                            p.external_id.as_deref(),
+                            p.external_url.as_deref(),
+                            p.posted_at_unix,
+                            p.error.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(clip = r.rank, platform = %p.platform, error = ?e, "failed to write post to DB");
+                    }
+                }
+            }
+        }
     }
 
     let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
@@ -596,6 +779,9 @@ pub async fn run_clipper_local_once(
         tracing::info!(sent_message_id, "clipper: digest email sent");
     }
 
+    // ── Status: done ──
+    set_job_status(storage, job_id, JobStatus::Done, None).await;
+
     Ok(())
 }
 
@@ -604,6 +790,7 @@ struct RenderedClip {
     ranked: RankedClip,
     social: Option<SocialCopy>,
     variants: Vec<RenderedVariant>,
+    cover_frame_path: Option<PathBuf>,
     posts: Vec<PostResult>,
 }
 
@@ -713,6 +900,10 @@ fn build_digest_body(
                 sz = v.bytes as f64 / (1024.0 * 1024.0),
                 p = abs.display(),
             ));
+        }
+        if let Some(cover) = &r.cover_frame_path {
+            let abs = cover.canonicalize().unwrap_or_else(|_| cover.clone());
+            out.push_str(&format!("  cover:   {}\n", abs.display()));
         }
         if let Some(social) = &r.social {
             if !social.overlay_hook.is_empty() {
@@ -881,6 +1072,20 @@ fn build_manifest_json(
                 .filter_map(|p| serde_json::to_value(p).ok())
                 .collect();
 
+            let cover_frame = r
+                .cover_frame_path
+                .as_ref()
+                .map(|p| {
+                    let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    serde_json::json!({
+                        "filename": p.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(""),
+                        "abs_path": abs.display().to_string(),
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null);
+
             serde_json::json!({
                 "rank": r.rank,
                 "score": r.ranked.score,
@@ -895,6 +1100,7 @@ fn build_manifest_json(
                 "hook": r.ranked.hook,
                 "reasoning": r.ranked.reasoning,
                 "variants": variants,
+                "cover_frame": cover_frame,
                 "social": social,
                 "posts": posts,
             })
@@ -1061,6 +1267,7 @@ mod tests {
                 width: 1080,
                 height: 1920,
             }],
+            cover_frame_path: None,
             posts: Vec::new(),
         }
     }
@@ -1085,5 +1292,43 @@ mod tests {
         assert!(body.contains("clip_01_9x16.mp4"), "expected variant filename, got:\n{body}");
         assert!(body.contains("[9x16]"));
         assert!(body.contains("Clips directory:"));
+    }
+
+    #[test]
+    fn digest_body_includes_cover_frame_when_present() {
+        let mut clip = dummy_clip(1, 85, 30.0, 90.0, "hook");
+        clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip]);
+        assert!(body.contains("cover:"), "expected cover line in digest, got:\n{body}");
+        assert!(body.contains("clip_01_cover.jpg"));
+    }
+
+    #[test]
+    fn digest_body_omits_cover_when_none() {
+        let clip = dummy_clip(1, 85, 30.0, 90.0, "hook");
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip]);
+        assert!(!body.contains("cover:"), "unexpected cover line in digest:\n{body}");
+    }
+
+    #[test]
+    fn manifest_includes_cover_frame_when_present() {
+        let mut clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
+        clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let clip_val = &manifest["clips"][0];
+        assert!(!clip_val["cover_frame"].is_null(), "cover_frame should be present");
+        assert_eq!(clip_val["cover_frame"]["filename"], "clip_01_cover.jpg");
+    }
+
+    #[test]
+    fn manifest_cover_frame_null_when_absent() {
+        let clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let clip_val = &manifest["clips"][0];
+        assert!(clip_val["cover_frame"].is_null(), "cover_frame should be null when absent");
     }
 }

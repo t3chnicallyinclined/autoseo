@@ -128,9 +128,9 @@ pub struct Config {
     #[arg(long, env = "CLIP_RENDER_FORMATS", default_value = "9x16,1x1,16x9")]
     pub clip_render_formats: String,
 
-    /// Which platforms to post to. Comma-separated, any of: `youtube`, `bluesky`.
-    /// Default empty (no posting). Posting also requires `POST_DRY_RUN=false`
-    /// to actually send — both knobs are opt-in for safety.
+    /// Which platforms to post to. Comma-separated, any of: `youtube`, `bluesky`,
+    /// `ayrshare`. Default empty (no posting). Posting also requires
+    /// `POST_DRY_RUN=false` to actually send — both knobs are opt-in for safety.
     #[arg(long, env = "POST_ENABLED_PLATFORMS", default_value = "")]
     pub post_enabled_platforms: String,
 
@@ -171,6 +171,17 @@ pub struct Config {
         default_value = "https://video.bsky.app"
     )]
     pub bluesky_video_service_url: String,
+
+    /// Ayrshare API key. Required when `POST_ENABLED_PLATFORMS` includes
+    /// `ayrshare`. Obtain from https://app.ayrshare.com.
+    #[arg(long, env = "AYRSHARE_API_KEY")]
+    pub ayrshare_api_key: Option<String>,
+
+    /// Comma-separated list of platforms Ayrshare should post to.
+    /// Typical values: `tiktok`, `instagram`. These are Ayrshare platform
+    /// names, not autoseo platform names.
+    #[arg(long, env = "AYRSHARE_PLATFORMS", default_value = "tiktok,instagram")]
+    pub ayrshare_platforms: String,
 
     /// Hugging Face API key (used for HF Inference Providers — embeddings + VLM re-rank).
     /// When set, the clipper routes embeddings through HF instead of the local

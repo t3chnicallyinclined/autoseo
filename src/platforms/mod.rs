@@ -8,6 +8,7 @@
 //! Instagram, Threads, LinkedIn, X land in subsequent phases (gated reviews
 //! and/or paid tiers).
 
+pub mod ayrshare;
 pub mod bluesky;
 pub mod youtube;
 
@@ -95,6 +96,7 @@ impl PostResult {
 pub enum Platform {
     YouTube(youtube::YouTubePoster),
     Bluesky(bluesky::BlueskyPoster),
+    Ayrshare(ayrshare::AyrsharePoster),
 }
 
 impl Platform {
@@ -102,6 +104,7 @@ impl Platform {
         match self {
             Platform::YouTube(_) => "youtube",
             Platform::Bluesky(_) => "bluesky",
+            Platform::Ayrshare(_) => "ayrshare",
         }
     }
 
@@ -130,6 +133,12 @@ impl Platform {
                 cfg.bluesky_app_password.clone(),
             )));
         }
+        if enabled.contains(&"ayrshare") {
+            out.push(Platform::Ayrshare(ayrshare::AyrsharePoster::new(
+                cfg.ayrshare_api_key.clone(),
+                cfg.ayrshare_platforms.clone(),
+            )));
+        }
         out
     }
 
@@ -149,6 +158,7 @@ impl Platform {
         match self {
             Platform::YouTube(p) => p.post(video_path, &social.youtube_shorts).await,
             Platform::Bluesky(p) => p.post(video_path, &social.bluesky).await,
+            Platform::Ayrshare(p) => p.post(video_path, social).await,
         }
     }
 }
@@ -166,6 +176,11 @@ fn parse_enabled_platforms(spec: &str) -> Vec<&'static str> {
             "bluesky" | "bsky" => {
                 if !out.contains(&"bluesky") {
                     out.push("bluesky");
+                }
+            }
+            "ayrshare" => {
+                if !out.contains(&"ayrshare") {
+                    out.push("ayrshare");
                 }
             }
             "" => {}
@@ -200,6 +215,11 @@ mod tests {
         assert_eq!(
             parse_enabled_platforms("youtube,YT,shorts"),
             vec!["youtube"]
+        );
+        // Ayrshare.
+        assert_eq!(
+            parse_enabled_platforms("youtube,ayrshare"),
+            vec!["youtube", "ayrshare"]
         );
         // Unknown ignored.
         assert_eq!(

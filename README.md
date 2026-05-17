@@ -1,5 +1,7 @@
 # autoseo (MVP)
 
+[![CI](https://github.com/t3chnicallyinclined/autoseo/actions/workflows/ci.yml/badge.svg)](https://github.com/t3chnicallyinclined/autoseo/actions/workflows/ci.yml)
+
 Polls Gmail for Google Drive “Item shared with you” emails, downloads the shared media from Drive (video or audio), transcribes via an OpenAI-compatible API, asks an OpenAI-compatible LLM for YouTube SEO packages, optionally generates thumbnail screenshots for videos, then sends the results back via Gmail API.
 
 ## What you need installed

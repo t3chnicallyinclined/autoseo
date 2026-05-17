@@ -180,6 +180,9 @@ fn serialize_batch(batch: &[CandidateWindow], start_index_in_episode: usize) -> 
             prosody: ProsodyPayload {
                 rms_peak_db: c.rms_peak_db,
                 rms_mean_db: c.rms_mean_db,
+                f0_mean_hz: c.f0_mean_hz,
+                f0_variance_hz2: c.f0_variance_hz2,
+                f0_peak_hz: c.f0_peak_hz,
                 speaking_rate_wps: c.speaking_rate_wps,
             },
             novelty: c.novelty_score,
@@ -216,6 +219,9 @@ struct LinguisticPayload {
 struct ProsodyPayload {
     rms_peak_db: Option<f64>,
     rms_mean_db: Option<f64>,
+    f0_mean_hz: Option<f64>,
+    f0_variance_hz2: Option<f64>,
+    f0_peak_hz: Option<f64>,
     speaking_rate_wps: Option<f64>,
 }
 
@@ -253,6 +259,9 @@ mod tests {
             linguistic: LinguisticFeatures::default(),
             rms_peak_db: Some(-15.0),
             rms_mean_db: Some(-22.0),
+            f0_mean_hz: Some(185.0),
+            f0_variance_hz2: Some(420.0),
+            f0_peak_hz: Some(310.0),
             speaking_rate_wps: Some(2.5),
             novelty_score: Some(0.4),
         }

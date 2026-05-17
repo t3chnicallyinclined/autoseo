@@ -76,7 +76,11 @@ pub struct Config {
     /// Cache directory for fastembed model files (MiniLM-L6-v2, ~90MB).
     /// First run downloads from Hugging Face; subsequent runs reuse the cached files.
     /// Set this under WORK_DIR so the download persists across container restarts.
-    #[arg(long, env = "EMBED_MODEL_DIR", default_value = "./work/models/fastembed")]
+    #[arg(
+        long,
+        env = "EMBED_MODEL_DIR",
+        default_value = "./work/models/fastembed"
+    )]
     pub embed_model_dir: String,
 
     /// LLM clip-ranker system prompt path.
@@ -192,7 +196,11 @@ pub struct Config {
     /// HF Inference Providers router URL (root, no trailing /v1).
     /// - VLM (chat) endpoint:    `{HF_ROUTER_URL}/v1/chat/completions`
     /// - Embedding endpoint:     `{HF_ROUTER_URL}/{HF_EMBED_PROVIDER}/models/{EMBED_MODEL}/pipeline/feature-extraction`
-    #[arg(long, env = "HF_ROUTER_URL", default_value = "https://router.huggingface.co")]
+    #[arg(
+        long,
+        env = "HF_ROUTER_URL",
+        default_value = "https://router.huggingface.co"
+    )]
     pub hf_router_url: String,
 
     /// Which HF Inference Provider to route embedding requests to. Most English
@@ -516,4 +524,18 @@ pub struct Config {
     /// How often to refresh Google Trends, in seconds. Default 86400 (daily).
     #[arg(long, env = "GOOGLE_TRENDS_REFRESH_SECS", default_value_t = 86400)]
     pub google_trends_refresh_secs: u64,
+    /// Enable veto-via-Gmail-reply polling. When true, the system polls for
+    /// replies to digest emails containing `veto: clip_XX` directives and
+    /// removes/unlists the matching posts on each platform.
+    #[arg(long, env = "VETO_ENABLED", default_value_t = false)]
+    pub veto_enabled: bool,
+
+    /// Gmail search query for veto reply messages. Defaults to replies to
+    /// autoseo CLIPPER digest emails.
+    #[arg(
+        long,
+        env = "VETO_GMAIL_QUERY",
+        default_value = "subject:\"CLIPPER\" label:inbox newer_than:7d"
+    )]
+    pub veto_gmail_query: String,
 }

@@ -160,6 +160,17 @@ impl Storage {
         })
     }
 
+    /// Open an in-memory SQLite database (for tests).
+    #[cfg(test)]
+    pub fn open_in_memory_sync() -> Self {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.pragma_update(None, "foreign_keys", "ON").ok();
+        migrate(&conn).expect("migrate in-memory db");
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
     /// Compatibility: import a flat newline-delimited dedupe file as completed jobs.
     /// Returns the count of newly-imported message IDs (existing rows are left alone).
     pub async fn import_legacy_dedupe(&self, path: impl AsRef<Path>) -> anyhow::Result<usize> {

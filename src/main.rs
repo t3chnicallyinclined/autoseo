@@ -1,4 +1,5 @@
 mod ai_pipeline;
+mod api;
 mod align;
 mod candidates;
 mod captions;
@@ -55,7 +56,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::parse();
 
-    let mode = show_config::Mode::parse(&cfg.mode)?;
+    let mode = if cfg.serve_api {
+        show_config::Mode::Server
+    } else {
+        show_config::Mode::parse(&cfg.mode)?
+    };
     let digest_mode = show_config::DigestMode::parse(&cfg.digest_mode)?;
 
     // Print a minimal startup banner to stdout so `docker logs` is never empty.
@@ -63,6 +68,16 @@ async fn main() -> anyhow::Result<()> {
         "autoseo starting (mode={:?}, digest_mode={:?}, poll_interval_secs={}, work_dir={}, clipper_db={})",
         mode, digest_mode, cfg.poll_interval_secs, cfg.work_dir, cfg.clipper_db
     );
+
+    // MODE=server: start the Axum API server and return.
+    if matches!(mode, show_config::Mode::Server) {
+        let storage = Storage::open(&cfg.clipper_db).await?;
+        let state = api::AppState {
+            storage,
+            work_dir: cfg.work_dir.clone(),
+        };
+        return api::serve(state, cfg.api_port, &cfg.api_cors_origins).await;
+    }
 
     // Build Google auth only if creds are all present; downstream code validates
     // its own requirement and bails with a clear message if missing.

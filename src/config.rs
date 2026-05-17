@@ -441,4 +441,18 @@ pub struct Config {
     /// This bypasses Gmail/Drive ingest and the dedupe list.
     #[arg(long, env = "LOCAL_VIDEO_PATH")]
     pub local_video_path: Option<String>,
+
+    /// Port for the API server (MODE=server).
+    #[arg(long, env = "API_PORT", default_value_t = 8080)]
+    pub api_port: u16,
+
+    /// Comma-separated CORS allowed origins for the API server.
+    /// Default allows the Vite dev server.
+    #[arg(long, env = "API_CORS_ORIGINS", default_value = "http://localhost:5173")]
+    pub api_cors_origins: String,
+
+    /// Start the API server instead of the pipeline. Can also be set via
+    /// `MODE=server` or `--serve-api`.
+    #[arg(long, env = "SERVE_API", default_value_t = false)]
+    pub serve_api: bool,
 }

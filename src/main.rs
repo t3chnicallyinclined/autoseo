@@ -4,6 +4,7 @@ mod candidates;
 mod captions;
 mod clipper;
 mod config;
+mod context;
 mod drive;
 mod embed;
 mod gmail;

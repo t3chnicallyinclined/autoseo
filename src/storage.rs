@@ -1,5 +1,5 @@
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -32,6 +32,33 @@ impl JobStatus {
             JobStatus::Failed => "failed",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(JobStatus::Pending),
+            "transcribed" => Some(JobStatus::Transcribed),
+            "ranked" => Some(JobStatus::Ranked),
+            "rendered" => Some(JobStatus::Rendered),
+            "posted" => Some(JobStatus::Posted),
+            "done" => Some(JobStatus::Done),
+            "failed" => Some(JobStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A row from the `jobs` table.
+#[derive(Debug, Clone)]
+pub struct JobRow {
+    pub id: String,
+    pub show_slug: Option<String>,
+    pub media_name: Option<String>,
+    pub drive_file_id: Option<String>,
+    pub status: JobStatus,
+    pub retry_count: i64,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 const SCHEMA_V1: &str = r#"
@@ -221,7 +248,265 @@ impl Storage {
 
         Ok(exists)
     }
+
+    /// Create a new job row with status=pending. If the job already exists, this is a no-op.
+    pub async fn create_job(
+        &self,
+        job_id: &str,
+        show_slug: Option<&str>,
+        media_name: Option<&str>,
+        drive_file_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let show_slug = show_slug.map(str::to_string);
+        let media_name = media_name.map(str::to_string);
+        let drive_file_id = drive_file_id.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs \
+                 (id, show_slug, media_name, drive_file_id, status, retry_count, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)",
+                rusqlite::params![job_id, show_slug, media_name, drive_file_id, now],
+            )
+            .context("create_job insert")?;
+            Ok(())
+        })
+        .await
+        .context("join create_job")??;
+        Ok(())
+    }
+
+    /// Transition a job to a new status, updating `updated_at`. On failure status,
+    /// also stores the error message.
+    pub async fn update_job_status(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let error = error.map(str::to_string);
+        let status_str = status.as_str().to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            conn.execute(
+                "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+                rusqlite::params![status_str, error, now, job_id],
+            )
+            .context("update_job_status")?;
+            Ok(())
+        })
+        .await
+        .context("join update_job_status")??;
+        Ok(())
+    }
+
+    /// Get a job row by ID.
+    pub async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobRow>> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let row = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<JobRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, show_slug, media_name, drive_file_id, status, \
+                     retry_count, error, created_at, updated_at \
+                     FROM jobs WHERE id = ?1",
+                )
+                .context("prepare get_job")?;
+            let row = stmt
+                .query_row([&job_id], |r| {
+                    Ok(JobRow {
+                        id: r.get(0)?,
+                        show_slug: r.get(1)?,
+                        media_name: r.get(2)?,
+                        drive_file_id: r.get(3)?,
+                        status: JobStatus::from_str(
+                            &r.get::<_, String>(4)?,
+                        )
+                        .unwrap_or(JobStatus::Pending),
+                        retry_count: r.get(5)?,
+                        error: r.get(6)?,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
+                    })
+                })
+                .optional()
+                .context("query get_job")?;
+            Ok(row)
+        })
+        .await
+        .context("join get_job")??;
+        Ok(row)
+    }
+
+    /// List all jobs with status='failed'.
+    pub async fn get_failed_jobs(&self) -> anyhow::Result<Vec<JobRow>> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<JobRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, show_slug, media_name, drive_file_id, status, \
+                     retry_count, error, created_at, updated_at \
+                     FROM jobs WHERE status = 'failed' ORDER BY updated_at DESC",
+                )
+                .context("prepare get_failed_jobs")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(JobRow {
+                        id: r.get(0)?,
+                        show_slug: r.get(1)?,
+                        media_name: r.get(2)?,
+                        drive_file_id: r.get(3)?,
+                        status: JobStatus::Failed,
+                        retry_count: r.get(5)?,
+                        error: r.get(6)?,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
+                    })
+                })
+                .context("query get_failed_jobs")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect get_failed_jobs")?;
+            Ok(rows)
+        })
+        .await
+        .context("join get_failed_jobs")??;
+        Ok(rows)
+    }
+
+    /// Reset a failed job back to pending for retry. Increments `retry_count`,
+    /// clears the error, and sets status to `pending`.
+    pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            let changed = conn
+                .execute(
+                    "UPDATE jobs SET status = 'pending', error = NULL, \
+                     retry_count = retry_count + 1, updated_at = ?1 \
+                     WHERE id = ?2 AND status = 'failed'",
+                    rusqlite::params![now, job_id],
+                )
+                .context("retry_job update")?;
+            if changed == 0 {
+                anyhow::bail!("job {job_id} is not in 'failed' status (or does not exist)");
+            }
+            Ok(())
+        })
+        .await
+        .context("join retry_job")??;
+        Ok(())
+    }
+
+    /// Insert a clip row. Idempotent (INSERT OR REPLACE).
+    pub async fn insert_clip(
+        &self,
+        clip_id: &str,
+        job_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        rank: Option<i64>,
+        score: Option<f64>,
+        hook: Option<&str>,
+        reasoning_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let job_id = job_id.to_string();
+        let hook = hook.map(str::to_string);
+        let reasoning_json = reasoning_json.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO clips \
+                 (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![clip_id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json],
+            )
+            .context("insert_clip")?;
+            Ok(())
+        })
+        .await
+        .context("join insert_clip")??;
+        Ok(())
+    }
+
+    /// Insert a clip render variant row. Idempotent (INSERT OR REPLACE).
+    pub async fn insert_clip_render(
+        &self,
+        clip_id: &str,
+        variant: &str,
+        path: &str,
+        bytes: Option<i64>,
+        duration_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let variant = variant.to_string();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO clip_renders \
+                 (clip_id, variant, path, bytes, duration_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![clip_id, variant, path, bytes, duration_ms],
+            )
+            .context("insert_clip_render")?;
+            Ok(())
+        })
+        .await
+        .context("join insert_clip_render")??;
+        Ok(())
+    }
+
+    /// Insert a post row. Idempotent (INSERT OR REPLACE).
+    pub async fn insert_post(
+        &self,
+        clip_id: &str,
+        platform: &str,
+        status: &str,
+        external_id: Option<&str>,
+        external_url: Option<&str>,
+        posted_at: Option<i64>,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let platform = platform.to_string();
+        let status = status.to_string();
+        let external_id = external_id.map(str::to_string);
+        let external_url = external_url.map(str::to_string);
+        let error = error.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO posts \
+                 (clip_id, platform, status, external_id, external_url, posted_at, error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![clip_id, platform, status, external_id, external_url, posted_at, error],
+            )
+            .context("insert_post")?;
+            Ok(())
+        })
+        .await
+        .context("join insert_post")??;
+        Ok(())
+    }
 }
+
+const SCHEMA_V2: &str = r#"
+ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+"#;
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: u32 = conn
@@ -231,6 +516,14 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA_V1).context("apply schema v1")?;
         conn.pragma_update(None, "user_version", 1)
             .context("set user_version=1")?;
+    }
+    if version < 2 {
+        // V1 already includes `error` in the CREATE TABLE; V2 adds `retry_count`.
+        // If version is 0 we just created the table fresh with V1 which doesn't
+        // have retry_count yet, so always run V2 when version < 2.
+        conn.execute_batch(SCHEMA_V2).context("apply schema v2")?;
+        conn.pragma_update(None, "user_version", 2)
+            .context("set user_version=2")?;
     }
     Ok(())
 }
@@ -306,6 +599,149 @@ mod tests {
             .import_legacy_dedupe(dir.path().join("missing.txt"))
             .await?;
         assert_eq!(imported, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_status_transitions() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        // Create a job.
+        storage.create_job("job1", Some("show"), Some("ep.mp4"), None).await?;
+        let job = storage.get_job("job1").await?.expect("job should exist");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.retry_count, 0);
+        assert!(job.error.is_none());
+
+        // Walk through the pipeline stages.
+        storage.update_job_status("job1", JobStatus::Transcribed, None).await?;
+        let job = storage.get_job("job1").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Transcribed);
+
+        storage.update_job_status("job1", JobStatus::Ranked, None).await?;
+        let job = storage.get_job("job1").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Ranked);
+
+        storage.update_job_status("job1", JobStatus::Rendered, None).await?;
+        storage.update_job_status("job1", JobStatus::Posted, None).await?;
+        storage.update_job_status("job1", JobStatus::Done, None).await?;
+        let job = storage.get_job("job1").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Done);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_failure_and_retry() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        storage.create_job("job2", None, None, None).await?;
+        storage.update_job_status("job2", JobStatus::Transcribed, None).await?;
+
+        // Fail with an error message.
+        storage.update_job_status("job2", JobStatus::Failed, Some("LLM timeout")).await?;
+        let job = storage.get_job("job2").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.error.as_deref(), Some("LLM timeout"));
+
+        // Shows up in failed jobs list.
+        let failed = storage.get_failed_jobs().await?;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "job2");
+
+        // Retry resets to pending and increments retry_count.
+        storage.retry_job("job2").await?;
+        let job = storage.get_job("job2").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.retry_count, 1);
+        assert!(job.error.is_none());
+
+        // Failed list is now empty.
+        let failed = storage.get_failed_jobs().await?;
+        assert!(failed.is_empty());
+
+        // Retry on non-failed job should error.
+        let err = storage.retry_job("job2").await;
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_job_is_idempotent() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        storage.create_job("j1", None, Some("a.mp4"), None).await?;
+        storage.update_job_status("j1", JobStatus::Transcribed, None).await?;
+
+        // Second create should be a no-op (INSERT OR IGNORE).
+        storage.create_job("j1", None, Some("b.mp4"), None).await?;
+        let job = storage.get_job("j1").await?.unwrap();
+        assert_eq!(job.status, JobStatus::Transcribed, "status should not have been reset");
+        assert_eq!(job.media_name.as_deref(), Some("a.mp4"), "media_name should not change");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_clip_and_render_and_post() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        storage.create_job("j1", None, None, None).await?;
+
+        // Insert a clip.
+        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}")).await?;
+
+        // Insert a render variant.
+        storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
+
+        // Insert a post.
+        storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), Some("https://yt.be/abc"), Some(1700000000), None).await?;
+
+        // Idempotent re-insert should not error.
+        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}")).await?;
+        storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
+        storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), None, None, None).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_v2_on_existing_v1_db() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("test.db");
+
+        // Simulate a V1-only database.
+        {
+            let conn = Connection::open(&db_path)?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.execute_batch(SCHEMA_V1)?;
+            conn.pragma_update(None, "user_version", 1)?;
+            conn.execute(
+                "INSERT INTO jobs (id, status, created_at, updated_at) VALUES ('old_job', 'done', 0, 0)",
+                [],
+            )?;
+        }
+
+        // Open with new code — should apply V2 migration.
+        let storage = Storage::open(&db_path).await?;
+        let job = storage.get_job("old_job").await?.expect("old_job should exist");
+        assert_eq!(job.status, JobStatus::Done);
+        assert_eq!(job.retry_count, 0, "retry_count should default to 0");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_job_returns_none() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+        let job = storage.get_job("nope").await?;
+        assert!(job.is_none());
         Ok(())
     }
 }

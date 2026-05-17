@@ -211,6 +211,9 @@ mod tests {
             linguistic: LinguisticFeatures::default(),
             rms_peak_db: Some(-12.0),
             rms_mean_db: Some(-22.0),
+            f0_mean_hz: None,
+            f0_variance_hz2: None,
+            f0_peak_hz: None,
             speaking_rate_wps: Some(3.0),
             novelty_score: Some(0.6),
         }

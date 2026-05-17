@@ -1,9 +1,8 @@
-//! Per-window prosody features: RMS energy curve via ffmpeg's `astats` filter.
+//! Per-window prosody features: RMS energy curve via ffmpeg's `astats` filter
+//! and fundamental frequency (F0) extraction via the `aubio` CLI.
 //!
-//! M1 implementation: RMS only, no F0. F0 detection via `aubio` is deferred —
-//! the LLM ranker with linguistic markers + RMS + word-density should be
-//! sufficient for M1 candidate scoring. Pitch features can be added later
-//! behind the same module surface if quality demands it.
+//! F0 extraction is non-fatal: if the `aubio` binary is not on PATH, the F0
+//! features are silently skipped and callers receive an empty vector.
 //!
 //! Speaking rate is derived directly from word timestamps in `candidates.rs`,
 //! not here.
@@ -65,6 +64,123 @@ pub fn peak_in_range(curve: &[RmsWindow], start_secs: f64, end_secs: f64) -> Opt
                 .partial_cmp(&b.rms_db)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+}
+
+// ---------------------------------------------------------------------------
+// F0 (fundamental frequency) via aubio CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct F0Sample {
+    /// Time in seconds.
+    pub time_secs: f64,
+    /// Detected pitch in Hz. 0.0 means unvoiced / no pitch detected.
+    pub pitch_hz: f64,
+}
+
+/// Aggregate F0 statistics over a time range.
+#[derive(Debug, Clone, PartialEq)]
+pub struct F0Stats {
+    pub mean_hz: f64,
+    pub variance_hz2: f64,
+    pub peak_hz: f64,
+}
+
+/// Extract per-frame F0 (pitch) from an audio file using the `aubio pitch` CLI.
+///
+/// Returns an empty `Vec` (not an error) if `aubio` is not on PATH, so callers
+/// can treat F0 as a best-effort signal.
+pub async fn f0_curve(
+    aubio_bin: &str,
+    media_path: &Path,
+) -> Vec<F0Sample> {
+    let output = Command::new(aubio_bin)
+        .arg("pitch")
+        .arg("-i")
+        .arg(media_path)
+        .args(["-p", "yin"])
+        .args(["-B", "2048"])
+        .args(["-H", "512"])
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::warn!(
+                status = %o.status,
+                "aubio pitch exited with error; skipping F0 features"
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!("aubio not found on PATH; skipping F0 features");
+            } else {
+                tracing::warn!(error = %e, "aubio pitch failed; skipping F0 features");
+            }
+            return Vec::new();
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_aubio_pitch(&stdout)
+}
+
+/// Compute F0 statistics over the voiced samples in `[start_secs, end_secs)`.
+/// Unvoiced frames (pitch_hz == 0) are excluded. Returns `None` if no voiced
+/// frames fall in the range.
+pub fn f0_stats_in_range(
+    curve: &[F0Sample],
+    start_secs: f64,
+    end_secs: f64,
+) -> Option<F0Stats> {
+    let voiced: Vec<f64> = curve
+        .iter()
+        .filter(|s| s.time_secs >= start_secs && s.time_secs < end_secs && s.pitch_hz > 0.0)
+        .map(|s| s.pitch_hz)
+        .collect();
+
+    if voiced.is_empty() {
+        return None;
+    }
+
+    let n = voiced.len() as f64;
+    let mean = voiced.iter().sum::<f64>() / n;
+    let variance = voiced.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+    let peak = voiced
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    Some(F0Stats {
+        mean_hz: mean,
+        variance_hz2: variance,
+        peak_hz: peak,
+    })
+}
+
+fn parse_aubio_pitch(stdout: &str) -> Vec<F0Sample> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // aubio pitch outputs: <time_secs>\t<pitch_hz>
+        let mut parts = line.split_whitespace();
+        let time = parts.next().and_then(|s| s.parse::<f64>().ok());
+        let pitch = parts.next().and_then(|s| s.parse::<f64>().ok());
+        if let (Some(t), Some(p)) = (time, pitch) {
+            if t.is_finite() && p.is_finite() {
+                out.push(F0Sample {
+                    time_secs: t,
+                    pitch_hz: p.max(0.0),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Mean RMS (in dBFS) over the windows that overlap `[start_secs, end_secs)`.
@@ -234,6 +350,61 @@ lavfi.astats.2.RMS_level=-21.0
 
         assert!(peak_in_range(&curve, 100.0, 200.0).is_none());
         assert!(mean_in_range(&curve, 100.0, 200.0).is_none());
+    }
+
+    #[test]
+    fn parses_aubio_pitch_output() {
+        let stdout = "\
+0.000000 220.500000
+0.032000 221.300000
+0.064000 0.000000
+0.096000 440.100000
+";
+        let curve = parse_aubio_pitch(stdout);
+        assert_eq!(curve.len(), 4);
+        assert!((curve[0].time_secs - 0.0).abs() < 1e-6);
+        assert!((curve[0].pitch_hz - 220.5).abs() < 1e-3);
+        assert!((curve[2].pitch_hz - 0.0).abs() < 1e-6, "unvoiced frame");
+        assert!((curve[3].pitch_hz - 440.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn f0_stats_computes_mean_variance_peak() {
+        let curve = vec![
+            F0Sample { time_secs: 0.0, pitch_hz: 100.0 },
+            F0Sample { time_secs: 0.5, pitch_hz: 200.0 },
+            F0Sample { time_secs: 1.0, pitch_hz: 0.0 },   // unvoiced, excluded
+            F0Sample { time_secs: 1.5, pitch_hz: 300.0 },
+            F0Sample { time_secs: 5.0, pitch_hz: 999.0 },  // outside range
+        ];
+        let stats = f0_stats_in_range(&curve, 0.0, 2.0).unwrap();
+        // voiced in [0,2): 100, 200, 300 => mean=200, var=6666.67, peak=300
+        assert!((stats.mean_hz - 200.0).abs() < 1e-6);
+        assert!((stats.variance_hz2 - 6666.666666).abs() < 1.0);
+        assert!((stats.peak_hz - 300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f0_stats_none_when_no_voiced_frames() {
+        let curve = vec![
+            F0Sample { time_secs: 0.5, pitch_hz: 0.0 },
+        ];
+        assert!(f0_stats_in_range(&curve, 0.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn f0_stats_none_when_out_of_range() {
+        let curve = vec![
+            F0Sample { time_secs: 5.0, pitch_hz: 440.0 },
+        ];
+        assert!(f0_stats_in_range(&curve, 0.0, 2.0).is_none());
+    }
+
+    #[tokio::test]
+    async fn f0_curve_returns_empty_when_aubio_missing() {
+        // Use a nonexistent binary name to verify graceful fallback.
+        let result = f0_curve("__nonexistent_aubio_binary__", Path::new("/dev/null")).await;
+        assert!(result.is_empty(), "should return empty vec when aubio not found");
     }
 
     #[tokio::test]

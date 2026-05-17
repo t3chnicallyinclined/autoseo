@@ -161,7 +161,7 @@ pub async fn duration_secs(ffprobe: &str, media_path: &std::path::Path) -> anyho
 
 pub async fn wav_duration_secs(path: &std::path::Path) -> anyhow::Result<f64> {
     let path = path.to_owned();
-    Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<f64> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<f64> {
         let reader = hound::WavReader::open(&path)
             .with_context(|| format!("open wav {}", path.display()))?;
         let spec = reader.spec();
@@ -170,7 +170,7 @@ pub async fn wav_duration_secs(path: &std::path::Path) -> anyhow::Result<f64> {
         Ok(frames / sr)
     })
     .await
-    .context("join wav_duration_secs")??)
+    .context("join wav_duration_secs")?
 }
 
 pub async fn segment_wav(
@@ -202,8 +202,7 @@ pub async fn segment_wav(
         }
     }
 
-    Ok(
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<std::path::PathBuf>> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<std::path::PathBuf>> {
             let mut reader = hound::WavReader::open(&wav_path)
                 .with_context(|| format!("open wav {}", wav_path.display()))?;
             let spec = reader.spec();
@@ -319,10 +318,9 @@ pub async fn segment_wav(
             });
             out_paths.sort();
             Ok(out_paths)
-        })
-        .await
-        .context("join segment_wav")??,
-    )
+    })
+    .await
+    .context("join segment_wav")?
 }
 
 #[derive(Debug, Deserialize)]

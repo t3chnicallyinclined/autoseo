@@ -341,7 +341,7 @@ fn build_description(copy: &YouTubeShortsCopy) -> String {
     let mut out = copy.description.trim().to_string();
     if !out.to_lowercase().contains("#shorts") {
         if !out.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
         }
         out.push_str("#Shorts");
     }

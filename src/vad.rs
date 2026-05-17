@@ -90,7 +90,7 @@ pub fn invert_to_speech(
     }
 
     // Sort & coalesce overlapping silences defensively.
-    let mut sorted: Vec<SilenceWindow> = silences.iter().cloned().collect();
+    let mut sorted: Vec<SilenceWindow> = silences.to_vec();
     sorted.sort_by(|a, b| {
         a.start_secs
             .partial_cmp(&b.start_secs)
@@ -172,17 +172,15 @@ fn parse_silencedetect(stderr: &str) -> Vec<SilenceWindow> {
             }
             continue;
         }
-        if let Some(c) = end_re.captures(line) {
-            if let Some(e) = c.get(1).and_then(|m| m.as_str().parse::<f64>().ok()) {
-                if let Some(s) = pending_start.take() {
-                    if e > s {
-                        out.push(SilenceWindow {
-                            start_secs: s,
-                            end_secs: e,
-                        });
-                    }
-                }
-            }
+        if let Some(c) = end_re.captures(line)
+            && let Some(e) = c.get(1).and_then(|m| m.as_str().parse::<f64>().ok())
+            && let Some(s) = pending_start.take()
+            && e > s
+        {
+            out.push(SilenceWindow {
+                start_secs: s,
+                end_secs: e,
+            });
         }
     }
     out

@@ -273,7 +273,7 @@ impl OpenAiClient {
             .and_then(|c| c.message.content)
             .context("missing chat content")?;
 
-        Ok(serde_json::from_str(&content).context("chat content was not JSON")?)
+        serde_json::from_str(&content).context("chat content was not JSON")
     }
 
     pub async fn chat_text(&self, model: &str, system: &str, user: &str) -> anyhow::Result<String> {
@@ -381,7 +381,7 @@ impl OpenAiClient {
         let text = parsed
             .output_text()
             .context("missing responses output_text")?;
-        Ok(serde_json::from_str(&text).context("responses content was not JSON")?)
+        serde_json::from_str(&text).context("responses content was not JSON")
     }
 
     async fn responses_text(

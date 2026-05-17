@@ -21,13 +21,13 @@ pub fn extract_drive_file_ids(text: &str) -> Vec<String> {
     let re_q = Regex::new(r#"(?:\?|&)q=([^&]+)"#).expect("valid regex");
     for m in re_google_url.find_iter(&normalized) {
         let url = m.as_str();
-        if let Some(cap) = re_q.captures(url) {
-            if let Some(q) = cap.get(1) {
-                let decoded = percent_decode_str(q.as_str())
-                    .decode_utf8_lossy()
-                    .to_string();
-                candidates.push(decoded);
-            }
+        if let Some(cap) = re_q.captures(url)
+            && let Some(q) = cap.get(1)
+        {
+            let decoded = percent_decode_str(q.as_str())
+                .decode_utf8_lossy()
+                .to_string();
+            candidates.push(decoded);
         }
     }
 

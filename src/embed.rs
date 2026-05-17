@@ -13,7 +13,7 @@
 
 use anyhow::Context;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod ai_pipeline;
 mod api;
 mod align;
@@ -45,7 +47,8 @@ use google_auth::GoogleAuth;
 use mime::build_mime_email;
 use openai::OpenAiClient;
 use std::time::{SystemTime, UNIX_EPOCH};
-use storage::Storage;
+use show_config::DigestMode;
+use storage::{JobStatus, Storage};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -257,36 +260,54 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if mode.produces_clips() {
-        tracing::warn!(
-            "MODE={} but no LOCAL_VIDEO_PATH — the clipper polling-from-Gmail flow \
-             is M2; M1 only supports MODE=clipper with LOCAL_VIDEO_PATH. The SEO-email \
-             polling loop will run if MODE=both.",
-            cfg.mode
-        );
-    }
-
-    if !mode.produces_seo_emails() {
+    if !mode.produces_seo_emails() && !mode.produces_clips() {
         tracing::info!("MODE={} has no polling work; exiting.", cfg.mode);
         return Ok(());
     }
 
+    // The clipper polling path needs Google for Gmail/Drive ingest even when
+    // DIGEST_MODE=file. Validate early.
+    if mode.produces_clips() && google.is_none() {
+        anyhow::bail!(
+            "MODE={} requires GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + \
+             GOOGLE_REFRESH_TOKEN for Gmail/Drive polling. Set them in .env \
+             or use LOCAL_VIDEO_PATH for offline clipper runs.",
+            cfg.mode
+        );
+    }
+
     let g = google
         .as_ref()
-        .expect("google creds validated at startup for polling path");
+        .expect("google creds validated above for polling path");
     loop {
-        if let Err(e) = run_once(
-            &cfg,
-            g,
-            &gmail,
-            &drive,
-            ai.as_ref(),
-            &storage,
-            &seo_variant_blocks,
-        )
-        .await
+        if mode.produces_seo_emails()
+            && let Err(e) = run_once(
+                &cfg,
+                g,
+                &gmail,
+                &drive,
+                ai.as_ref(),
+                &storage,
+                &seo_variant_blocks,
+            )
+            .await
         {
-            tracing::error!(error = ?e, "run_once failed");
+            tracing::error!(error = ?e, "run_once (seo) failed");
+        }
+
+        if mode.produces_clips()
+            && let Err(e) = run_clipper_once(
+                &cfg,
+                g,
+                &gmail,
+                &drive,
+                ai.as_ref().expect("AI pipeline required for clipper mode"),
+                &storage,
+                digest_mode,
+            )
+            .await
+        {
+            tracing::error!(error = ?e, "run_clipper_once failed");
         }
 
         if cfg.once {
@@ -342,13 +363,13 @@ async fn run_once(
                 .await
             {
                 file_ids = parse::extract_drive_file_ids(&raw);
-                if file_ids.is_empty() {
-                    if let Some(dump_dir) = &cfg.dump_dir {
-                        let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
-                        dump_failed_message(dump_dir, &message_id, &bodies, &raw, &msg_json)
-                            .await
-                            .ok();
-                    }
+                if file_ids.is_empty()
+                    && let Some(dump_dir) = &cfg.dump_dir
+                {
+                    let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
+                    dump_failed_message(dump_dir, &message_id, &bodies, &raw, &msg_json)
+                        .await
+                        .ok();
                 }
             } else if let Some(dump_dir) = &cfg.dump_dir {
                 let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
@@ -716,6 +737,180 @@ async fn run_once(
         tracing::info!("done");
 
         // MVP: only process the newest matching media message.
+        break;
+    }
+
+    Ok(())
+}
+
+/// Poll Gmail for new Drive video shares and dispatch each through the clipper
+/// pipeline. Mirrors the structure of `run_once()` (message fetch → Drive download)
+/// but hands off to `clipper::run_clipper_from_drive` instead of the SEO path.
+///
+/// Uses a `clipper:` prefix on the job ID so clipper and SEO jobs don't collide
+/// when MODE=both.
+async fn run_clipper_once(
+    cfg: &Config,
+    google: &GoogleAuth,
+    gmail: &GmailClient,
+    drive: &DriveClient,
+    ai: &AiPipeline,
+    storage: &Storage,
+    digest_mode: DigestMode,
+) -> anyhow::Result<()> {
+    let access_token = google.access_token().await?;
+
+    let message_ids = gmail
+        .list_message_ids(&access_token, &cfg.gmail_query, cfg.gmail_max_results)
+        .await?;
+    if message_ids.is_empty() {
+        tracing::info!("clipper: no messages matched");
+        return Ok(());
+    }
+
+    for message_id in message_ids {
+        let job_id = format!("clipper:{message_id}");
+
+        // Dedupe: skip if this clipper job already completed or is in-flight.
+        match storage.get_job(&job_id).await? {
+            Some(row) if row.status == JobStatus::Done => continue,
+            Some(row) if row.status == JobStatus::Failed => {
+                tracing::info!(job_id, "retrying previously failed clipper job");
+                // Fall through to re-process.
+            }
+            Some(_) => {
+                // In-flight (pending/transcribed/ranked/rendered/posted) — skip.
+                continue;
+            }
+            None => {} // New job.
+        }
+
+        let msg = gmail.get_message_full(&access_token, &message_id).await?;
+        let bodies = match gmail
+            .extract_text_bodies_resolving_attachments(&access_token, &message_id, &msg)
+            .await
+        {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(message_id, error = %err, "clipper: failed to resolve bodies; falling back");
+                GmailClient::extract_text_bodies(&msg)
+            }
+        };
+        let mut file_ids = parse::extract_drive_file_ids(&bodies);
+        if file_ids.is_empty()
+            && let Ok(raw) = gmail
+                .get_message_raw_rfc822(&access_token, &message_id)
+                .await
+        {
+            file_ids = parse::extract_drive_file_ids(&raw);
+        }
+        if file_ids.is_empty() {
+            tracing::info!(message_id, "clipper: no drive file ids found");
+            // Mark as done so we don't re-check this message every poll.
+            storage.create_job(&job_id, None, None, None).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            continue;
+        }
+
+        let file_id = &file_ids[0];
+        tracing::info!(message_id, file_id, "clipper: processing drive file");
+
+        let meta = match drive.get_metadata(&access_token, file_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(message_id, file_id, error=?e, "clipper: drive metadata failed; skipping");
+                storage.create_job(&job_id, None, None, Some(file_id)).await?;
+                storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+                continue;
+            }
+        };
+
+        let name_lower = meta.name.to_lowercase();
+        let is_video = name_lower.ends_with(".mp4")
+            || name_lower.ends_with(".mov")
+            || name_lower.ends_with(".mkv")
+            || name_lower.ends_with(".webm")
+            || name_lower.ends_with(".m4v")
+            || name_lower.ends_with(".avi");
+
+        if !is_video {
+            tracing::info!(
+                message_id,
+                file_id,
+                name = %meta.name,
+                "clipper: skipping non-video file"
+            );
+            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            continue;
+        }
+
+        if cfg.dry_run {
+            tracing::info!(message_id, file_id, name = %meta.name, "clipper: dry-run skip");
+            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            continue;
+        }
+
+        ensure_tool_available(&cfg.ffmpeg, "ffmpeg").await?;
+        ensure_tool_available(&cfg.ffprobe, "ffprobe").await?;
+
+        // Download the video.
+        let job_dir = std::path::PathBuf::from(&cfg.work_dir)
+            .join(sanitize_filename(&meta.name))
+            .join(&message_id);
+        tokio::fs::create_dir_all(&job_dir).await.ok();
+
+        let video_path = job_dir.join(&meta.name);
+        let expected_size_bytes = meta
+            .size
+            .as_deref()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+
+        let need_download = match tokio::fs::metadata(&video_path).await {
+            Ok(m) => match expected_size_bytes {
+                Some(expected) if expected > 0 => m.len() != expected,
+                _ => false,
+            },
+            Err(_) => true,
+        };
+
+        if need_download {
+            tracing::info!(dest=%video_path.display(), "clipper: downloading from drive");
+            drive
+                .download_to_path(&access_token, file_id, &video_path)
+                .await?;
+        }
+
+        // Create or reset the job row to pending.
+        storage
+            .create_job(&job_id, None, Some(&meta.name), Some(file_id))
+            .await?;
+        // Ensure status is pending (handles retry case where job already existed).
+        storage
+            .update_job_status(&job_id, JobStatus::Pending, None)
+            .await?;
+
+        // Run the full clipper pipeline with job status tracking.
+        // Errors are caught inside run_clipper_from_drive and the job is
+        // marked failed — we log but don't bail so the loop can continue.
+        if let Err(e) = clipper::run_clipper_from_drive(
+            cfg,
+            Some(google),
+            gmail,
+            ai,
+            storage,
+            &job_id,
+            &video_path,
+            &meta.name,
+            digest_mode,
+        )
+        .await
+        {
+            tracing::error!(job_id, error = ?e, "clipper pipeline failed for this job");
+        }
+
+        // Process one message per poll cycle (like the SEO path).
         break;
     }
 

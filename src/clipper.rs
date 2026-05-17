@@ -2,8 +2,10 @@
 //! M1 feature pipeline, ranks candidates via LLM, renders top clips with burned
 //! captions, sends a digest email with clip attachments.
 //!
-//! Polling-from-Gmail and posting-to-social-platforms are M2+ — for M1 the
-//! acceptance path is `MODE=clipper LOCAL_VIDEO_PATH=foo.mp4`.
+//! Supports two entry-points:
+//! - `run_clipper_local_once`: M1 path, `MODE=clipper LOCAL_VIDEO_PATH=foo.mp4`
+//! - `run_clipper_from_drive`: M2 polling path, called from the Gmail loop when
+//!   a Drive share contains a video file.
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -42,6 +44,531 @@ async fn set_job_status(storage: Option<&Storage>, job_id: Option<&str>, status:
             tracing::warn!(job_id = jid, status = status.as_str(), error = ?e, "failed to update job status");
         }
     }
+}
+
+/// Run the full clipper pipeline for a video that has already been downloaded
+/// from Google Drive. Called from the Gmail polling loop. Tracks progress
+/// through the jobs table (pending → transcribed → ranked → rendered → posted → done).
+///
+/// If the pipeline fails at any stage the job is marked `failed` with the error
+/// message stored in `jobs.error`, so a subsequent poll can retry it.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_clipper_from_drive(
+    cfg: &Config,
+    google: Option<&GoogleAuth>,
+    gmail: &GmailClient,
+    ai: &AiPipeline,
+    storage: &Storage,
+    job_id: &str,
+    video_path: &std::path::Path,
+    media_name: &str,
+    digest_mode: DigestMode,
+) -> Result<()> {
+    // The job row must already exist (created by the polling loop).
+    // Run the pipeline and update status at each gate. On error, mark the
+    // job as failed so the caller (polling loop) can decide whether to retry.
+    let result = run_clipper_pipeline_inner(
+        cfg, google, gmail, ai, video_path, media_name, digest_mode, storage, job_id,
+    )
+    .await;
+
+    match &result {
+        Ok(()) => {
+            storage
+                .update_job_status(job_id, JobStatus::Done, None)
+                .await?;
+            tracing::info!(job_id, media_name, "clipper job completed");
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(job_id, media_name, error = %msg, "clipper job failed");
+            storage
+                .update_job_status(job_id, JobStatus::Failed, Some(&msg))
+                .await
+                .ok(); // best-effort; don't mask the original error
+        }
+    }
+    result
+}
+
+/// Inner pipeline logic shared between `run_clipper_from_drive` and
+/// `run_clipper_local_once` (the local path doesn't track status yet but
+/// could in the future).
+#[allow(clippy::too_many_arguments)]
+async fn run_clipper_pipeline_inner(
+    cfg: &Config,
+    google: Option<&GoogleAuth>,
+    gmail: &GmailClient,
+    ai: &AiPipeline,
+    input_path: &std::path::Path,
+    media_name: &str,
+    digest_mode: DigestMode,
+    storage: &Storage,
+    job_id: &str,
+) -> Result<()> {
+    let file_name = media_name.to_string();
+    let lower = file_name.to_lowercase();
+
+    if !is_video_extension(&lower) {
+        anyhow::bail!("clipper mode requires a video input, got: {file_name}");
+    }
+
+    ensure_tool(&cfg.ffmpeg, "ffmpeg").await?;
+    ensure_tool(&cfg.ffprobe, "ffprobe").await?;
+
+    let job_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let job_dir = PathBuf::from(&cfg.work_dir)
+        .join("clipper")
+        .join(sanitize_filename(&file_name))
+        .join(job_ts.to_string());
+    tokio::fs::create_dir_all(&job_dir).await.ok();
+
+    let audio_path = job_dir.join("audio.m4a");
+    if !audio_path.exists() {
+        media::extract_audio_m4a(&cfg.ffmpeg, input_path, &audio_path).await?;
+    }
+
+    let total_duration_secs = media::duration_secs(&cfg.ffprobe, &audio_path)
+        .await
+        .context("ffprobe duration")?;
+    let chunk_secs = choose_chunk_secs(cfg, total_duration_secs);
+    tracing::info!(
+        total_secs = total_duration_secs,
+        chunk_secs,
+        "clipper: chunk sizing"
+    );
+
+    let chunks_dir = job_dir.join("audio_chunks");
+    let chunk_paths =
+        media::segment_audio(&cfg.ffmpeg, &audio_path, &chunks_dir, chunk_secs).await?;
+    if chunk_paths.is_empty() {
+        anyhow::bail!("no audio chunks produced");
+    }
+
+    let chunks: Vec<(PathBuf, f64, f64)> = chunk_paths
+        .into_iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let offset = (idx as f64) * (chunk_secs as f64);
+            let mut dur = chunk_secs as f64;
+            if offset + dur > total_duration_secs {
+                dur = (total_duration_secs - offset).max(0.0);
+            }
+            if !dur.is_finite() || dur <= 0.0 {
+                dur = chunk_secs as f64;
+            }
+            (p, offset, dur)
+        })
+        .collect();
+
+    let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    let bar_style = ProgressStyle::with_template(
+        "{spinner:.green} {msg:18} {pos}/{len} [{wide_bar:.cyan/blue}] {elapsed_precise}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar());
+
+    let pb_transcribe = mp.add(ProgressBar::new(chunks.len() as u64));
+    pb_transcribe.set_style(bar_style.clone());
+    pb_transcribe.set_message("transcribing");
+    pb_transcribe.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let pb_features = mp.add(ProgressBar::new_spinner());
+    if let Ok(style) = ProgressStyle::with_template("{spinner:.green} {msg}") {
+        pb_features.set_style(style);
+    }
+    pb_features.set_message("scene + vad + prosody");
+    pb_features.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let (transcript, shots, silences, rms) = tokio::try_join!(
+        ai.transcribe_word_chunks(&chunks, Some(pb_transcribe.clone())),
+        scene::detect_shots(&cfg.ffmpeg, input_path, 0.4),
+        vad::detect_silences(&cfg.ffmpeg, &audio_path, -30.0, 0.3),
+        prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
+    )?;
+
+    // F0 pitch extraction via aubio — non-fatal, returns empty vec if unavailable.
+    let f0 = prosody::f0_curve("aubio", &audio_path).await;
+    if f0.is_empty() {
+        tracing::info!("clipper: F0 features unavailable (aubio not on PATH or failed)");
+    }
+
+    pb_features.finish_with_message("scene + vad + prosody complete");
+
+    tracing::info!(
+        words = transcript.words.len(),
+        shots = shots.len(),
+        silences = silences.len(),
+        rms_windows = rms.len(),
+        f0_samples = f0.len(),
+        "clipper: feature extraction complete"
+    );
+
+    if transcript.words.is_empty() {
+        anyhow::bail!(
+            "transcription returned no word-level timestamps — provider likely doesn't \
+             support timestamp_granularities=word"
+        );
+    }
+
+    // Gate: transcribed
+    storage
+        .update_job_status(job_id, JobStatus::Transcribed, None)
+        .await?;
+
+    let show_context = ai
+        .infer_show_context(&file_name, &transcript.full_text)
+        .await
+        .ok();
+
+    let cand_gen = CandidateGenerator::new();
+    let mut candidates =
+        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
+    tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
+
+    if candidates.is_empty() {
+        anyhow::bail!("no candidate windows produced — episode may be too short or too quiet");
+    }
+
+    match Embedder::from_config(cfg) {
+        Ok(embedder) => {
+            tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
+            if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
+                tracing::warn!(error = ?e, "novelty scoring failed; proceeding without it");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "embedder init failed; proceeding without novelty");
+        }
+    }
+
+    let ranker_system = tokio::fs::read_to_string(&cfg.clip_ranker_system_prompt_path)
+        .await
+        .with_context(|| {
+            format!(
+                "read ranker system prompt at {}",
+                &cfg.clip_ranker_system_prompt_path
+            )
+        })?
+        .trim()
+        .to_string();
+    let ranker_user_template = tokio::fs::read_to_string(&cfg.clip_ranker_user_prompt_path)
+        .await
+        .with_context(|| {
+            format!(
+                "read ranker user prompt at {}",
+                &cfg.clip_ranker_user_prompt_path
+            )
+        })?
+        .trim()
+        .to_string();
+
+    let ranker = Ranker::new(
+        ai.openai.clone(),
+        ai.chat_model.clone(),
+        ranker_system,
+        ranker_user_template,
+    );
+
+    let final_top_k = cfg.clip_top_k.max(1);
+    let llm_top_k = if cfg.vlm_rerank_enabled {
+        cfg.vlm_rerank_top_k.max(final_top_k)
+    } else {
+        final_top_k
+    };
+    let ranked = ranker
+        .rank(&candidates, llm_top_k, show_context.as_ref())
+        .await
+        .context("LLM rank")?;
+    tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
+
+    if ranked.is_empty() {
+        anyhow::bail!("LLM ranker returned no clips");
+    }
+
+    let ranked = match VlmReranker::from_config(cfg) {
+        Some(reranker) => {
+            match reranker
+                .rerank(&cfg.ffmpeg, input_path, ranked, cfg.vlm_rerank_top_k)
+                .await
+            {
+                Ok(re) => re,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
+                    ranker
+                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .await
+                        .context("LLM rank (refetch after VLM failure)")?
+                }
+            }
+        }
+        None => ranked,
+    };
+
+    let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
+
+    // Gate: ranked
+    storage
+        .update_job_status(job_id, JobStatus::Ranked, None)
+        .await?;
+
+    // Generate social copy
+    let social_copies: Vec<Option<SocialCopy>> = if cfg.clip_social_copy_disabled {
+        vec![None; ranked.len()]
+    } else {
+        let sys = tokio::fs::read_to_string(&cfg.clip_social_system_prompt_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "read social system prompt at {}",
+                    &cfg.clip_social_system_prompt_path
+                )
+            })?
+            .trim()
+            .to_string();
+        let user_tmpl = tokio::fs::read_to_string(&cfg.clip_social_user_prompt_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "read social user prompt at {}",
+                    &cfg.clip_social_user_prompt_path
+                )
+            })?
+            .trim()
+            .to_string();
+        let generator = SocialCopyGenerator::new(
+            ai.openai.clone(),
+            ai.chat_model.clone(),
+            sys,
+            user_tmpl,
+        );
+        let mut copies: Vec<Option<SocialCopy>> = Vec::with_capacity(ranked.len());
+        for (i, clip) in ranked.iter().enumerate() {
+            let candidate = candidates.get(clip.candidate_index);
+            let copy = match candidate {
+                Some(cand) => match generator.generate(clip, cand, show_context.as_ref()).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(clip = i + 1, error = ?e, "social copy failed");
+                        None
+                    }
+                },
+                None => None,
+            };
+            copies.push(copy);
+        }
+        copies
+    };
+
+    // Render clips
+    let clips_dir = job_dir.join("clips");
+    tokio::fs::create_dir_all(&clips_dir).await.ok();
+
+    let formats = parse_render_formats(&cfg.clip_render_formats);
+    if formats.is_empty() {
+        anyhow::bail!(
+            "CLIP_RENDER_FORMATS produced no recognized formats (got '{}')",
+            cfg.clip_render_formats
+        );
+    }
+
+    let mut rendered: Vec<RenderedClip> = Vec::with_capacity(ranked.len());
+    for (i, (clip, social)) in ranked.iter().zip(social_copies.iter()).enumerate() {
+        let idx = i + 1;
+
+        let clip_words: Vec<AlignedWord> = transcript
+            .words
+            .iter()
+            .filter(|w| w.start_secs >= clip.start_secs && w.end_secs <= clip.end_secs + 0.5)
+            .map(|w| AlignedWord {
+                text: w.text.clone(),
+                start_secs: (w.start_secs - clip.start_secs).max(0.0),
+                end_secs: (w.end_secs - clip.start_secs).max(0.0),
+            })
+            .collect();
+
+        let mut variants: Vec<RenderedVariant> = Vec::with_capacity(formats.len());
+        for spec in &formats {
+            let basename = format!(
+                "clip_{idx:02}_{}-{}_{}.mp4",
+                to_mmss(clip.start_secs),
+                to_mmss(clip.end_secs),
+                spec.label
+            );
+            let out_path = clips_dir.join(&basename);
+            let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
+
+            let profile = (spec.profile)();
+            let style = (spec.style)();
+
+            if let Err(e) =
+                captions::write_ass(&ass_path, &clip_words, profile.width, profile.height, &style)
+                    .await
+            {
+                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
+                continue;
+            }
+
+            let overlay_ass_path =
+                clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
+            let mut overlay_written = false;
+            if let Some(sc) = social {
+                let hook = sc.overlay_hook.trim();
+                if !hook.is_empty() {
+                    let overlay_style = (spec.overlay_style)();
+                    match captions::write_overlay_ass(
+                        &overlay_ass_path,
+                        hook,
+                        profile.width,
+                        profile.height,
+                        &overlay_style,
+                    )
+                    .await
+                    {
+                        Ok(()) => overlay_written = true,
+                        Err(e) => {
+                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                        }
+                    }
+                }
+            }
+
+            let mut layers: Vec<&std::path::Path> = vec![ass_path.as_ref()];
+            if overlay_written {
+                layers.push(overlay_ass_path.as_ref());
+            }
+
+            let res = render::render_clip(
+                &cfg.ffmpeg,
+                input_path,
+                clip.start_secs,
+                clip.end_secs,
+                &out_path,
+                &profile,
+                &layers,
+            )
+            .await;
+
+            match res {
+                Ok(()) => {
+                    let bytes = tokio::fs::metadata(&out_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    variants.push(RenderedVariant {
+                        label: spec.label.to_string(),
+                        path: out_path,
+                        bytes,
+                        width: profile.width,
+                        height: profile.height,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
+                }
+            }
+        }
+
+        if variants.is_empty() {
+            tracing::warn!(clip = idx, "no variants rendered for this clip");
+            continue;
+        }
+
+        rendered.push(RenderedClip {
+            rank: idx,
+            ranked: clip.clone(),
+            social: social.clone(),
+            variants,
+            cover_frame_path: None,
+            posts: Vec::new(),
+        });
+    }
+
+    if rendered.is_empty() {
+        anyhow::bail!("all clip renders failed");
+    }
+
+    // Gate: rendered
+    storage
+        .update_job_status(job_id, JobStatus::Rendered, None)
+        .await?;
+
+    // Post to platforms
+    let platforms = platforms::Platform::from_config(cfg, google);
+    if !platforms.is_empty() {
+        tracing::info!(
+            platforms = ?platforms.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            "clipper: posting starting"
+        );
+        for r in rendered.iter_mut() {
+            let video_9x16 = r
+                .variants
+                .iter()
+                .find(|v| v.label == "9x16")
+                .map(|v| v.path.as_path());
+            let results = posting::post_one_clip(
+                &platforms,
+                cfg.post_dry_run,
+                r.rank,
+                video_9x16,
+                r.social.as_ref(),
+            )
+            .await;
+            r.posts = results;
+        }
+    }
+
+    // Gate: posted
+    storage
+        .update_job_status(job_id, JobStatus::Posted, None)
+        .await?;
+
+    // Write digest
+    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
+
+    if digest_mode.writes_file() {
+        let digest_path = clips_dir.join("digest.md");
+        tokio::fs::write(&digest_path, &body)
+            .await
+            .with_context(|| format!("write digest at {}", digest_path.display()))?;
+        tracing::info!(path = %digest_path.display(), "clipper: digest written to disk");
+
+        let manifest_path = clips_dir.join("manifest.json");
+        let manifest =
+            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered);
+        let manifest_text = serde_json::to_string_pretty(&manifest)
+            .unwrap_or_else(|_| "{}".to_string());
+        if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
+            tracing::warn!(error = ?e, "manifest.json write failed (non-fatal)");
+        }
+    }
+
+    if digest_mode.sends_email() {
+        let google = google.ok_or_else(|| {
+            anyhow::anyhow!("DIGEST_MODE includes email but Google credentials are missing")
+        })?;
+        let result_to = cfg
+            .result_to
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("DIGEST_MODE includes email but RESULT_TO is unset"))?;
+
+        let subject = format!(
+            "{} CLIPPER: {} clips for {}",
+            cfg.result_subject_prefix,
+            rendered.len(),
+            file_name
+        );
+
+        let access_token = google.access_token().await?;
+        let raw_mime = build_mime_email("me", result_to, &subject, &body, &[]);
+        let raw_b64url = URL_SAFE_NO_PAD.encode(raw_mime);
+        let sent_message_id = gmail.send_raw(&access_token, &raw_b64url).await?;
+        tracing::info!(sent_message_id, "clipper: digest email sent");
+    }
+
+    Ok(())
 }
 
 pub async fn run_clipper_local_once(

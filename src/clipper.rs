@@ -31,7 +31,7 @@ use crate::show_config::DigestMode;
 use crate::social_copy::{SocialCopy, SocialCopyGenerator};
 use crate::storage::{JobStatus, Storage};
 use crate::vad;
-use crate::vlm_ranker::VlmReranker;
+use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
 
 /// Update job status in storage if both storage and job_id are provided.
 /// Errors from the status update itself are logged but not propagated,
@@ -339,6 +339,36 @@ async fn run_clipper_inner(
                         .rank(&candidates, llm_top_k, show_context.as_ref())
                         .await
                         .context("LLM rank (refetch after VLM failure)")?
+                }
+            }
+        }
+        None => ranked,
+    };
+
+    // Optional: Premium VLM re-rank (Lane B) — top-K clips through a larger model.
+    let ranked = match PremiumVlmReranker::from_config(cfg) {
+        Some(premium) => {
+            tracing::info!(
+                model = ?cfg.vlm_premium_model,
+                top_k = cfg.vlm_premium_top_k,
+                blend_weight = cfg.vlm_premium_blend_weight,
+                "clipper: premium VLM re-rank starting"
+            );
+            match premium
+                .rerank(&cfg.ffmpeg, &input_path, ranked, cfg.vlm_premium_top_k)
+                .await
+            {
+                Ok(re) => {
+                    tracing::info!(reranked = re.len(), "clipper: premium VLM re-rank complete");
+                    re
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "premium VLM re-rank failed; keeping standard order");
+                    // Re-fetch needed since we moved ranked into the call.
+                    ranker
+                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .await
+                        .context("LLM rank (refetch after premium VLM failure)")?
                 }
             }
         }

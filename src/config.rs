@@ -239,6 +239,31 @@ pub struct Config {
     #[arg(long, env = "VLM_BLEND_WEIGHT", default_value_t = 0.5)]
     pub vlm_blend_weight: f64,
 
+    /// Premium VLM model id (e.g. `qwen/qwen2.5-vl-72b-instruct`). When set,
+    /// the top-K clips (after standard VLM re-rank) are re-scored through this
+    /// higher-quality model via OpenRouter or any OpenAI-compatible endpoint.
+    #[arg(long, env = "VLM_PREMIUM_MODEL")]
+    pub vlm_premium_model: Option<String>,
+
+    /// Base URL for the premium VLM API (OpenRouter or self-hosted).
+    /// Defaults to OpenRouter's endpoint.
+    #[arg(long, env = "VLM_PREMIUM_BASE_URL", default_value = "https://openrouter.ai/api")]
+    pub vlm_premium_base_url: String,
+
+    /// API key for the premium VLM endpoint (e.g. OpenRouter API key).
+    /// Falls back to `HF_API_KEY` if not set.
+    #[arg(long, env = "VLM_PREMIUM_API_KEY")]
+    pub vlm_premium_api_key: Option<String>,
+
+    /// How many top clips go through the premium VLM re-rank (default 3).
+    #[arg(long, env = "VLM_PREMIUM_TOP_K", default_value_t = 3)]
+    pub vlm_premium_top_k: usize,
+
+    /// Blend weight for the premium VLM score with the current blended score.
+    /// final = (1 - w) * current + w * premium_vlm
+    #[arg(long, env = "VLM_PREMIUM_BLEND_WEIGHT", default_value_t = 0.6)]
+    pub vlm_premium_blend_weight: f64,
+
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]
     pub dump_dir: Option<String>,

@@ -86,7 +86,13 @@ pub async fn detect_silences(
                 return detect_silences_ffmpeg(ffmpeg, media_path, noise_db, min_duration_secs)
                     .await;
             }
-            detect_silences_silero(ffmpeg, media_path, model_path, threshold, min_duration_secs)
+            let canonical = model_file
+                .canonicalize()
+                .with_context(|| format!("canonicalize VAD model path: {model_path}"))?;
+            let canonical_str = canonical.to_str().ok_or_else(|| {
+                anyhow::anyhow!("VAD model path is not valid UTF-8: {}", canonical.display())
+            })?;
+            detect_silences_silero(ffmpeg, media_path, canonical_str, threshold, min_duration_secs)
                 .await
         }
         VadBackend::Ffmpeg => {

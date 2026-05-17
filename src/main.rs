@@ -78,11 +78,23 @@ async fn main() -> anyhow::Result<()> {
     // MODE=server: start the Axum API server and return.
     if matches!(mode, show_config::Mode::Server) {
         let storage = Storage::open(&cfg.clipper_db).await?;
+        let dist_path = std::path::PathBuf::from(&cfg.dashboard_dist);
+        let dashboard_dist = if dist_path.is_dir() {
+            tracing::info!(path = %dist_path.display(), "serving dashboard frontend");
+            Some(dist_path)
+        } else {
+            tracing::warn!(
+                path = %dist_path.display(),
+                "dashboard dist/ not found — frontend will show build instructions"
+            );
+            None
+        };
         let state = api::AppState {
             storage,
             work_dir: cfg.work_dir.clone(),
+            dashboard_dist,
         };
-        return api::serve(state, cfg.api_port, &cfg.api_cors_origins).await;
+        return api::serve(state, cfg.api_port, &cfg.api_cors_origins, cfg.open_browser).await;
     }
 
     // Build Google auth only if creds are all present; downstream code validates
@@ -124,10 +136,10 @@ async fn main() -> anyhow::Result<()> {
              MODE=clipper DIGEST_MODE=file for disk-only output."
         );
     }
-    // Start the media API server in the background if API_PORT is set.
-    if let Some(port) = cfg.api_port {
+    // Start the media API server in the background (serves rendered media for the dashboard).
+    {
         let work_dir = std::path::PathBuf::from(&cfg.work_dir);
-        let bind_addr = format!("{}:{}", cfg.api_bind, port);
+        let bind_addr = format!("{}:{}", cfg.api_bind, cfg.api_port);
         let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
             .with_context(|| format!("bind API server to {bind_addr}"))?;

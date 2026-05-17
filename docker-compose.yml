@@ -1,0 +1,10 @@
+services:
+  autoseo:
+    build: .
+    env_file: .env
+    volumes:
+      - autoseo-work:/work
+    restart: unless-stopped
+
+volumes:
+  autoseo-work:

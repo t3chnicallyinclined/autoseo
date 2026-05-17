@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::ai_pipeline::ShowContext;
+use crate::ast::AudioEvents;
 use crate::candidates::CandidateWindow;
 use crate::openai::OpenAiClient;
 
@@ -186,6 +187,7 @@ fn serialize_batch(batch: &[CandidateWindow], start_index_in_episode: usize) -> 
                 speaking_rate_wps: c.speaking_rate_wps,
             },
             novelty: c.novelty_score,
+            audio_events: c.audio_events.clone(),
         })
         .collect();
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_string())
@@ -201,6 +203,8 @@ struct BatchCandidate {
     linguistic: LinguisticPayload,
     prosody: ProsodyPayload,
     novelty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_events: Option<AudioEvents>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +268,7 @@ mod tests {
             f0_peak_hz: Some(310.0),
             speaking_rate_wps: Some(2.5),
             novelty_score: Some(0.4),
+            audio_events: None,
         }
     }
 

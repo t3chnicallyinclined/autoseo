@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai_pipeline::{AiPipeline, TranscriptSegment};
 use crate::align::AlignedWord;
+use crate::ast::AstScorer;
 use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionStyle, OverlayStyle};
 use crate::config::Config;
@@ -825,6 +826,37 @@ async fn run_clipper_inner(
         }
         Err(e) => {
             tracing::warn!(error = ?e, "embedder init failed; proceeding without novelty");
+        }
+    }
+
+    // Optional: AST audio-event scoring. Non-fatal — if the model is unavailable
+    // or inference fails, we proceed without the signal.
+    if cfg.ast_enabled {
+        let models_dir = std::path::PathBuf::from(&cfg.work_dir).join("models");
+        match AstScorer::load(&models_dir, Some(&cfg.ast_model_url)).await {
+            Ok(scorer) => {
+                tracing::info!("clipper: AST audio-event scoring starting");
+                match scorer.score_file(&cfg.ffmpeg, &audio_path).await {
+                    Ok(scored_windows) => {
+                        candidates::attach_audio_events(&mut candidates, &scored_windows);
+                        let with_events = candidates
+                            .iter()
+                            .filter(|c| c.audio_events.is_some())
+                            .count();
+                        tracing::info!(
+                            with_events,
+                            total = candidates.len(),
+                            "clipper: AST audio events attached"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "AST scoring failed; proceeding without audio events");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "AST model load failed; proceeding without audio events");
+            }
         }
     }
 

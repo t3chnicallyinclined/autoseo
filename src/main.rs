@@ -3,6 +3,7 @@
 mod ai_pipeline;
 mod api;
 mod align;
+mod ast;
 mod candidates;
 mod captions;
 mod clipper;

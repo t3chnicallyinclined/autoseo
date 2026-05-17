@@ -216,6 +216,7 @@ mod tests {
             f0_peak_hz: None,
             speaking_rate_wps: Some(3.0),
             novelty_score: Some(0.6),
+            audio_events: None,
         }
     }
 

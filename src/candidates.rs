@@ -18,7 +18,7 @@ use anyhow::Result;
 use crate::align::{self, AlignedWord};
 use crate::embed::{self, Embedder};
 use crate::linguistic_markers::{self, LinguisticFeatures};
-use crate::prosody::{self, RmsWindow};
+use crate::prosody::{self, F0Sample, RmsWindow};
 use crate::scene;
 use crate::vad::{self, SilenceWindow};
 
@@ -31,6 +31,9 @@ pub struct CandidateWindow {
     pub linguistic: LinguisticFeatures,
     pub rms_peak_db: Option<f64>,
     pub rms_mean_db: Option<f64>,
+    pub f0_mean_hz: Option<f64>,
+    pub f0_variance_hz2: Option<f64>,
+    pub f0_peak_hz: Option<f64>,
     pub speaking_rate_wps: Option<f64>,
     /// 0..=1, set by [`attach_novelty`]. `None` until the embedding pass runs.
     pub novelty_score: Option<f64>,
@@ -89,6 +92,7 @@ impl CandidateGenerator {
         silences: &[SilenceWindow],
         shots: &[f64],
         rms_curve: &[RmsWindow],
+        f0_curve: &[F0Sample],
     ) -> Vec<CandidateWindow> {
         if total_duration_secs < self.min_secs {
             return Vec::new();
@@ -109,7 +113,7 @@ impl CandidateGenerator {
             );
 
             if end - start >= self.min_secs {
-                let window = build_window(start, end, words, rms_curve);
+                let window = build_window(start, end, words, rms_curve, f0_curve);
                 if window.word_count >= self.min_words {
                     // Skip near-duplicate of previous window.
                     let dup = out.last().is_some_and(|prev| {
@@ -193,6 +197,7 @@ fn build_window(
     end: f64,
     words: &[AlignedWord],
     rms_curve: &[RmsWindow],
+    f0_curve: &[F0Sample],
 ) -> CandidateWindow {
     let in_window: Vec<&AlignedWord> = words
         .iter()
@@ -208,6 +213,7 @@ fn build_window(
     let speaking_rate_wps = align::speaking_rate_wps(words, start, end);
     let rms_peak_db = prosody::peak_in_range(rms_curve, start, end).map(|w| w.rms_db);
     let rms_mean_db = prosody::mean_in_range(rms_curve, start, end);
+    let f0_stats = prosody::f0_stats_in_range(f0_curve, start, end);
 
     CandidateWindow {
         start_secs: start,
@@ -217,6 +223,9 @@ fn build_window(
         linguistic,
         rms_peak_db,
         rms_mean_db,
+        f0_mean_hz: f0_stats.as_ref().map(|s| s.mean_hz),
+        f0_variance_hz2: f0_stats.as_ref().map(|s| s.variance_hz2),
+        f0_peak_hz: f0_stats.map(|s| s.peak_hz),
         speaking_rate_wps,
         novelty_score: None,
     }
@@ -247,9 +256,9 @@ mod tests {
     #[test]
     fn empty_duration_returns_empty() {
         let g = CandidateGenerator::new();
-        let out = g.generate(0.0, &[], &[], &[], &[]);
+        let out = g.generate(0.0, &[], &[], &[], &[], &[]);
         assert!(out.is_empty());
-        let out = g.generate(10.0, &[], &[], &[], &[]);
+        let out = g.generate(10.0, &[], &[], &[], &[], &[]);
         // 10s < default min_secs (25s) — should be empty.
         assert!(out.is_empty());
     }
@@ -259,7 +268,7 @@ mod tests {
         // 5 minutes of dense speech, no silences or shots, no RMS.
         let words = dense_words(300.0, 3.0); // 900 words at 3wps
         let g = CandidateGenerator::new();
-        let out = g.generate(300.0, &words, &[], &[], &[]);
+        let out = g.generate(300.0, &words, &[], &[], &[], &[]);
         assert!(!out.is_empty(), "expected several candidate windows");
         for w in &out {
             assert!(
@@ -295,7 +304,7 @@ mod tests {
         ];
         // Pad time but no more words.
         let g = CandidateGenerator::new();
-        let out = g.generate(120.0, &mut words, &[], &[], &[]);
+        let out = g.generate(120.0, &mut words, &[], &[], &[], &[]);
         // Below default min_words (30), so even though windows fit, none pass.
         assert!(
             out.is_empty(),
@@ -313,7 +322,7 @@ mod tests {
             end_secs: 0.5,
         }];
         let g = CandidateGenerator::new();
-        let out = g.generate(200.0, &words, &silences, &[], &[]);
+        let out = g.generate(200.0, &words, &silences, &[], &[], &[]);
         let first = out.first().expect("at least one window");
         // First proposed start is 0.0; the snap-target boundary is 0.0 (silence_start)
         // — already there. The next thing snap_to_silence_boundary might prefer is 0.5
@@ -355,7 +364,7 @@ mod tests {
             min_words: 5,
             ..Default::default()
         };
-        let out = g.generate(total, &all, &[], &[], &rms);
+        let out = g.generate(total, &all, &[], &[], &rms, &[]);
         assert!(!out.is_empty(), "expected at least one window");
         let w = &out[0];
         assert!(w.transcript.contains("Honestly"));

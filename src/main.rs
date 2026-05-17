@@ -5,6 +5,7 @@ mod candidates;
 mod captions;
 mod clipper;
 mod config;
+mod context;
 mod drive;
 mod embed;
 mod gmail;
@@ -201,6 +202,15 @@ async fn main() -> anyhow::Result<()> {
             let ai_ref = ai.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)")
             })?;
+            // Generate a stable job ID from the local file path so retries
+            // reuse the same row.
+            let job_id = format!("local:{}", sanitize_filename(
+                std::path::Path::new(local_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(local_path),
+            ));
+            storage.create_job(&job_id, None, Some(local_path), None).await?;
             clipper::run_clipper_local_once(
                 &cfg,
                 google.as_ref(),
@@ -208,6 +218,8 @@ async fn main() -> anyhow::Result<()> {
                 ai_ref,
                 local_path,
                 digest_mode,
+                Some(&storage),
+                Some(&job_id),
             )
             .await?;
         }

@@ -772,9 +772,9 @@ async fn run_clipper_once(
         let job_id = format!("clipper:{message_id}");
 
         // Dedupe: skip if this clipper job already completed or is in-flight.
-        match storage.get_job_status(&job_id).await? {
-            Some(JobStatus::Done) => continue,
-            Some(JobStatus::Failed) => {
+        match storage.get_job(&job_id).await? {
+            Some(row) if row.status == JobStatus::Done => continue,
+            Some(row) if row.status == JobStatus::Failed => {
                 tracing::info!(job_id, "retrying previously failed clipper job");
                 // Fall through to re-process.
             }
@@ -807,9 +807,8 @@ async fn run_clipper_once(
         if file_ids.is_empty() {
             tracing::info!(message_id, "clipper: no drive file ids found");
             // Mark as done so we don't re-check this message every poll.
-            storage
-                .create_job(&job_id, None, None, None, JobStatus::Done)
-                .await?;
+            storage.create_job(&job_id, None, None, None).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
             continue;
         }
 
@@ -820,9 +819,8 @@ async fn run_clipper_once(
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(message_id, file_id, error=?e, "clipper: drive metadata failed; skipping");
-                storage
-                    .create_job(&job_id, Some(file_id), None, None, JobStatus::Done)
-                    .await?;
+                storage.create_job(&job_id, None, None, Some(file_id)).await?;
+                storage.update_job_status(&job_id, JobStatus::Done, None).await?;
                 continue;
             }
         };
@@ -842,17 +840,15 @@ async fn run_clipper_once(
                 name = %meta.name,
                 "clipper: skipping non-video file"
             );
-            storage
-                .create_job(&job_id, Some(file_id), Some(&meta.name), None, JobStatus::Done)
-                .await?;
+            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
             continue;
         }
 
         if cfg.dry_run {
             tracing::info!(message_id, file_id, name = %meta.name, "clipper: dry-run skip");
-            storage
-                .create_job(&job_id, Some(file_id), Some(&meta.name), None, JobStatus::Done)
-                .await?;
+            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
+            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
             continue;
         }
 
@@ -887,21 +883,13 @@ async fn run_clipper_once(
         }
 
         // Create or reset the job row to pending.
-        let created = storage
-            .create_job(
-                &job_id,
-                Some(file_id),
-                Some(&meta.name),
-                None,
-                JobStatus::Pending,
-            )
+        storage
+            .create_job(&job_id, None, Some(&meta.name), Some(file_id))
             .await?;
-        if !created {
-            // Job exists (retry case) — reset to pending.
-            storage
-                .update_job_status(&job_id, JobStatus::Pending, None)
-                .await?;
-        }
+        // Ensure status is pending (handles retry case where job already existed).
+        storage
+            .update_job_status(&job_id, JobStatus::Pending, None)
+            .await?;
 
         // Run the full clipper pipeline with job status tracking.
         // Errors are caught inside run_clipper_from_drive and the job is

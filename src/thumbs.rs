@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::{ai_pipeline::ThumbnailMoment, media, mime::Attachment};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_thumbnails(
     ffmpeg: &str,
     video_path: &std::path::Path,
@@ -80,7 +81,6 @@ pub async fn generate_thumbnails(
         .map(|(out_path, at)| {
             let ffmpeg = ffmpeg.to_string();
             let video_path = video_path.to_path_buf();
-            let thumbnail_max_height = thumbnail_max_height;
             let pb = pb.clone();
             async move {
                 let _ = media::screenshot_jpeg(

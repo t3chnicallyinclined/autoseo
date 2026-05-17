@@ -94,7 +94,7 @@ pub async fn render_clip(
     profile: &RenderProfile,
     subtitle_paths: &[&Path],
 ) -> anyhow::Result<()> {
-    if !(end_secs > start_secs) {
+    if !matches!(end_secs.partial_cmp(&start_secs), Some(std::cmp::Ordering::Greater)) {
         anyhow::bail!(
             "render_clip: end ({end_secs}) must be after start ({start_secs})"
         );

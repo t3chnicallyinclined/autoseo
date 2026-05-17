@@ -75,7 +75,7 @@ impl GmailClient {
             anyhow::bail!("gmail get failed: {status} {body}");
         }
 
-        Ok(res.json().await.context("parse messages.get")?)
+        res.json().await.context("parse messages.get")
     }
 
     pub async fn get_message_raw_rfc822(
@@ -107,15 +107,13 @@ impl GmailClient {
 
     pub fn extract_text_bodies(message: &Message) -> String {
         fn walk(part: &MessagePart, out: &mut String) {
-            if let Some(body) = &part.body {
-                if let Some(data) = &body.data {
-                    if let Some(bytes) = GmailClient::decode_b64url_lenient(data) {
-                        if let Ok(s) = String::from_utf8(bytes) {
-                            out.push_str("\n");
-                            out.push_str(&s);
-                        }
-                    }
-                }
+            if let Some(body) = &part.body
+                && let Some(data) = &body.data
+                && let Some(bytes) = GmailClient::decode_b64url_lenient(data)
+                && let Ok(s) = String::from_utf8(bytes)
+            {
+                out.push('\n');
+                out.push_str(&s);
             }
             if let Some(parts) = &part.parts {
                 for p in parts {
@@ -151,10 +149,10 @@ impl GmailClient {
             if let Some(body) = &part.body {
                 if let Some(data) = &body.data {
                     out.push(TextSource::InlineData(data.clone()));
-                } else if is_text {
-                    if let Some(attachment_id) = &body.attachment_id {
-                        out.push(TextSource::AttachmentId(attachment_id.clone()));
-                    }
+                } else if is_text
+                    && let Some(attachment_id) = &body.attachment_id
+                {
+                    out.push(TextSource::AttachmentId(attachment_id.clone()));
                 }
             }
 
@@ -177,7 +175,7 @@ impl GmailClient {
                     if let Some(bytes) = Self::decode_b64url_lenient(&data) {
                         let s = String::from_utf8_lossy(&bytes);
                         if !s.trim().is_empty() {
-                            out.push_str("\n");
+                            out.push('\n');
                             out.push_str(&s);
                         }
                     }
@@ -191,7 +189,7 @@ impl GmailClient {
                         })?;
                     let s = String::from_utf8_lossy(&bytes);
                     if !s.trim().is_empty() {
-                        out.push_str("\n");
+                        out.push('\n');
                         out.push_str(&s);
                     }
                 }

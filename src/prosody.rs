@@ -221,13 +221,13 @@ fn parse_astats_metadata(stdout: &str) -> Vec<RmsWindow> {
     }
     impl PendingFrame {
         fn flush(&self, out: &mut Vec<RmsWindow>) {
-            if let (Some(pts), Some(rms)) = (self.pts, self.overall.or(self.first_channel)) {
-                if rms.is_finite() {
-                    out.push(RmsWindow {
-                        start_secs: pts.max(0.0),
-                        rms_db: rms,
-                    });
-                }
+            if let (Some(pts), Some(rms)) = (self.pts, self.overall.or(self.first_channel))
+                && rms.is_finite()
+            {
+                out.push(RmsWindow {
+                    start_secs: pts.max(0.0),
+                    rms_db: rms,
+                });
             }
         }
     }
@@ -247,10 +247,10 @@ fn parse_astats_metadata(stdout: &str) -> Vec<RmsWindow> {
             pending.overall = c.get(1).and_then(|m| parse_db(m.as_str()));
             continue;
         }
-        if pending.first_channel.is_none() {
-            if let Some(c) = channel_re.captures(line) {
-                pending.first_channel = c.get(1).and_then(|m| parse_db(m.as_str()));
-            }
+        if pending.first_channel.is_none()
+            && let Some(c) = channel_re.captures(line)
+        {
+            pending.first_channel = c.get(1).and_then(|m| parse_db(m.as_str()));
         }
     }
     pending.flush(&mut out);

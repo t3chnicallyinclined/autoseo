@@ -52,6 +52,7 @@ async fn set_job_status(storage: Option<&Storage>, job_id: Option<&str>, status:
 ///
 /// If the pipeline fails at any stage the job is marked `failed` with the error
 /// message stored in `jobs.error`, so a subsequent poll can retry it.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_clipper_from_drive(
     cfg: &Config,
     google: Option<&GoogleAuth>,
@@ -93,6 +94,7 @@ pub async fn run_clipper_from_drive(
 /// Inner pipeline logic shared between `run_clipper_from_drive` and
 /// `run_clipper_local_once` (the local path doesn't track status yet but
 /// could in the future).
+#[allow(clippy::too_many_arguments)]
 async fn run_clipper_pipeline_inner(
     cfg: &Config,
     google: Option<&GoogleAuth>,

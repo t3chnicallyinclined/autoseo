@@ -35,7 +35,7 @@ impl DriveClient {
             anyhow::bail!("drive metadata failed: {status} {body}");
         }
 
-        Ok(res.json().await.context("parse drive metadata")?)
+        res.json().await.context("parse drive metadata")
     }
 
     pub async fn download_to_path(

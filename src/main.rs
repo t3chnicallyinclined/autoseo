@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod ai_pipeline;
 mod api;
 mod align;
@@ -278,8 +280,8 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .expect("google creds validated above for polling path");
     loop {
-        if mode.produces_seo_emails() {
-            if let Err(e) = run_once(
+        if mode.produces_seo_emails()
+            && let Err(e) = run_once(
                 &cfg,
                 g,
                 &gmail,
@@ -289,13 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 &seo_variant_blocks,
             )
             .await
-            {
-                tracing::error!(error = ?e, "run_once (seo) failed");
-            }
+        {
+            tracing::error!(error = ?e, "run_once (seo) failed");
         }
 
-        if mode.produces_clips() {
-            if let Err(e) = run_clipper_once(
+        if mode.produces_clips()
+            && let Err(e) = run_clipper_once(
                 &cfg,
                 g,
                 &gmail,
@@ -305,9 +306,8 @@ async fn main() -> anyhow::Result<()> {
                 digest_mode,
             )
             .await
-            {
-                tracing::error!(error = ?e, "run_clipper_once failed");
-            }
+        {
+            tracing::error!(error = ?e, "run_clipper_once failed");
         }
 
         if cfg.once {
@@ -363,13 +363,13 @@ async fn run_once(
                 .await
             {
                 file_ids = parse::extract_drive_file_ids(&raw);
-                if file_ids.is_empty() {
-                    if let Some(dump_dir) = &cfg.dump_dir {
-                        let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
-                        dump_failed_message(dump_dir, &message_id, &bodies, &raw, &msg_json)
-                            .await
-                            .ok();
-                    }
+                if file_ids.is_empty()
+                    && let Some(dump_dir) = &cfg.dump_dir
+                {
+                    let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
+                    dump_failed_message(dump_dir, &message_id, &bodies, &raw, &msg_json)
+                        .await
+                        .ok();
                 }
             } else if let Some(dump_dir) = &cfg.dump_dir {
                 let msg_json = serde_json::to_string_pretty(&msg).unwrap_or_default();
@@ -797,13 +797,12 @@ async fn run_clipper_once(
             }
         };
         let mut file_ids = parse::extract_drive_file_ids(&bodies);
-        if file_ids.is_empty() {
-            if let Ok(raw) = gmail
+        if file_ids.is_empty()
+            && let Ok(raw) = gmail
                 .get_message_raw_rfc822(&access_token, &message_id)
                 .await
-            {
-                file_ids = parse::extract_drive_file_ids(&raw);
-            }
+        {
+            file_ids = parse::extract_drive_file_ids(&raw);
         }
         if file_ids.is_empty() {
             tracing::info!(message_id, "clipper: no drive file ids found");

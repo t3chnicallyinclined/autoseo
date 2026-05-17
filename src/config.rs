@@ -538,4 +538,12 @@ pub struct Config {
         default_value = "subject:\"CLIPPER\" label:inbox newer_than:7d"
     )]
     pub veto_gmail_query: String,
+    /// If set, start an HTTP API server on this port to serve rendered media.
+    /// Exposes endpoints for video streaming, thumbnails, and manifests.
+    #[arg(long, env = "API_PORT")]
+    pub api_port: Option<u16>,
+
+    /// Bind address for the API server. Defaults to 0.0.0.0 (all interfaces).
+    #[arg(long, env = "API_BIND", default_value = "0.0.0.0")]
+    pub api_bind: String,
 }

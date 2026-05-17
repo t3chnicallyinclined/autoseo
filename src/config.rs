@@ -546,4 +546,8 @@ pub struct Config {
     /// Bind address for the API server. Defaults to 0.0.0.0 (all interfaces).
     #[arg(long, env = "API_BIND", default_value = "0.0.0.0")]
     pub api_bind: String,
+    /// Port for the WebSocket server that streams live pipeline events.
+    /// Set to 0 to disable the WebSocket server.
+    #[arg(long, env = "WS_PORT", default_value_t = 9823)]
+    pub ws_port: u16,
 }

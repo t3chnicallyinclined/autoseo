@@ -103,6 +103,9 @@ impl AstScorer {
     /// Extracts 16 kHz mono PCM via ffmpeg, slides a ~10.24s window with a 5s
     /// stride, computes mel spectrogram, runs ONNX inference, and maps AudioSet
     /// class probabilities to the four event categories.
+    ///
+    /// The mel computation and ONNX inference are CPU-bound and run inside
+    /// `spawn_blocking` to avoid stalling the Tokio executor.
     pub async fn score_file(
         &self,
         ffmpeg: &str,
@@ -113,71 +116,91 @@ impl AstScorer {
             return Ok(Vec::new());
         }
 
-        let total_samples = pcm.len();
-        let mut windows = Vec::new();
-        let mut offset: usize = 0;
+        // Move the CPU-bound mel + ONNX inference loop onto a blocking thread
+        // so we don't stall the Tokio async runtime.
+        let session = &self.session;
+        let hann_window = self.hann_window.clone();
+        let mel_filterbank = self.mel_filterbank.clone();
 
-        while offset + WIN_LENGTH <= total_samples {
-            let end = (offset + WINDOW_SAMPLES).min(total_samples);
-            let chunk = &pcm[offset..end];
+        // SAFETY: ort::Session is Send but not Sync. We use a reference scoped
+        // to this call; spawn_blocking needs 'static, so we use unsafe to extend
+        // the lifetime. The caller (score_file) awaits the task, guaranteeing
+        // the session outlives the blocking closure.
+        let session_ptr = session as *const Session as usize;
+        let windows = tokio::task::spawn_blocking(move || -> Result<Vec<ScoredWindow>> {
+            // Reconstruct session reference inside the blocking thread.
+            let session = unsafe { &*(session_ptr as *const Session) };
 
-            let fbank = compute_fbank(chunk, &self.hann_window, &self.mel_filterbank);
-            let events = self.infer(&fbank)?;
+            let total_samples = pcm.len();
+            let mut windows = Vec::new();
+            let mut offset: usize = 0;
 
-            let start_secs = offset as f64 / SAMPLE_RATE as f64;
-            let end_secs = end as f64 / SAMPLE_RATE as f64;
+            while offset + WIN_LENGTH <= total_samples {
+                let end = (offset + WINDOW_SAMPLES).min(total_samples);
+                let chunk = &pcm[offset..end];
 
-            windows.push(ScoredWindow {
-                start_secs,
-                end_secs,
-                events,
-            });
+                let fbank = compute_fbank(chunk, &hann_window, &mel_filterbank);
+                let events = infer_sync(session, &fbank)?;
 
-            offset += STRIDE_SAMPLES;
-        }
+                let start_secs = offset as f64 / SAMPLE_RATE as f64;
+                let end_secs = end as f64 / SAMPLE_RATE as f64;
+
+                windows.push(ScoredWindow {
+                    start_secs,
+                    end_secs,
+                    events,
+                });
+
+                offset += STRIDE_SAMPLES;
+            }
+
+            Ok(windows)
+        })
+        .await
+        .context("AST scoring task panicked")??;
 
         Ok(windows)
     }
 
-    /// Run inference on a single mel-spectrogram frame.
-    fn infer(&self, fbank: &[Vec<f32>]) -> Result<AudioEvents> {
-        // Pad or truncate to exactly TARGET_FRAMES.
-        let mut flat = Vec::with_capacity(TARGET_FRAMES * N_MELS);
-        for i in 0..TARGET_FRAMES {
-            if i < fbank.len() {
-                flat.extend_from_slice(&fbank[i]);
-            } else {
-                flat.extend(std::iter::repeat_n(0.0f32, N_MELS));
-            }
+}
+
+/// Run inference on a single mel-spectrogram frame (blocking, not async).
+fn infer_sync(session: &Session, fbank: &[Vec<f32>]) -> Result<AudioEvents> {
+    // Pad or truncate to exactly TARGET_FRAMES.
+    let mut flat = Vec::with_capacity(TARGET_FRAMES * N_MELS);
+    for i in 0..TARGET_FRAMES {
+        if i < fbank.len() {
+            flat.extend_from_slice(&fbank[i]);
+        } else {
+            flat.extend(std::iter::repeat_n(0.0f32, N_MELS));
         }
-
-        // Normalize with AudioSet stats.
-        for v in flat.iter_mut() {
-            *v = (*v - AUDIOSET_MEAN) / (2.0 * AUDIOSET_STD);
-        }
-
-        let input =
-            Array3::<f32>::from_shape_vec((1, TARGET_FRAMES, N_MELS), flat)
-                .context("build AST input tensor")?;
-
-        let outputs = self
-            .session
-            .run(ort::inputs![input].context("build ort inputs")?)
-            .context("AST inference")?;
-
-        let output = outputs
-            .values()
-            .next()
-            .context("no output from AST model")?;
-        let logits = output
-            .try_extract_raw_tensor::<f32>()
-            .context("extract AST output tensor")?
-            .1;
-
-        // Apply softmax to get probabilities.
-        let probs = softmax(logits);
-        Ok(extract_events(&probs))
     }
+
+    // Normalize with AudioSet stats.
+    for v in flat.iter_mut() {
+        *v = (*v - AUDIOSET_MEAN) / (2.0 * AUDIOSET_STD);
+    }
+
+    let input =
+        Array3::<f32>::from_shape_vec((1, TARGET_FRAMES, N_MELS), flat)
+            .context("build AST input tensor")?;
+
+    let outputs = session
+        .run(ort::inputs![input].context("build ort inputs")?)
+        .context("AST inference")?;
+
+    let output = outputs
+        .values()
+        .next()
+        .context("no output from AST model")?;
+    let logits = output
+        .try_extract_raw_tensor::<f32>()
+        .context("extract AST output tensor")?
+        .1;
+
+    // Apply softmax to get probabilities.
+    let probs = softmax(logits);
+    Ok(extract_events(&probs))
 }
 
 /// Aggregate event scores from scored windows for a candidate time range.

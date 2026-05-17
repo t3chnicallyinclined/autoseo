@@ -264,6 +264,19 @@ pub struct Config {
     #[arg(long, env = "VLM_PREMIUM_BLEND_WEIGHT", default_value_t = 0.6)]
     pub vlm_premium_blend_weight: f64,
 
+    /// VAD backend: "silero" (Silero VAD ONNX, default) or "ffmpeg" (silencedetect fallback).
+    /// If silero is selected but the model file is missing, falls back to ffmpeg automatically.
+    #[arg(long, env = "VAD_BACKEND", default_value = "silero")]
+    pub vad_backend: String,
+
+    /// Path to silero_vad.onnx model file. Downloaded automatically if missing.
+    #[arg(long, env = "VAD_MODEL_PATH", default_value = "./models/silero_vad.onnx")]
+    pub vad_model_path: String,
+
+    /// Silero VAD speech probability threshold (0.0–1.0). Frames above this are speech.
+    #[arg(long, env = "VAD_THRESHOLD", default_value_t = 0.5)]
+    pub vad_threshold: f64,
+
     /// If set, writes debug dumps (raw RFC822 + extracted URLs) for messages we can't parse.
     #[arg(long, env = "DUMP_DIR")]
     pub dump_dir: Option<String>,

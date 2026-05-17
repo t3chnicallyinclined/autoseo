@@ -172,6 +172,8 @@ dependencies = [
  "futures-util",
  "hound",
  "indicatif",
+ "ndarray",
+ "ort",
  "percent-encoding",
  "rand 0.8.5",
  "regex",

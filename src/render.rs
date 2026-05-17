@@ -78,6 +78,12 @@ impl RenderProfile {
             crf: 23,
         }
     }
+
+    /// Return a copy of this profile with the loudness target overridden.
+    pub fn with_loudness(mut self, lufs: f64) -> Self {
+        self.loudnorm_target_lufs = lufs;
+        self
+    }
 }
 
 /// Render a single clip with cut + center-crop reformat + loudnorm + libx264.
@@ -303,5 +309,22 @@ mod tests {
             .expect_err("expected error on zero duration");
         let msg = format!("{err:?}");
         assert!(msg.contains("end") && msg.contains("after"));
+    }
+
+    #[test]
+    fn with_loudness_overrides_lufs_target() {
+        let p = RenderProfile::shorts_vertical().with_loudness(-18.5);
+        assert!((p.loudnorm_target_lufs - -18.5).abs() < 0.01);
+        // Other fields should be unchanged.
+        assert_eq!(p.width, 1080);
+        assert_eq!(p.height, 1920);
+        assert_eq!(p.crf, 23);
+    }
+
+    #[test]
+    fn with_loudness_applies_to_audio_filter() {
+        let p = RenderProfile::tiktok_vertical().with_loudness(-12.0);
+        let af = build_audio_filter(&p);
+        assert!(af.contains("I=-12"), "expected I=-12 in filter, got: {af}");
     }
 }

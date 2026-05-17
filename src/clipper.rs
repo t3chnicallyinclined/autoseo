@@ -29,7 +29,7 @@ use crate::render::{self, RenderProfile};
 use crate::platforms::{self, PostResult, PostStatus};
 use crate::posting;
 use crate::scene;
-use crate::show_config::DigestMode;
+use crate::show_config::{self, DigestMode};
 use crate::social_copy::{SocialCopy, SocialCopyGenerator};
 use crate::storage::{JobStatus, Storage};
 use crate::vad;
@@ -739,6 +739,49 @@ async fn run_clipper_inner(
         .await
         .ok();
 
+    // Resolve per-show loudness target: look up stored LUFS for this show,
+    // or measure the source and persist the result for future episodes.
+    let show_slug = show_context
+        .as_ref()
+        .and_then(|ctx| ctx.show_name.as_deref())
+        .map(show_config::slugify);
+
+    let per_show_lufs: Option<f64> = if cfg.loudness_per_show {
+        match (&show_slug, storage) {
+            (Some(slug), Some(db)) => {
+                match db.get_show_loudness(slug).await {
+                    Ok(Some(lufs)) => {
+                        tracing::info!(show = %slug, lufs, "using stored per-show loudness");
+                        Some(lufs)
+                    }
+                    Ok(None) => {
+                        // First episode: measure and store.
+                        match media::measure_loudness(&cfg.ffmpeg, &audio_path).await {
+                            Ok(lufs) => {
+                                tracing::info!(show = %slug, lufs, "measured and storing per-show loudness");
+                                if let Err(e) = db.set_show_loudness(slug, lufs).await {
+                                    tracing::warn!(error = ?e, "failed to store show loudness");
+                                }
+                                Some(lufs)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "loudness measurement failed; using platform defaults");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "show loudness lookup failed; using platform defaults");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let cand_gen = CandidateGenerator::new();
     let mut candidates =
         cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
@@ -1014,7 +1057,10 @@ async fn run_clipper_inner(
             let ass_path =
                 clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
-            let profile = (spec.profile)();
+            let profile = match per_show_lufs {
+                Some(lufs) => (spec.profile)().with_loudness(lufs),
+                None => (spec.profile)(),
+            };
             let style = (spec.style)();
 
             if let Err(e) =

@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS trends (
 CREATE INDEX IF NOT EXISTS idx_trends_recent ON trends(source, fetched_at DESC);
 "#;
 
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS show_loudness (
+    show_slug       TEXT PRIMARY KEY,
+    integrated_lufs REAL NOT NULL,
+    measured_at     INTEGER NOT NULL,
+    episode_count   INTEGER NOT NULL DEFAULT 1
+);
+"#;
+
 impl Storage {
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -236,6 +245,61 @@ impl Storage {
         })
         .await
         .context("join mark_processed")??;
+        Ok(())
+    }
+
+    /// Get the stored integrated loudness (LUFS) for a show slug.
+    /// Returns `None` if no loudness has been stored yet.
+    pub async fn get_show_loudness(&self, show_slug: &str) -> anyhow::Result<Option<f64>> {
+        let conn = self.conn.clone();
+        let slug = show_slug.to_string();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<f64>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT integrated_lufs FROM show_loudness WHERE show_slug = ?1")
+                .context("prepare get_show_loudness")?;
+            let mut rows = stmt
+                .query_map([&slug], |r| r.get::<_, f64>(0))
+                .context("query get_show_loudness")?;
+            match rows.next() {
+                Some(Ok(lufs)) => Ok(Some(lufs)),
+                Some(Err(e)) => Err(e.into()),
+                None => Ok(None),
+            }
+        })
+        .await
+        .context("join get_show_loudness")??;
+        Ok(result)
+    }
+
+    /// Store or update the integrated loudness (LUFS) for a show slug.
+    /// On first call, inserts with episode_count=1. On subsequent calls,
+    /// updates with a running average and increments episode_count.
+    pub async fn set_show_loudness(
+        &self,
+        show_slug: &str,
+        integrated_lufs: f64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let slug = show_slug.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO show_loudness (show_slug, integrated_lufs, measured_at, episode_count) \
+                 VALUES (?1, ?2, ?3, 1) \
+                 ON CONFLICT(show_slug) DO UPDATE SET \
+                   integrated_lufs = (show_loudness.integrated_lufs * show_loudness.episode_count + excluded.integrated_lufs) \
+                     / (show_loudness.episode_count + 1), \
+                   episode_count = show_loudness.episode_count + 1, \
+                   measured_at = excluded.measured_at",
+                rusqlite::params![slug, integrated_lufs, now],
+            )
+            .context("upsert show_loudness")?;
+            Ok(())
+        })
+        .await
+        .context("join set_show_loudness")??;
         Ok(())
     }
 
@@ -536,6 +600,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.pragma_update(None, "user_version", 2)
             .context("set user_version=2")?;
     }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3).context("apply schema v3")?;
+        conn.pragma_update(None, "user_version", 3)
+            .context("set user_version=3")?;
+    }
     Ok(())
 }
 
@@ -610,6 +679,31 @@ mod tests {
             .import_legacy_dedupe(dir.path().join("missing.txt"))
             .await?;
         assert_eq!(imported, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_loudness_roundtrip() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let storage = Storage::open(&db_path).await?;
+
+        // No loudness stored yet.
+        assert_eq!(storage.get_show_loudness("tfatk").await?, None);
+
+        // Store first measurement.
+        storage.set_show_loudness("tfatk", -16.5).await?;
+        let lufs = storage.get_show_loudness("tfatk").await?;
+        assert!((lufs.unwrap() - -16.5).abs() < 0.01, "got {:?}", lufs);
+
+        // Second measurement updates with running average: (-16.5 + -14.5) / 2 = -15.5
+        storage.set_show_loudness("tfatk", -14.5).await?;
+        let lufs = storage.get_show_loudness("tfatk").await?;
+        assert!((lufs.unwrap() - -15.5).abs() < 0.01, "got {:?}", lufs);
+
+        // Different show is independent.
+        assert_eq!(storage.get_show_loudness("other_show").await?, None);
+
         Ok(())
     }
 
@@ -753,6 +847,23 @@ mod tests {
         let storage = Storage::open(dir.path().join("test.db")).await?;
         let job = storage.get_job("nope").await?;
         assert!(job.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_loudness_survives_reopen() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("test.db");
+
+        {
+            let storage = Storage::open(&db_path).await?;
+            storage.set_show_loudness("myshow", -18.0).await?;
+        }
+
+        // Reopen and verify persistence.
+        let storage2 = Storage::open(&db_path).await?;
+        let lufs = storage2.get_show_loudness("myshow").await?;
+        assert!((lufs.unwrap() - -18.0).abs() < 0.01);
         Ok(())
     }
 }

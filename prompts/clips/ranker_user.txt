@@ -10,8 +10,11 @@ candidate has:
 - prosody: rms_peak_db / rms_mean_db / speaking_rate_wps
 - novelty: 0..1, higher = unusual topic content relative to the episode mean
 
+{{current_trends}}
+
 Score each candidate. Return JSON exactly matching the schema in the system
-prompt — one clip entry per input candidate, indices preserved.
+prompt — one clip entry per input candidate, indices preserved. If a candidate
+aligns with a current trend, note that in the trend_match field.
 
 CANDIDATES:
 {{candidates_json}}

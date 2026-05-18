@@ -24,6 +24,7 @@ pub struct RankedClip {
     pub score: i32,
     pub hook: String,
     pub reasoning: String,
+    pub trend_match: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,7 @@ impl Ranker {
         candidates: &[CandidateWindow],
         top_k: usize,
         show_context: Option<&ShowContext>,
+        current_trends: Option<&str>,
     ) -> Result<Vec<RankedClip>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -76,7 +78,7 @@ impl Ranker {
             let batch_start_index = batch_idx * batch_size;
             let batch_json = serialize_batch(batch, batch_start_index);
 
-            let user = self.build_user_prompt(&batch_json, show_context);
+            let user = self.build_user_prompt(&batch_json, show_context, current_trends);
 
             let raw = self
                 .openai
@@ -108,6 +110,7 @@ impl Ranker {
                     score: clip.score.clamp(0, 100),
                     hook: clip.hook.trim().to_string(),
                     reasoning: clip.reasoning.trim().to_string(),
+                    trend_match: clip.trend_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
                 });
             }
         }
@@ -121,6 +124,7 @@ impl Ranker {
         &self,
         candidates_json: &str,
         show_context: Option<&ShowContext>,
+        current_trends: Option<&str>,
     ) -> String {
         let mut out = self
             .user_prompt_template
@@ -134,11 +138,18 @@ impl Ranker {
             ),
             None => (String::new(), String::new(), String::new()),
         };
+        let trends_block = match current_trends {
+            Some(t) if !t.is_empty() => format!(
+                "CURRENT TRENDS (boost candidates that align with these topics):\n{t}"
+            ),
+            _ => String::new(),
+        };
         out = out
             .replace("{{show_name}}", &show_name)
             .replace("{{hosts}}", &hosts)
             .replace("{{guest}}", &guest)
-            .replace("{{performance_history}}", &self.performance_history);
+            .replace("{{performance_history}}", &self.performance_history)
+            .replace("{{current_trends}}", &trends_block);
         out
     }
 
@@ -251,6 +262,8 @@ struct RankerClip {
     refined_end_secs: f64,
     #[serde(default)]
     reasoning: String,
+    #[serde(default)]
+    trend_match: Option<String>,
 }
 
 #[cfg(test)]
@@ -329,22 +342,42 @@ mod tests {
             guest: Some("Joe".into()),
             evidence: vec![],
         };
-        let out = r.build_user_prompt("[]", Some(&ctx));
+        let out = r.build_user_prompt("[]", Some(&ctx), None);
         assert!(out.contains("show=TFATK"));
         assert!(out.contains("hosts=Brendan, Bryan"));
         assert!(out.contains("guest=Joe"));
         assert!(out.contains("CANDS:\n[]"));
 
-        let out_no_ctx = r.build_user_prompt("[]", None);
+        let out_no_ctx = r.build_user_prompt("[]", None, None);
         assert!(out_no_ctx.contains("show="));
         assert!(!out_no_ctx.contains("{{show_name}}"));
+    }
+
+    #[test]
+    fn build_user_prompt_injects_trends() {
+        let openai = OpenAiClient::new("https://example.com".into(), "x".into());
+        let r = Ranker::new(
+            openai,
+            "model".into(),
+            "sys".into(),
+            "{{current_trends}}\nCANDS:\n{{candidates_json}}".into(),
+        );
+        let out = r.build_user_prompt("[]", None, Some("- AI safety\n- Rust lang"));
+        assert!(out.contains("CURRENT TRENDS"));
+        assert!(out.contains("AI safety"));
+        assert!(out.contains("Rust lang"));
+
+        // Empty trends → placeholder removed cleanly.
+        let out_empty = r.build_user_prompt("[]", None, None);
+        assert!(!out_empty.contains("CURRENT TRENDS"));
+        assert!(!out_empty.contains("{{current_trends}}"));
     }
 
     #[test]
     fn parses_ranker_response() {
         let body = r#"{
           "clips": [
-            {"index": 0, "score": 85, "hook": "the punchline", "refined_start_secs": 12.5, "refined_end_secs": 71.0, "reasoning": "strong claim + payoff"},
+            {"index": 0, "score": 85, "hook": "the punchline", "refined_start_secs": 12.5, "refined_end_secs": 71.0, "reasoning": "strong claim + payoff", "trend_match": "AI safety"},
             {"index": 1, "score": 40, "hook": "filler", "refined_start_secs": 60.0, "refined_end_secs": 120.0, "reasoning": "long setup no payoff"}
           ]
         }"#;
@@ -352,5 +385,7 @@ mod tests {
         assert_eq!(parsed.clips.len(), 2);
         assert_eq!(parsed.clips[0].score, 85);
         assert_eq!(parsed.clips[0].hook, "the punchline");
+        assert_eq!(parsed.clips[0].trend_match.as_deref(), Some("AI safety"));
+        assert!(parsed.clips[1].trend_match.is_none());
     }
 }

@@ -34,7 +34,7 @@ use crate::posting;
 use crate::scene;
 use crate::show_config::{self, DigestMode};
 use crate::social_copy::{HookSource, SocialCopy, SocialCopyGenerator, resolve_hook};
-use crate::storage::{JobStatus, Storage};
+use crate::storage::{JobStatus, Storage, TrendRow};
 use crate::vad;
 use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
 
@@ -319,6 +319,22 @@ async fn run_clipper_pipeline_inner(
         ranker.performance_history = history;
     }
 
+    // Fetch current trends for ranker prompt augmentation.
+    let show_slug_str = show_context
+        .as_ref()
+        .and_then(|ctx| ctx.show_name.as_deref())
+        .map(show_config::slugify);
+    let trends_text = build_trends_text(
+        storage,
+        cfg.ranker_trends_top_n,
+        show_slug_str.as_deref(),
+        &cfg.shows_dir,
+    )
+    .await;
+    if trends_text.is_some() {
+        tracing::info!("clipper: injecting current_trends into ranker prompt");
+    }
+
     let final_top_k = cfg.clip_top_k.max(1);
     let llm_top_k = if cfg.vlm_rerank_enabled {
         cfg.vlm_rerank_top_k.max(final_top_k)
@@ -326,7 +342,7 @@ async fn run_clipper_pipeline_inner(
         final_top_k
     };
     let ranked = ranker
-        .rank(&candidates, llm_top_k, show_context.as_ref())
+        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
         .await
         .context("LLM rank")?;
     tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
@@ -345,7 +361,7 @@ async fn run_clipper_pipeline_inner(
                 Err(e) => {
                     tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
                         .await
                         .context("LLM rank (refetch after VLM failure)")?
                 }
@@ -967,6 +983,17 @@ async fn run_clipper_inner(
         }
     }
 
+    // Fetch current trends for ranker prompt augmentation.
+    let trends_text = if let Some(st) = storage {
+        let slug = show_slug.as_deref();
+        build_trends_text(st, cfg.ranker_trends_top_n, slug, &cfg.shows_dir).await
+    } else {
+        None
+    };
+    if trends_text.is_some() {
+        tracing::info!("clipper: injecting current_trends into ranker prompt");
+    }
+
     let final_top_k = cfg.clip_top_k.max(1);
     // If VLM re-rank is on, pass a wider top-K through the LLM ranker so the
     // VLM has more to choose from before final truncation.
@@ -976,7 +1003,7 @@ async fn run_clipper_inner(
         final_top_k
     };
     let ranked = ranker
-        .rank(&candidates, llm_top_k, show_context.as_ref())
+        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
         .await
         .context("LLM rank")?;
     tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
@@ -1004,6 +1031,7 @@ async fn run_clipper_inner(
                     Some(clip.score as f64),
                     Some(&clip.hook),
                     Some(&clip.reasoning),
+                    clip.trend_match.as_deref(),
                 )
                 .await
             {
@@ -1033,7 +1061,7 @@ async fn run_clipper_inner(
                     tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
                     // re-fetch from ranker since we moved it; just re-do the call cheaply
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
                         .await
                         .context("LLM rank (refetch after VLM failure)")?
                 }
@@ -1063,7 +1091,7 @@ async fn run_clipper_inner(
                     tracing::warn!(error = ?e, "premium VLM re-rank failed; keeping standard order");
                     // Re-fetch needed since we moved ranked into the call.
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref())
+                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
                         .await
                         .context("LLM rank (refetch after premium VLM failure)")?
                 }
@@ -1900,6 +1928,61 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Build the current_trends text block for the ranker prompt.
+/// Combines platform trends from the DB with optional per-show topic priors.
+/// Returns `None` if both sources are empty.
+async fn build_trends_text(
+    storage: &Storage,
+    top_n: usize,
+    show_slug: Option<&str>,
+    shows_dir: &str,
+) -> Option<String> {
+    let mut lines = Vec::new();
+
+    // Fetch platform trends from DB.
+    match storage.get_recent_trends(top_n).await {
+        Ok(trends) => {
+            for t in &trends {
+                let label = t.label.as_deref().unwrap_or(&t.topic_id);
+                let score_tag = t
+                    .score
+                    .map(|s| format!(" (score: {s:.0})"))
+                    .unwrap_or_default();
+                lines.push(format!("- {label}{score_tag} [{source}]", source = t.source));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to fetch trends; proceeding without them");
+        }
+    }
+
+    // Load per-show topic priors if available.
+    if let Some(slug) = show_slug.filter(|s| !s.is_empty()) {
+        let path = std::path::PathBuf::from(shows_dir)
+            .join(slug)
+            .join("context_sources.txt");
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                lines.push(String::new()); // blank separator
+                lines.push("Show topic priors:".to_string());
+                for line in trimmed.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        lines.push(format!("- {line}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn is_video_extension(name_lower: &str) -> bool {
     name_lower.ends_with(".mp4")
         || name_lower.ends_with(".mov")
@@ -1972,6 +2055,7 @@ mod tests {
                 score,
                 hook: hook.to_string(),
                 reasoning: "test".to_string(),
+                trend_match: None,
             },
             social: None,
             variants: vec![RenderedVariant {

@@ -577,10 +577,152 @@ impl Storage {
         .context("join insert_post")??;
         Ok(())
     }
+
+    /// Insert an analytics row. Uses INSERT OR REPLACE keyed on (clip_id, platform, fetched_at).
+    pub async fn insert_analytics(&self, row: &AnalyticsRow) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO analytics \
+                 (clip_id, platform, fetched_at, views, ctr, watch_pct, likes, reposts, replies) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    row.clip_id, row.platform, row.fetched_at,
+                    row.views, row.ctr, row.watch_pct,
+                    row.likes, row.reposts, row.replies,
+                ],
+            )
+            .context("insert_analytics")?;
+            Ok(())
+        })
+        .await
+        .context("join insert_analytics")??;
+        Ok(())
+    }
+
+    /// Find posts that are due for analytics fetching.
+    /// Returns posts where `posted_at` is approximately `target_age_secs` ago
+    /// (within a ±window), and no analytics row exists yet for that age bucket.
+    pub async fn posts_due_for_analytics(
+        &self,
+        target_age_secs: i64,
+        window_secs: i64,
+    ) -> anyhow::Result<Vec<PostRow>> {
+        let conn = self.conn.clone();
+        let now = unix_now();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<PostRow>> {
+            let conn = conn.blocking_lock();
+            let min_posted = now - target_age_secs - window_secs;
+            let max_posted = now - target_age_secs + window_secs;
+            // Select posts that were posted in the target window and don't yet
+            // have an analytics row fetched within ±window of the target age.
+            let mut stmt = conn.prepare(
+                "SELECT p.clip_id, p.platform, p.status, p.external_id, p.external_url, p.posted_at, p.error \
+                 FROM posts p \
+                 WHERE p.status = 'posted' \
+                   AND p.posted_at IS NOT NULL \
+                   AND p.posted_at BETWEEN ?1 AND ?2 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM analytics a \
+                       WHERE a.clip_id = p.clip_id \
+                         AND a.platform = p.platform \
+                         AND a.fetched_at BETWEEN (p.posted_at + ?3 - ?4) AND (p.posted_at + ?3 + ?4) \
+                   )"
+            ).context("prepare posts_due_for_analytics")?;
+            let rows = stmt.query_map(
+                rusqlite::params![min_posted, max_posted, target_age_secs, window_secs],
+                |r| {
+                    Ok(PostRow {
+                        clip_id: r.get(0)?,
+                        platform: r.get(1)?,
+                        status: r.get(2)?,
+                        external_id: r.get(3)?,
+                        external_url: r.get(4)?,
+                        posted_at: r.get(5)?,
+                        error: r.get(6)?,
+                    })
+                },
+            )
+            .context("query posts_due_for_analytics")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("collect posts_due_for_analytics")?;
+            Ok(rows)
+        })
+        .await
+        .context("join posts_due_for_analytics")??;
+        Ok(rows)
+    }
+
+    /// Get all analytics rows for a clip, ordered by fetched_at.
+    pub async fn get_analytics_for_clip(&self, clip_id: &str) -> anyhow::Result<Vec<AnalyticsRow>> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AnalyticsRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT clip_id, platform, fetched_at, views, ctr, watch_pct, likes, reposts, replies \
+                 FROM analytics WHERE clip_id = ?1 ORDER BY fetched_at"
+            ).context("prepare get_analytics_for_clip")?;
+            let rows = stmt.query_map([&clip_id], |r| {
+                Ok(AnalyticsRow {
+                    clip_id: r.get(0)?,
+                    platform: r.get(1)?,
+                    fetched_at: r.get(2)?,
+                    views: r.get(3)?,
+                    ctr: r.get(4)?,
+                    watch_pct: r.get(5)?,
+                    likes: r.get(6)?,
+                    reposts: r.get(7)?,
+                    replies: r.get(8)?,
+                })
+            })
+            .context("query get_analytics_for_clip")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("collect get_analytics_for_clip")?;
+            Ok(rows)
+        })
+        .await
+        .context("join get_analytics_for_clip")??;
+        Ok(rows)
+    }
+}
+
+/// A row from the `posts` table.
+#[derive(Debug, Clone)]
+pub struct PostRow {
+    pub clip_id: String,
+    pub platform: String,
+    pub status: String,
+    pub external_id: Option<String>,
+    pub external_url: Option<String>,
+    pub posted_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// A row from the `analytics` table.
+#[derive(Debug, Clone)]
+pub struct AnalyticsRow {
+    pub clip_id: String,
+    pub platform: String,
+    pub fetched_at: i64,
+    pub views: Option<i64>,
+    pub ctr: Option<f64>,
+    pub watch_pct: Option<f64>,
+    pub likes: Option<i64>,
+    pub reposts: Option<i64>,
+    pub replies: Option<i64>,
 }
 
 const SCHEMA_V2: &str = r#"
 ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const SCHEMA_V4: &str = r#"
+ALTER TABLE analytics ADD COLUMN likes INTEGER;
+ALTER TABLE analytics ADD COLUMN reposts INTEGER;
+ALTER TABLE analytics ADD COLUMN replies INTEGER;
 "#;
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -604,6 +746,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA_V3).context("apply schema v3")?;
         conn.pragma_update(None, "user_version", 3)
             .context("set user_version=3")?;
+    }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4).context("apply schema v4")?;
+        conn.pragma_update(None, "user_version", 4)
+            .context("set user_version=4")?;
     }
     Ok(())
 }

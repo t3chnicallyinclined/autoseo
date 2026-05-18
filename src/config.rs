@@ -595,6 +595,10 @@ pub struct Config {
     /// How often to refresh Google Trends, in seconds. Default 86400 (daily).
     #[arg(long, env = "GOOGLE_TRENDS_REFRESH_SECS", default_value_t = 86400)]
     pub google_trends_refresh_secs: u64,
+
+    /// Maximum number of trending topics to inject into the ranker prompt.
+    #[arg(long, env = "RANKER_TRENDS_TOP_N", default_value_t = 10)]
+    pub ranker_trends_top_n: usize,
     /// Enable veto-via-Gmail-reply polling. When true, the system polls for
     /// replies to digest emails containing `veto: clip_XX` directives and
     /// removes/unlists the matching posts on each platform.

@@ -651,6 +651,7 @@ mod tests {
             score,
             hook: "test hook".to_string(),
             reasoning: "test reason".to_string(),
+            trend_match: None,
         }
     }
 

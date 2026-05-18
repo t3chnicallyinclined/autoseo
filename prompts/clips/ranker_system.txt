@@ -21,6 +21,10 @@ SCORING HEURISTICS
 - High score: clear hook + payoff inside the window; strong reactions;
   declarative claims that stand alone; back-and-forth conflict; surprising
   confession; quotable single sentence.
+- Trend boost: if the candidate's topic aligns with a current trend (listed
+  in the user message), bump the score by up to +10 and note the matching
+  trend in trend_match. Trends are optional context — if none are listed,
+  ignore this heuristic.
 - Mid score: interesting content but the payoff is partial or the setup is
   long; topic shift with promise but no resolution yet.
 - Low score: filler, transitional banter, monologue without a punch,
@@ -35,7 +39,8 @@ OUTPUT JSON SHAPE
       "hook": "<one short sentence stating the clip's payoff>",
       "refined_start_secs": <float>,
       "refined_end_secs": <float>,
-      "reasoning": "<one sentence why this scored where it did>"
+      "reasoning": "<one sentence why this scored where it did>",
+      "trend_match": "<optional: name of matching trend, or omit if none>"
     },
     ...
   ]

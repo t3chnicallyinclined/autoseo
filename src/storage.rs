@@ -76,6 +76,16 @@ pub struct JobRow {
     pub updated_at: i64,
 }
 
+/// A row from the `trends` table.
+#[derive(Debug, Clone)]
+pub struct TrendRow {
+    pub source: String,
+    pub topic_id: String,
+    pub label: Option<String>,
+    pub score: Option<f64>,
+    pub fetched_at: i64,
+}
+
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
     id              TEXT PRIMARY KEY,
@@ -567,19 +577,21 @@ impl Storage {
         score: Option<f64>,
         hook: Option<&str>,
         reasoning_json: Option<&str>,
+        trend_match: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let clip_id = clip_id.to_string();
         let job_id = job_id.to_string();
         let hook = hook.map(str::to_string);
         let reasoning_json = reasoning_json.map(str::to_string);
+        let trend_match = trend_match.map(str::to_string);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.blocking_lock();
             conn.execute(
                 "INSERT OR REPLACE INTO clips \
-                 (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![clip_id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json],
+                 (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![clip_id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match],
             )
             .context("insert_clip")?;
             Ok(())
@@ -968,6 +980,43 @@ impl Storage {
         .await
         .context("join bulk_update_clip_status")??;
         Ok(count)
+    }
+
+    /// Fetch the top-N trending topics, ordered by score descending.
+    /// Only returns the most recent fetch per (source, topic_id) pair.
+    /// Returns an empty vec if the trends table is empty.
+    pub async fn get_recent_trends(&self, top_n: usize) -> anyhow::Result<Vec<TrendRow>> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<TrendRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source, topic_id, label, score, fetched_at \
+                     FROM trends t1 \
+                     WHERE fetched_at = (SELECT MAX(t2.fetched_at) FROM trends t2 \
+                                         WHERE t2.source = t1.source AND t2.topic_id = t1.topic_id) \
+                     ORDER BY score DESC \
+                     LIMIT ?1",
+                )
+                .context("prepare get_recent_trends")?;
+            let rows = stmt
+                .query_map([top_n as i64], |r| {
+                    Ok(TrendRow {
+                        source: r.get(0)?,
+                        topic_id: r.get(1)?,
+                        label: r.get(2)?,
+                        score: r.get(3)?,
+                        fetched_at: r.get(4)?,
+                    })
+                })
+                .context("query get_recent_trends")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect get_recent_trends")?;
+            Ok(rows)
+        })
+        .await
+        .context("join get_recent_trends")??;
+        Ok(rows)
     }
 
     /// Insert a post row. Idempotent (INSERT OR REPLACE).
@@ -1372,7 +1421,7 @@ mod tests {
         storage.create_job("j1", None, None, None).await?;
 
         // Insert a clip.
-        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}")).await?;
+        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), None).await?;
 
         // Insert a render variant.
         storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
@@ -1381,7 +1430,7 @@ mod tests {
         storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), Some("https://yt.be/abc"), Some(1700000000), None).await?;
 
         // Idempotent re-insert should not error.
-        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}")).await?;
+        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), None).await?;
         storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
         storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), None, None, None).await?;
 
@@ -1437,6 +1486,70 @@ mod tests {
         let storage2 = Storage::open(&db_path).await?;
         let lufs = storage2.get_show_loudness("myshow").await?;
         assert!((lufs.unwrap() - -18.0).abs() < 0.01);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_recent_trends_returns_empty_when_no_trends() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+        let trends = storage.get_recent_trends(10).await?;
+        assert!(trends.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_recent_trends_returns_top_n_by_score() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        // Insert some trends directly.
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute(
+                "INSERT INTO trends (source, topic_id, label, score, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["google", "t1", "AI Safety", 90.0, 1000],
+            )?;
+            conn.execute(
+                "INSERT INTO trends (source, topic_id, label, score, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["google", "t2", "Rust Language", 70.0, 1000],
+            )?;
+            conn.execute(
+                "INSERT INTO trends (source, topic_id, label, score, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["google", "t3", "Climate Change", 50.0, 1000],
+            )?;
+        }
+
+        let trends = storage.get_recent_trends(2).await?;
+        assert_eq!(trends.len(), 2);
+        assert_eq!(trends[0].label.as_deref(), Some("AI Safety"));
+        assert_eq!(trends[1].label.as_deref(), Some("Rust Language"));
+
+        // top_n=0 returns nothing.
+        let trends_zero = storage.get_recent_trends(0).await?;
+        assert!(trends_zero.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_clip_with_trend_match() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+        storage.create_job("j1", None, None, None).await?;
+
+        // Insert a clip with trend_match.
+        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), Some("AI Safety")).await?;
+
+        // Verify trend_match was stored.
+        let conn = storage.conn.lock().await;
+        let tm: Option<String> = conn.query_row(
+            "SELECT trend_match FROM clips WHERE id = 'c1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(tm.as_deref(), Some("AI Safety"));
+
         Ok(())
     }
 }

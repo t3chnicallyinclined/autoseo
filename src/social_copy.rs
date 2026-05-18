@@ -282,6 +282,7 @@ mod tests {
             score: 78,
             hook: "He says the old defense is hopeless.".to_string(),
             reasoning: "Big reaction; clean payoff.".to_string(),
+            trend_match: None,
         }
     }
 

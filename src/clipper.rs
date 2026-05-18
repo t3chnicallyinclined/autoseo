@@ -20,6 +20,7 @@ use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionStyle, OverlayStyle};
 use crate::config::Config;
 use crate::embed::Embedder;
+use crate::enhance;
 use crate::gmail::GmailClient;
 use crate::google_auth::GoogleAuth;
 use crate::media;
@@ -133,6 +134,29 @@ async fn run_clipper_pipeline_inner(
         media::extract_audio_m4a(&cfg.ffmpeg, input_path, &audio_path).await?;
     }
 
+    // Optional speech enhancement (DeepFilterNet3).
+    // When enabled, produces an enhanced 48kHz WAV and transcodes it to m4a
+    // for the STT chunking path. The enhanced WAV is also available for
+    // render-side audio replacement.
+    let enhanced_wav = enhance::maybe_enhance(
+        &cfg.ffmpeg,
+        input_path,
+        &job_dir,
+        &cfg.enhance_model_path,
+        cfg.enhance_audio,
+    )
+    .await;
+
+    let stt_audio_path = if let Some(ref enh_wav) = enhanced_wav {
+        let enh_m4a = job_dir.join("audio_enhanced.m4a");
+        if !enh_m4a.exists() {
+            media::transcode_audio_to_m4a(&cfg.ffmpeg, enh_wav, &enh_m4a).await?;
+        }
+        enh_m4a
+    } else {
+        audio_path.clone()
+    };
+
     let total_duration_secs = media::duration_secs(&cfg.ffprobe, &audio_path)
         .await
         .context("ffprobe duration")?;
@@ -140,12 +164,13 @@ async fn run_clipper_pipeline_inner(
     tracing::info!(
         total_secs = total_duration_secs,
         chunk_secs,
+        enhanced = enhanced_wav.is_some(),
         "clipper: chunk sizing"
     );
 
     let chunks_dir = job_dir.join("audio_chunks");
     let chunk_paths =
-        media::segment_audio(&cfg.ffmpeg, &audio_path, &chunks_dir, chunk_secs).await?;
+        media::segment_audio(&cfg.ffmpeg, &stt_audio_path, &chunks_dir, chunk_secs).await?;
     if chunk_paths.is_empty() {
         anyhow::bail!("no audio chunks produced");
     }
@@ -462,9 +487,11 @@ async fn run_clipper_pipeline_inner(
                 layers.push(overlay_ass_path.as_ref());
             }
 
-            let res = render::render_clip(
+            let enh_audio_ref = enhanced_wav.as_deref();
+            let res = render::render_clip_with_audio(
                 &cfg.ffmpeg,
                 input_path,
+                enh_audio_ref,
                 clip.start_secs,
                 clip.end_secs,
                 &out_path,
@@ -670,6 +697,26 @@ async fn run_clipper_inner(
         media::extract_audio_m4a(&cfg.ffmpeg, &input_path, &audio_path).await?;
     }
 
+    // Optional speech enhancement (DeepFilterNet3).
+    let enhanced_wav = enhance::maybe_enhance(
+        &cfg.ffmpeg,
+        &input_path,
+        &job_dir,
+        &cfg.enhance_model_path,
+        cfg.enhance_audio,
+    )
+    .await;
+
+    let stt_audio_path = if let Some(ref enh_wav) = enhanced_wav {
+        let enh_m4a = job_dir.join("audio_enhanced.m4a");
+        if !enh_m4a.exists() {
+            media::transcode_audio_to_m4a(&cfg.ffmpeg, enh_wav, &enh_m4a).await?;
+        }
+        enh_m4a
+    } else {
+        audio_path.clone()
+    };
+
     let total_duration_secs = media::duration_secs(&cfg.ffprobe, &audio_path)
         .await
         .context("ffprobe duration")?;
@@ -677,12 +724,13 @@ async fn run_clipper_inner(
     tracing::info!(
         total_secs = total_duration_secs,
         chunk_secs,
+        enhanced = enhanced_wav.is_some(),
         "clipper: chunk sizing"
     );
 
     let chunks_dir = job_dir.join("audio_chunks");
     let chunk_paths =
-        media::segment_audio(&cfg.ffmpeg, &audio_path, &chunks_dir, chunk_secs).await?;
+        media::segment_audio(&cfg.ffmpeg, &stt_audio_path, &chunks_dir, chunk_secs).await?;
     if chunk_paths.is_empty() {
         anyhow::bail!("no audio chunks produced");
     }
@@ -1178,9 +1226,11 @@ async fn run_clipper_inner(
                 layers.push(overlay_ass_path.as_ref());
             }
 
-            let res = render::render_clip(
+            let enh_audio_ref = enhanced_wav.as_deref();
+            let res = render::render_clip_with_audio(
                 &cfg.ffmpeg,
                 &input_path,
+                enh_audio_ref,
                 clip.start_secs,
                 clip.end_secs,
                 &out_path,

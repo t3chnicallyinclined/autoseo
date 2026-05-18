@@ -502,6 +502,22 @@ pub struct Config {
     #[arg(long, env = "LOUDNESS_PER_SHOW", default_value_t = true)]
     pub loudness_per_show: bool,
 
+    /// Enable DeepFilterNet3 speech enhancement as a pre-processing stage.
+    /// When enabled, extracted audio is denoised before chunking/STT and
+    /// the enhanced audio is used for final clip rendering.
+    /// Requires the `enhance` cargo feature.
+    #[arg(long, env = "ENHANCE_AUDIO", default_value_t = false)]
+    pub enhance_audio: bool,
+
+    /// Path to the DeepFilterNet3 model tar.gz file.
+    /// Downloaded automatically from GitHub releases if missing.
+    #[arg(
+        long,
+        env = "ENHANCE_MODEL_PATH",
+        default_value = "./models/DeepFilterNet3.tar.gz"
+    )]
+    pub enhance_model_path: String,
+
     /// Enable AST (Audio Spectrogram Transformer) audio-event detection.
     /// When enabled, classifies audio windows for laughter, applause, music, and
     /// speech as a tier-2 ranking signal. Requires the ONNX model file.

@@ -34,10 +34,12 @@ whisper-rs = { version = "0.13", optional = true }
 indicatif = "0.17"
 ndarray = "0.16"
 rustfft = "6"
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet.git", tag = "v0.5.6", features = ["tract"], optional = true }
 
 [features]
 default = []
 local-stt = ["whisper-rs"]
+enhance = ["deep_filter"]
 
 [dev-dependencies]
 tempfile = "3"

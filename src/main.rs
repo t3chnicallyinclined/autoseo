@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod active_speaker;
 mod ai_pipeline;
 mod analytics;
 mod api;

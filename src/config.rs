@@ -537,6 +537,39 @@ pub struct Config {
         default_value = "https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593/resolve/main/onnx/model.onnx"
     )]
     pub ast_model_url: String,
+
+    /// Enable SCRFD face detection for active-speaker crop. Requires the ONNX
+    /// model file; auto-downloads on first use if `SCRFD_MODEL_URL` is set.
+    #[arg(long, env = "SCRFD_ENABLED", default_value_t = false)]
+    pub scrfd_enabled: bool,
+
+    /// URL to download the SCRFD ONNX model from on first use.
+    /// The model is saved to `{WORK_DIR}/models/scrfd/scrfd_10g_bnkps.onnx`.
+    #[arg(
+        long,
+        env = "SCRFD_MODEL_URL",
+        default_value = "https://huggingface.co/deepinsight/scrfd_10g_bnkps/resolve/main/onnx/model.onnx"
+    )]
+    pub scrfd_model_url: String,
+
+    /// SCRFD input resolution (square). Larger = more accurate but slower.
+    /// 640 is the standard SCRFD inference size.
+    #[arg(long, env = "SCRFD_INPUT_SIZE", default_value_t = 640)]
+    pub scrfd_input_size: u32,
+
+    /// SCRFD confidence threshold. Detections below this are discarded.
+    #[arg(long, env = "SCRFD_CONF_THRESHOLD", default_value_t = 0.5)]
+    pub scrfd_conf_threshold: f32,
+
+    /// SCRFD NMS IoU threshold. Overlapping boxes above this are suppressed.
+    #[arg(long, env = "SCRFD_NMS_THRESHOLD", default_value_t = 0.4)]
+    pub scrfd_nms_threshold: f32,
+
+    /// IoU threshold for the frame-to-frame face tracker.
+    /// Higher = stricter matching (fewer identity switches but more lost tracks).
+    #[arg(long, env = "SCRFD_TRACKER_IOU", default_value_t = 0.3)]
+    pub scrfd_tracker_iou: f32,
+
     /// Enable the Google Trends poller. When true, fetches daily trending
     /// searches and stores them in the `trends` table for ranker context.
     #[arg(long, env = "GOOGLE_TRENDS_ENABLED", default_value_t = false)]

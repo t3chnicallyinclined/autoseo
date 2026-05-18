@@ -538,14 +538,18 @@ pub struct Config {
         default_value = "subject:\"CLIPPER\" label:inbox newer_than:7d"
     )]
     pub veto_gmail_query: String,
-    /// If set, start an HTTP API server on this port to serve rendered media.
-    /// Exposes endpoints for video streaming, thumbnails, and manifests.
-    #[arg(long, env = "API_PORT")]
-    pub api_port: Option<u16>,
-
     /// Bind address for the API server. Defaults to 0.0.0.0 (all interfaces).
     #[arg(long, env = "API_BIND", default_value = "0.0.0.0")]
     pub api_bind: String,
+
+    /// Path to the built dashboard frontend (dist/ folder). When MODE=server,
+    /// static files from this directory are served at /* as a fallback behind /api/*.
+    #[arg(long, env = "DASHBOARD_DIST", default_value = "./dashboard/dist")]
+    pub dashboard_dist: String,
+
+    /// Open the browser automatically when the server starts.
+    #[arg(long, env = "OPEN_BROWSER", default_value_t = false)]
+    pub open_browser: bool,
     /// Port for the WebSocket server that streams live pipeline events.
     /// Set to 0 to disable the WebSocket server.
     #[arg(long, env = "WS_PORT", default_value_t = 9823)]

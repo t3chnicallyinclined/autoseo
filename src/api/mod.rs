@@ -1,6 +1,8 @@
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, response::Html, routing::get};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::storage::Storage;
 
@@ -9,6 +11,7 @@ use crate::storage::Storage;
 pub struct AppState {
     pub storage: Storage,
     pub work_dir: String,
+    pub dashboard_dist: Option<PathBuf>,
 }
 
 #[derive(serde::Serialize)]
@@ -43,20 +46,67 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
-    Router::new()
-        .route("/api/health", get(health))
+    let dashboard_dist = state.dashboard_dist.clone();
+
+    // API routes nested under /api — unknown /api/* paths still return 404
+    let api_routes = Router::new()
+        .route("/health", get(health));
+
+    let app = Router::new()
+        .nest("/api", api_routes)
         .layer(cors)
-        .with_state(Arc::new(state))
+        .with_state(Arc::new(state));
+
+    // Serve the dashboard frontend from dist/ as a fallback for non-API paths
+    match dashboard_dist {
+        Some(dist_path) if dist_path.is_dir() => {
+            let index_file = dist_path.join("index.html");
+            // SPA fallback: serve index.html for any path not matched by a static file
+            let serve_dir = ServeDir::new(&dist_path)
+                .not_found_service(ServeFile::new(index_file));
+            app.fallback_service(serve_dir)
+        }
+        _ => {
+            app.fallback(dist_not_found)
+        }
+    }
+}
+
+/// Shown when the dashboard dist/ folder doesn't exist.
+async fn dist_not_found() -> Html<&'static str> {
+    Html(r#"<!DOCTYPE html>
+<html>
+<head><title>autoseo - Dashboard Not Built</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px;">
+  <h1>Dashboard not found</h1>
+  <p>The frontend has not been built yet. To build it:</p>
+  <pre style="background: #f4f4f4; padding: 16px; border-radius: 4px;">
+cd dashboard
+npm install
+npm run build</pre>
+  <p>Then restart the server. The built files will be served automatically.</p>
+  <p><strong>API is running:</strong> <a href="/api/health">/api/health</a></p>
+</body>
+</html>"#)
 }
 
 /// Start the API server on the given port with graceful shutdown.
-pub async fn serve(state: AppState, port: u16, cors_origins: &str) -> anyhow::Result<()> {
+pub async fn serve(state: AppState, port: u16, cors_origins: &str, open_browser: bool) -> anyhow::Result<()> {
     let app = router(state, cors_origins);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!(%addr, "API server listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    if open_browser {
+        let url = format!("http://localhost:{}", port);
+        tracing::info!(url = %url, "opening browser");
+        if let Err(e) = open::that(&url) {
+            tracing::warn!(error = %e, "failed to open browser");
+        }
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -99,6 +149,7 @@ mod tests {
         AppState {
             storage,
             work_dir: "/tmp/test_work".to_string(),
+            dashboard_dist: None,
         }
     }
 

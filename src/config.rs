@@ -629,4 +629,11 @@ pub struct Config {
     /// Set to 0 to disable the WebSocket server.
     #[arg(long, env = "WS_PORT", default_value_t = 9823)]
     pub ws_port: u16,
+
+    /// Enable per-job API cost tracking. When true (default), the pipeline
+    /// estimates costs from token usage across STT, chat, embedding, and VLM
+    /// calls. The cost summary appears in the digest email/file and is
+    /// persisted to `jobs.cost_cents` in the database.
+    #[arg(long, env = "COST_TRACKING_ENABLED", default_value_t = true)]
+    pub cost_tracking_enabled: bool,
 }

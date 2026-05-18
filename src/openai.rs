@@ -2,11 +2,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::cost::{CostCategory, CostTracker, UsageRecord};
+
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
+    cost_tracker: Option<CostTracker>,
 }
 
 impl OpenAiClient {
@@ -15,7 +18,31 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             http: reqwest::Client::new(),
+            cost_tracker: None,
         }
+    }
+
+    /// Attach a cost tracker to record token usage from API calls.
+    pub fn with_cost_tracker(mut self, tracker: CostTracker) -> Self {
+        self.cost_tracker = Some(tracker);
+        self
+    }
+
+    /// Record token usage to the cost tracker if present.
+    fn record_usage(&self, category: CostCategory, model: &str, input: u64, output: u64) {
+        if let Some(ref tracker) = self.cost_tracker {
+            tracker.record(UsageRecord {
+                category,
+                model: model.to_string(),
+                input_tokens: input,
+                output_tokens: output,
+            });
+        }
+    }
+
+    /// Access the cost tracker (if attached) for external recording (e.g. STT).
+    pub fn cost_tracker(&self) -> Option<&CostTracker> {
+        self.cost_tracker.as_ref()
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -266,6 +293,9 @@ impl OpenAiClient {
         }
 
         let parsed: ChatResponse = res.json().await.context("parse chat response")?;
+        if let Some(u) = &parsed.usage {
+            self.record_usage(CostCategory::Chat, model, u.prompt_tokens, u.completion_tokens);
+        }
         let content = parsed
             .choices
             .into_iter()
@@ -325,6 +355,9 @@ impl OpenAiClient {
         }
 
         let parsed: ChatResponse = res.json().await.context("parse chat response")?;
+        if let Some(u) = &parsed.usage {
+            self.record_usage(CostCategory::Chat, model, u.prompt_tokens, u.completion_tokens);
+        }
         let content = parsed
             .choices
             .into_iter()
@@ -378,6 +411,9 @@ impl OpenAiClient {
         }
 
         let parsed: ResponsesResponse = res.json().await.context("parse responses response")?;
+        if let Some(u) = &parsed.usage {
+            self.record_usage(CostCategory::Chat, model, u.input_tokens, u.output_tokens);
+        }
         let text = parsed
             .output_text()
             .context("missing responses output_text")?;
@@ -424,6 +460,9 @@ impl OpenAiClient {
         }
 
         let parsed: ResponsesResponse = res.json().await.context("parse responses response")?;
+        if let Some(u) = &parsed.usage {
+            self.record_usage(CostCategory::Chat, model, u.input_tokens, u.output_tokens);
+        }
         parsed
             .output_text()
             .context("missing responses output_text")
@@ -615,6 +654,16 @@ struct ResponsesTextFormat {
 struct ResponsesResponse {
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 impl ResponsesResponse {
@@ -668,6 +717,16 @@ enum ResponsesMessageContent {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]

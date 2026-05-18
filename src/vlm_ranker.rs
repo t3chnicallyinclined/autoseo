@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::cost::{CostCategory, CostTracker, UsageRecord};
 use crate::media;
 use crate::ranker::RankedClip;
 
@@ -32,11 +33,12 @@ pub struct VlmReranker {
     frames_per_clip: usize,
     frame_max_dim: u32,
     blend_weight: f64,
+    cost_tracker: Option<CostTracker>,
 }
 
 impl VlmReranker {
     /// Build from config. Returns `None` when not enabled or HF key is missing.
-    pub fn from_config(cfg: &Config) -> Option<Self> {
+    pub fn from_config(cfg: &Config, cost_tracker: Option<&CostTracker>) -> Option<Self> {
         if !cfg.vlm_rerank_enabled {
             return None;
         }
@@ -58,6 +60,7 @@ impl VlmReranker {
             frames_per_clip: cfg.vlm_frames_per_clip.max(1),
             frame_max_dim: cfg.vlm_frame_max_dim,
             blend_weight: cfg.vlm_blend_weight.clamp(0.0, 1.0),
+            cost_tracker: cost_tracker.cloned(),
         })
     }
 
@@ -211,7 +214,15 @@ impl VlmReranker {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
-                        let parsed: ChatResponse = r.json().await.context("parse vlm response")?;
+                        let parsed: ChatResponseWithUsage = r.json().await.context("parse vlm response")?;
+                        if let (Some(tracker), Some(u)) = (&self.cost_tracker, &parsed.usage) {
+                            tracker.record(UsageRecord {
+                                category: CostCategory::Vlm,
+                                model: self.model.clone(),
+                                input_tokens: u.prompt_tokens,
+                                output_tokens: u.completion_tokens,
+                            });
+                        }
                         let content = parsed
                             .choices
                             .into_iter()
@@ -268,11 +279,12 @@ pub struct PremiumVlmReranker {
     blend_weight: f64,
     total_prompt_tokens: AtomicU64,
     total_completion_tokens: AtomicU64,
+    cost_tracker: Option<CostTracker>,
 }
 
 impl PremiumVlmReranker {
     /// Build from config. Returns `None` when `VLM_PREMIUM_MODEL` is not set.
-    pub fn from_config(cfg: &Config) -> Option<Self> {
+    pub fn from_config(cfg: &Config, cost_tracker: Option<&CostTracker>) -> Option<Self> {
         let model = cfg.vlm_premium_model.as_ref().filter(|m| !m.is_empty())?.clone();
         let api_key = cfg
             .vlm_premium_api_key
@@ -294,6 +306,7 @@ impl PremiumVlmReranker {
             blend_weight: cfg.vlm_premium_blend_weight.clamp(0.0, 1.0),
             total_prompt_tokens: AtomicU64::new(0),
             total_completion_tokens: AtomicU64::new(0),
+            cost_tracker: cost_tracker.cloned(),
         })
     }
 
@@ -364,6 +377,14 @@ impl PremiumVlmReranker {
                             .fetch_add(u.prompt_tokens, Ordering::Relaxed);
                         self.total_completion_tokens
                             .fetch_add(u.completion_tokens, Ordering::Relaxed);
+                        if let Some(tracker) = &self.cost_tracker {
+                            tracker.record(UsageRecord {
+                                category: CostCategory::VlmPremium,
+                                model: self.model.clone(),
+                                input_tokens: u.prompt_tokens,
+                                output_tokens: u.completion_tokens,
+                            });
+                        }
                         tracing::info!(
                             clip = i,
                             prompt_tokens = u.prompt_tokens,

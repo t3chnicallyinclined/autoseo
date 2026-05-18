@@ -14,6 +14,7 @@ mod context;
 mod drive;
 mod embed;
 mod enhance;
+mod face_detect;
 mod gmail;
 mod google_auth;
 mod linguistic_markers;

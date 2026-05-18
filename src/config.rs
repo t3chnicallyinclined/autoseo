@@ -133,7 +133,7 @@ pub struct Config {
     pub clip_render_formats: String,
 
     /// Which platforms to post to. Comma-separated, any of: `youtube`, `bluesky`,
-    /// `ayrshare`. Default empty (no posting). Posting also requires
+    /// `instagram`, `ayrshare`. Default empty (no posting). Posting also requires
     /// `POST_DRY_RUN=false` to actually send — both knobs are opt-in for safety.
     #[arg(long, env = "POST_ENABLED_PLATFORMS", default_value = "")]
     pub post_enabled_platforms: String,
@@ -175,6 +175,16 @@ pub struct Config {
         default_value = "https://video.bsky.app"
     )]
     pub bluesky_video_service_url: String,
+
+    /// Instagram Graph API long-lived access token. Required when
+    /// `POST_ENABLED_PLATFORMS` includes `instagram`.
+    #[arg(long, env = "INSTAGRAM_ACCESS_TOKEN")]
+    pub instagram_access_token: Option<String>,
+
+    /// Instagram Business/Creator account user ID (numeric). Required alongside
+    /// `INSTAGRAM_ACCESS_TOKEN`.
+    #[arg(long, env = "INSTAGRAM_USER_ID")]
+    pub instagram_user_id: Option<String>,
 
     /// Ayrshare API key. Required when `POST_ENABLED_PLATFORMS` includes
     /// `ayrshare`. Obtain from https://app.ayrshare.com.

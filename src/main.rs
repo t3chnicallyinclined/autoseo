@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod ai_pipeline;
+mod analytics;
 mod api;
 mod align;
 mod ast;
@@ -276,6 +277,15 @@ async fn main() -> anyhow::Result<()> {
             .await
         {
             tracing::error!(error = ?e, "run_clipper_once failed");
+        }
+
+        // Pull analytics for posts that are ~24h or ~72h old.
+        if mode.produces_clips() {
+            match analytics::pull_analytics(&cfg, google.as_ref(), &storage).await {
+                Ok(n) if n > 0 => tracing::info!(fetched = n, "analytics pull complete"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "analytics pull failed"),
+            }
         }
 
         if cfg.once {

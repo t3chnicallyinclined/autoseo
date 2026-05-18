@@ -10,6 +10,7 @@
 
 pub mod ayrshare;
 pub mod bluesky;
+pub mod instagram;
 pub mod youtube;
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,7 @@ impl PostResult {
 pub enum Platform {
     YouTube(youtube::YouTubePoster),
     Bluesky(bluesky::BlueskyPoster),
+    Instagram(instagram::InstagramPoster),
     Ayrshare(ayrshare::AyrsharePoster),
 }
 
@@ -104,6 +106,7 @@ impl Platform {
         match self {
             Platform::YouTube(_) => "youtube",
             Platform::Bluesky(_) => "bluesky",
+            Platform::Instagram(_) => "instagram",
             Platform::Ayrshare(_) => "ayrshare",
         }
     }
@@ -133,6 +136,12 @@ impl Platform {
                 cfg.bluesky_app_password.clone(),
             )));
         }
+        if enabled.contains(&"instagram") {
+            out.push(Platform::Instagram(instagram::InstagramPoster::new(
+                cfg.instagram_access_token.clone(),
+                cfg.instagram_user_id.clone(),
+            )));
+        }
         if enabled.contains(&"ayrshare") {
             out.push(Platform::Ayrshare(ayrshare::AyrsharePoster::new(
                 cfg.ayrshare_api_key.clone(),
@@ -148,6 +157,22 @@ impl Platform {
         match self {
             Platform::YouTube(p) => p.set_private(external_id).await,
             Platform::Bluesky(p) => p.delete_record(external_id).await,
+            Platform::Instagram(_) => {
+                // Instagram Graph API does not expose a public delete endpoint
+                // for Reels. Veto is a no-op; manual removal required.
+                tracing::warn!(
+                    media_id = external_id,
+                    "instagram: veto not supported via API — remove manually"
+                );
+                Ok(())
+            }
+            Platform::Ayrshare(_) => {
+                tracing::warn!(
+                    id = external_id,
+                    "ayrshare: veto not implemented"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -170,6 +195,7 @@ impl Platform {
         match self {
             Platform::YouTube(p) => p.post(video_path, &social.youtube_shorts).await,
             Platform::Bluesky(p) => p.post(video_path, &social.bluesky).await,
+            Platform::Instagram(p) => p.post(video_path, &social.instagram_reels).await,
             Platform::Ayrshare(p) => p.post(video_path, social).await,
         }
     }
@@ -188,6 +214,11 @@ fn parse_enabled_platforms(spec: &str) -> Vec<&'static str> {
             "bluesky" | "bsky" => {
                 if !out.contains(&"bluesky") {
                     out.push("bluesky");
+                }
+            }
+            "instagram" | "ig" | "reels" => {
+                if !out.contains(&"instagram") {
+                    out.push("instagram");
                 }
             }
             "ayrshare" => {
@@ -232,6 +263,14 @@ mod tests {
         assert_eq!(
             parse_enabled_platforms("youtube,ayrshare"),
             vec!["youtube", "ayrshare"]
+        );
+        // Instagram with aliases.
+        assert_eq!(parse_enabled_platforms("instagram"), vec!["instagram"]);
+        assert_eq!(parse_enabled_platforms("ig"), vec!["instagram"]);
+        assert_eq!(parse_enabled_platforms("reels"), vec!["instagram"]);
+        assert_eq!(
+            parse_enabled_platforms("instagram,IG,reels"),
+            vec!["instagram"]
         );
         // Unknown ignored.
         assert_eq!(

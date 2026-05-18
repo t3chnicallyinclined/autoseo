@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::cost::CostTracker;
 
 #[derive(Clone)]
 pub enum Embedder {
@@ -30,13 +31,22 @@ impl Embedder {
     /// Pick a backend from config. Prefers HF Inference Providers when
     /// `HF_API_KEY` is set; falls back to local `fastembed` ONNX otherwise.
     pub fn from_config(cfg: &Config) -> anyhow::Result<Self> {
+        Self::from_config_with_tracker(cfg, None)
+    }
+
+    /// Like [`from_config`] but attaches a cost tracker for usage estimation.
+    pub fn from_config_with_tracker(cfg: &Config, cost_tracker: Option<&CostTracker>) -> anyhow::Result<Self> {
         if let Some(key) = cfg.hf_api_key.as_ref().filter(|k| !k.is_empty()) {
-            Ok(Embedder::Hf(HfEmbedder::new(
+            let mut embedder = HfEmbedder::new(
                 cfg.hf_router_url.clone(),
                 cfg.hf_embed_provider.clone(),
                 key.clone(),
                 cfg.embed_model.clone(),
-            )))
+            );
+            if let Some(tracker) = cost_tracker {
+                embedder.cost_tracker = Some(tracker.clone());
+            }
+            Ok(Embedder::Hf(embedder))
         } else {
             let cache_dir = (!cfg.embed_model_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.embed_model_dir));
@@ -105,6 +115,7 @@ pub struct HfEmbedder {
     model: String,
     http: reqwest::Client,
     batch_size: usize,
+    cost_tracker: Option<CostTracker>,
 }
 
 impl HfEmbedder {
@@ -118,6 +129,7 @@ impl HfEmbedder {
             model,
             http: reqwest::Client::new(),
             batch_size: 32,
+            cost_tracker: None,
         }
     }
 
@@ -176,6 +188,10 @@ impl HfEmbedder {
                                 vecs.len(),
                                 batch.len()
                             );
+                        }
+                        if let Some(tracker) = &self.cost_tracker {
+                            let total_chars: usize = batch.iter().map(|t| t.len()).sum();
+                            tracker.record_embedding_call(&self.model, total_chars);
                         }
                         return Ok(vecs);
                     }

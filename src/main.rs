@@ -10,6 +10,7 @@ mod candidates;
 mod captions;
 mod clipper;
 mod config;
+mod cost;
 mod context;
 mod drive;
 mod embed;

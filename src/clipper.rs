@@ -19,6 +19,7 @@ use crate::ast::AstScorer;
 use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionStyle, OverlayStyle};
 use crate::config::Config;
+use crate::cost::{CostSnapshot, CostTracker};
 use crate::embed::Embedder;
 use crate::enhance;
 use crate::gmail::GmailClient;
@@ -109,6 +110,8 @@ async fn run_clipper_pipeline_inner(
     storage: &Storage,
     job_id: &str,
 ) -> Result<()> {
+    let cost_tracker = CostTracker::new(cfg.cost_tracking_enabled);
+
     let file_name = media_name.to_string();
     let lower = file_name.to_lowercase();
 
@@ -224,6 +227,9 @@ async fn run_clipper_pipeline_inner(
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
 
+    // Record STT cost for the entire transcription pass.
+    cost_tracker.record_stt_call(&ai.stt_model, total_duration_secs);
+
     // F0 pitch extraction via aubio — non-fatal, returns empty vec if unavailable.
     let f0 = prosody::f0_curve("aubio", &audio_path).await;
     if f0.is_empty() {
@@ -253,6 +259,9 @@ async fn run_clipper_pipeline_inner(
         .update_job_status(job_id, JobStatus::Transcribed, None)
         .await?;
 
+    // Create a tracked OpenAI client for LLM calls (ranker, social copy, show context).
+    let tracked_openai = ai.openai.clone().with_cost_tracker(cost_tracker.clone());
+
     let show_context = ai
         .infer_show_context(&file_name, &transcript.full_text)
         .await
@@ -267,7 +276,7 @@ async fn run_clipper_pipeline_inner(
         anyhow::bail!("no candidate windows produced — episode may be too short or too quiet");
     }
 
-    match Embedder::from_config(cfg) {
+    match Embedder::from_config_with_tracker(cfg, Some(&cost_tracker)) {
         Ok(embedder) => {
             tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
             if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
@@ -301,7 +310,7 @@ async fn run_clipper_pipeline_inner(
         .to_string();
 
     let mut ranker = Ranker::new(
-        ai.openai.clone(),
+        tracked_openai.clone(),
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
@@ -351,7 +360,7 @@ async fn run_clipper_pipeline_inner(
         anyhow::bail!("LLM ranker returned no clips");
     }
 
-    let ranked = match VlmReranker::from_config(cfg) {
+    let ranked = match VlmReranker::from_config(cfg, Some(&cost_tracker)) {
         Some(reranker) => {
             match reranker
                 .rerank(&cfg.ffmpeg, input_path, ranked, cfg.vlm_rerank_top_k)
@@ -402,7 +411,7 @@ async fn run_clipper_pipeline_inner(
             .trim()
             .to_string();
         let generator = SocialCopyGenerator::new(
-            ai.openai.clone(),
+            tracked_openai.clone(),
             ai.chat_model.clone(),
             sys,
             user_tmpl,
@@ -594,8 +603,22 @@ async fn run_clipper_pipeline_inner(
         .update_job_status(job_id, JobStatus::Posted, None)
         .await?;
 
+    // Finalize cost tracking: snapshot and persist.
+    let cost_snap = cost_tracker.snapshot();
+    let total_cost_cents = cost_snap.total_cost_cents().round() as i64;
+    if cost_tracker.enabled() {
+        if let Err(e) = storage.update_job_cost(job_id, total_cost_cents).await {
+            tracing::warn!(error = ?e, "failed to persist job cost (non-fatal)");
+        }
+        tracing::info!(
+            cost_cents = total_cost_cents,
+            calls = cost_snap.total_calls(),
+            "clipper: job cost summary"
+        );
+    }
+
     // Write digest
-    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
+    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
 
     if digest_mode.writes_file() {
         let digest_path = clips_dir.join("digest.md");
@@ -606,7 +629,7 @@ async fn run_clipper_pipeline_inner(
 
         let manifest_path = clips_dir.join("manifest.json");
         let manifest =
-            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered);
+            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
         let manifest_text = serde_json::to_string_pretty(&manifest)
             .unwrap_or_else(|_| "{}".to_string());
         if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
@@ -678,6 +701,8 @@ async fn run_clipper_inner(
             anyhow::bail!("DIGEST_MODE includes email but RESULT_TO is unset");
         }
     }
+
+    let cost_tracker = CostTracker::new(cfg.cost_tracking_enabled);
 
     let input_path = PathBuf::from(local_path);
     if tokio::fs::metadata(&input_path).await.is_err() {
@@ -804,6 +829,9 @@ async fn run_clipper_inner(
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
 
+    // Record STT cost for the entire transcription pass.
+    cost_tracker.record_stt_call(&ai.stt_model, total_duration_secs);
+
     // F0 pitch extraction via aubio — non-fatal, returns empty vec if unavailable.
     let f0 = prosody::f0_curve("aubio", &audio_path).await;
     if f0.is_empty() {
@@ -831,6 +859,9 @@ async fn run_clipper_inner(
 
     // ── Status: transcribed ──
     set_job_status(storage, job_id, JobStatus::Transcribed, None).await;
+
+    // Create a tracked OpenAI client for LLM calls.
+    let tracked_openai = ai.openai.clone().with_cost_tracker(cost_tracker.clone());
 
     let show_context = ai
         .infer_show_context(&file_name, &transcript.full_text)
@@ -891,7 +922,7 @@ async fn run_clipper_inner(
 
     // Attach within-episode novelty scores. Non-fatal — if the embedder fails
     // (network blip, missing model cache), we proceed without the signal.
-    match Embedder::from_config(cfg) {
+    match Embedder::from_config_with_tracker(cfg, Some(&cost_tracker)) {
         Ok(embedder) => {
             tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
             if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
@@ -963,7 +994,7 @@ async fn run_clipper_inner(
         .to_string();
 
     let mut ranker = Ranker::new(
-        ai.openai.clone(),
+        tracked_openai.clone(),
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
@@ -1041,7 +1072,7 @@ async fn run_clipper_inner(
     }
 
     // Optional: VLM re-rank top-N using frames + transcript.
-    let ranked = match VlmReranker::from_config(cfg) {
+    let ranked = match VlmReranker::from_config(cfg, Some(&cost_tracker)) {
         Some(reranker) => {
             tracing::info!(
                 model = %cfg.vlm_model,
@@ -1071,7 +1102,7 @@ async fn run_clipper_inner(
     };
 
     // Optional: Premium VLM re-rank (Lane B) — top-K clips through a larger model.
-    let ranked = match PremiumVlmReranker::from_config(cfg) {
+    let ranked = match PremiumVlmReranker::from_config(cfg, Some(&cost_tracker)) {
         Some(premium) => {
             tracing::info!(
                 model = ?cfg.vlm_premium_model,
@@ -1129,7 +1160,7 @@ async fn run_clipper_inner(
             .trim()
             .to_string();
         let generator = SocialCopyGenerator::new(
-            ai.openai.clone(),
+            tracked_openai.clone(),
             ai.chat_model.clone(),
             sys,
             user_tmpl,
@@ -1467,7 +1498,23 @@ async fn run_clipper_inner(
         }
     }
 
-    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered);
+    // Finalize cost tracking.
+    let cost_snap = cost_tracker.snapshot();
+    let total_cost_cents = cost_snap.total_cost_cents().round() as i64;
+    if cost_tracker.enabled() {
+        if let (Some(st), Some(jid)) = (storage, job_id) {
+            if let Err(e) = st.update_job_cost(jid, total_cost_cents).await {
+                tracing::warn!(error = ?e, "failed to persist job cost (non-fatal)");
+            }
+        }
+        tracing::info!(
+            cost_cents = total_cost_cents,
+            calls = cost_snap.total_calls(),
+            "clipper: job cost summary"
+        );
+    }
+
+    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
 
     if digest_mode.writes_file() {
         let digest_path = clips_dir.join("digest.md");
@@ -1481,7 +1528,7 @@ async fn run_clipper_inner(
         // regex-parsing digest.md).
         let manifest_path = clips_dir.join("manifest.json");
         let manifest =
-            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered);
+            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
         let manifest_text = serde_json::to_string_pretty(&manifest)
             .unwrap_or_else(|_| "{}".to_string());
         if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
@@ -1588,6 +1635,7 @@ fn build_digest_body(
     total_duration_secs: f64,
     clips_dir: &std::path::Path,
     rendered: &[RenderedClip],
+    cost: &CostSnapshot,
 ) -> String {
     // Resolve to an absolute path if possible so the email reader can copy/paste
     // it straight into a `vlc` / `open` command.
@@ -1603,6 +1651,12 @@ fn build_digest_body(
     ));
     out.push_str(&format!("Clips produced: {}\n", rendered.len()));
     out.push_str(&format!("Clips directory: {}\n", abs_clips_dir.display()));
+
+    if cost.total_calls() > 0 {
+        out.push('\n');
+        out.push_str(&cost.format_digest());
+    }
+
     out.push('\n');
     out.push_str(&"=".repeat(72));
     out.push('\n');
@@ -1767,6 +1821,7 @@ fn build_manifest_json(
     total_duration_secs: f64,
     clips_dir: &std::path::Path,
     rendered: &[RenderedClip],
+    cost: &CostSnapshot,
 ) -> serde_json::Value {
     let abs_clips_dir = clips_dir
         .canonicalize()
@@ -1849,8 +1904,8 @@ fn build_manifest_json(
         })
         .collect();
 
-    serde_json::json!({
-        "schema_version": 1,
+    let mut manifest = serde_json::json!({
+        "schema_version": 2,
         "episode": media_name,
         "total_duration_secs": total_duration_secs,
         "clips_dir": abs_clips_dir.display().to_string(),
@@ -1859,7 +1914,13 @@ fn build_manifest_json(
             .map(|d| d.as_secs())
             .unwrap_or(0),
         "clips": clips,
-    })
+    });
+
+    if cost.total_calls() > 0 {
+        manifest["cost"] = cost.to_json();
+    }
+
+    manifest
 }
 
 /// Pretty-print a multi-line block with consistent left padding.
@@ -2014,7 +2075,12 @@ fn fmt_hms(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost::CostTracker;
     use crate::ranker::RankedClip;
+
+    fn empty_cost() -> CostSnapshot {
+        CostTracker::new(false).snapshot()
+    }
 
     #[test]
     fn to_mmss_basic() {
@@ -2077,7 +2143,7 @@ mod tests {
             dummy_clip(2, 75, 240.0, 300.0, "second hook"),
         ];
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let body = build_digest_body("episode.mp4", 7320.0, &dir, &clips);
+        let body = build_digest_body("episode.mp4", 7320.0, &dir, &clips, &empty_cost());
         assert!(body.contains("episode.mp4"));
         assert!(body.contains("2h"));
         assert!(body.contains("Clip 01"));
@@ -2097,7 +2163,7 @@ mod tests {
         let mut clip = dummy_clip(1, 85, 30.0, 90.0, "hook");
         clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip]);
+        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         assert!(body.contains("cover:"), "expected cover line in digest, got:\n{body}");
         assert!(body.contains("clip_01_cover.jpg"));
     }
@@ -2106,7 +2172,7 @@ mod tests {
     fn digest_body_omits_cover_when_none() {
         let clip = dummy_clip(1, 85, 30.0, 90.0, "hook");
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip]);
+        let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         assert!(!body.contains("cover:"), "unexpected cover line in digest:\n{body}");
     }
 
@@ -2115,17 +2181,57 @@ mod tests {
         let mut clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
         clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
         assert!(!clip_val["cover_frame"].is_null(), "cover_frame should be present");
         assert_eq!(clip_val["cover_frame"]["filename"], "clip_01_cover.jpg");
     }
 
     #[test]
+    fn digest_body_includes_cost_when_tracked() {
+        let tracker = CostTracker::new(true);
+        tracker.record(crate::cost::UsageRecord {
+            category: crate::cost::CostCategory::Chat,
+            model: "gpt-5.2-pro".to_string(),
+            input_tokens: 5000,
+            output_tokens: 1000,
+        });
+        tracker.record_stt_call("whisper-large-v3-turbo", 120.0);
+        let snap = tracker.snapshot();
+
+        let clips = vec![dummy_clip(1, 90, 60.0, 120.0, "hook")];
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let body = build_digest_body("ep.mp4", 600.0, &dir, &clips, &snap);
+        assert!(body.contains("Cost breakdown"), "digest should contain cost section");
+        assert!(body.contains("Chat/LLM"), "digest should list chat costs");
+        assert!(body.contains("STT"), "digest should list STT costs");
+        assert!(body.contains("TOTAL"), "digest should have total line");
+    }
+
+    #[test]
+    fn manifest_includes_cost_when_tracked() {
+        let tracker = CostTracker::new(true);
+        tracker.record(crate::cost::UsageRecord {
+            category: crate::cost::CostCategory::Chat,
+            model: "gpt-5.2-pro".to_string(),
+            input_tokens: 1000,
+            output_tokens: 200,
+        });
+        let snap = tracker.snapshot();
+
+        let clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &snap);
+        assert!(manifest["cost"]["total_cost_usd"].as_f64().unwrap() > 0.0);
+        assert_eq!(manifest["cost"]["total_calls"].as_u64().unwrap(), 1);
+        assert_eq!(manifest["schema_version"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
     fn manifest_cover_frame_null_when_absent() {
         let clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
         assert!(clip_val["cover_frame"].is_null(), "cover_frame should be null when absent");
     }

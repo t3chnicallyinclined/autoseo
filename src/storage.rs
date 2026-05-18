@@ -71,6 +71,7 @@ pub struct JobRow {
     pub drive_file_id: Option<String>,
     pub status: JobStatus,
     pub retry_count: i64,
+    pub cost_cents: i64,
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -474,7 +475,7 @@ impl Storage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, show_slug, media_name, drive_file_id, status, \
-                     retry_count, error, created_at, updated_at \
+                     retry_count, cost_cents, error, created_at, updated_at \
                      FROM jobs WHERE id = ?1",
                 )
                 .context("prepare get_job")?;
@@ -490,9 +491,10 @@ impl Storage {
                         )
                         .unwrap_or(JobStatus::Pending),
                         retry_count: r.get(5)?,
-                        error: r.get(6)?,
-                        created_at: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        cost_cents: r.get(6)?,
+                        error: r.get(7)?,
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
                     })
                 })
                 .optional()
@@ -504,6 +506,25 @@ impl Storage {
         Ok(row)
     }
 
+    /// Update the accumulated cost_cents for a job.
+    pub async fn update_job_cost(&self, job_id: &str, cost_cents: i64) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            conn.execute(
+                "UPDATE jobs SET cost_cents = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![cost_cents, now, job_id],
+            )
+            .context("update_job_cost")?;
+            Ok(())
+        })
+        .await
+        .context("join update_job_cost")??;
+        Ok(())
+    }
+
     /// List all jobs with status='failed'.
     pub async fn get_failed_jobs(&self) -> anyhow::Result<Vec<JobRow>> {
         let conn = self.conn.clone();
@@ -512,7 +533,7 @@ impl Storage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, show_slug, media_name, drive_file_id, status, \
-                     retry_count, error, created_at, updated_at \
+                     retry_count, cost_cents, error, created_at, updated_at \
                      FROM jobs WHERE status = 'failed' ORDER BY updated_at DESC",
                 )
                 .context("prepare get_failed_jobs")?;
@@ -525,9 +546,10 @@ impl Storage {
                         drive_file_id: r.get(3)?,
                         status: JobStatus::Failed,
                         retry_count: r.get(5)?,
-                        error: r.get(6)?,
-                        created_at: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        cost_cents: r.get(6)?,
+                        error: r.get(7)?,
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
                     })
                 })
                 .context("query get_failed_jobs")?
@@ -1459,6 +1481,27 @@ mod tests {
         let job = storage.get_job("old_job").await?.expect("old_job should exist");
         assert_eq!(job.status, JobStatus::Done);
         assert_eq!(job.retry_count, 0, "retry_count should default to 0");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_job_cost_persists() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let storage = Storage::open(dir.path().join("test.db")).await?;
+
+        storage.create_job("j1", None, None, None).await?;
+        let job = storage.get_job("j1").await?.unwrap();
+        assert_eq!(job.cost_cents, 0, "initial cost should be 0");
+
+        storage.update_job_cost("j1", 42).await?;
+        let job = storage.get_job("j1").await?.unwrap();
+        assert_eq!(job.cost_cents, 42, "cost should be updated to 42");
+
+        // Update again — overwrites, not accumulates.
+        storage.update_job_cost("j1", 100).await?;
+        let job = storage.get_job("j1").await?.unwrap();
+        assert_eq!(job.cost_cents, 100);
 
         Ok(())
     }

@@ -94,10 +94,15 @@ async fn main() -> anyhow::Result<()> {
             );
             None
         };
+        let config_path = std::path::PathBuf::from(&cfg.work_dir).join("config.json");
+        let config_store = std::sync::Arc::new(
+            api::config_store::ConfigStore::load(config_path).await?,
+        );
         let state = api::AppState {
             storage,
             work_dir: cfg.work_dir.clone(),
             dashboard_dist,
+            config_store,
         };
         return api::serve(state, cfg.api_port, &cfg.api_cors_origins, cfg.open_browser).await;
     }

@@ -33,7 +33,7 @@ use crate::platforms::{self, PostResult, PostStatus};
 use crate::posting;
 use crate::scene;
 use crate::show_config::{self, DigestMode};
-use crate::social_copy::{SocialCopy, SocialCopyGenerator};
+use crate::social_copy::{HookSource, SocialCopy, SocialCopyGenerator, resolve_hook};
 use crate::storage::{JobStatus, Storage};
 use crate::vad;
 use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
@@ -391,12 +391,16 @@ async fn run_clipper_pipeline_inner(
             sys,
             user_tmpl,
         );
+        let hook_source = HookSource::from_str(&cfg.clip_hook_source);
         let mut copies: Vec<Option<SocialCopy>> = Vec::with_capacity(ranked.len());
         for (i, clip) in ranked.iter().enumerate() {
             let candidate = candidates.get(clip.candidate_index);
             let copy = match candidate {
                 Some(cand) => match generator.generate(clip, cand, show_context.as_ref()).await {
-                    Ok(c) => Some(c),
+                    Ok(mut c) => {
+                        resolve_hook(&mut c, &clip.hook, hook_source, i);
+                        Some(c)
+                    }
                     Err(e) => {
                         tracing::warn!(clip = i + 1, error = ?e, "social copy failed");
                         None
@@ -1102,16 +1106,19 @@ async fn run_clipper_inner(
             sys,
             user_tmpl,
         );
-        tracing::info!(top_k = ranked.len(), "clipper: generating per-platform social copy");
+        let hook_source = HookSource::from_str(&cfg.clip_hook_source);
+        tracing::info!(top_k = ranked.len(), hook_source = ?hook_source, "clipper: generating per-platform social copy");
         let mut copies: Vec<Option<SocialCopy>> = Vec::with_capacity(ranked.len());
         for (i, clip) in ranked.iter().enumerate() {
             let candidate = candidates.get(clip.candidate_index);
             let copy = match candidate {
                 Some(cand) => match generator.generate(clip, cand, show_context.as_ref()).await {
-                    Ok(c) => {
+                    Ok(mut c) => {
+                        resolve_hook(&mut c, &clip.hook, hook_source, i);
                         tracing::info!(
                             clip = i + 1,
                             overlay = %c.overlay_hook,
+                            source = %c.hook_source,
                             "social copy generated"
                         );
                         Some(c)
@@ -1784,6 +1791,13 @@ fn build_manifest_json(
                 })
                 .unwrap_or(serde_json::Value::Null);
 
+            // Promote overlay_hook and hook_source to top-level clip fields
+            // for easy review in the manifest, alongside the nested social block.
+            let (overlay_hook, hook_source) = match &r.social {
+                Some(sc) => (sc.overlay_hook.as_str(), sc.hook_source.as_str()),
+                None => ("", ""),
+            };
+
             serde_json::json!({
                 "rank": r.rank,
                 "score": r.ranked.score,
@@ -1796,6 +1810,8 @@ fn build_manifest_json(
                     to_mmss(r.ranked.end_secs),
                 ),
                 "hook": r.ranked.hook,
+                "overlay_hook": overlay_hook,
+                "hook_source": hook_source,
                 "reasoning": r.ranked.reasoning,
                 "variants": variants,
                 "cover_frame": cover_frame,
@@ -2028,5 +2044,32 @@ mod tests {
         let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
         let clip_val = &manifest["clips"][0];
         assert!(clip_val["cover_frame"].is_null(), "cover_frame should be null when absent");
+    }
+
+    #[test]
+    fn manifest_includes_overlay_hook_and_source() {
+        let mut clip = dummy_clip(1, 80, 10.0, 70.0, "ranker hook");
+        clip.social = Some(SocialCopy {
+            overlay_hook: "Wait for it".into(),
+            hook_source: "llm".into(),
+            ..Default::default()
+        });
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let clip_val = &manifest["clips"][0];
+        assert_eq!(clip_val["overlay_hook"], "Wait for it");
+        assert_eq!(clip_val["hook_source"], "llm");
+        // Ranker hook is still at top level
+        assert_eq!(clip_val["hook"], "ranker hook");
+    }
+
+    #[test]
+    fn manifest_overlay_hook_empty_when_no_social() {
+        let clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let clip_val = &manifest["clips"][0];
+        assert_eq!(clip_val["overlay_hook"], "");
+        assert_eq!(clip_val["hook_source"], "");
     }
 }

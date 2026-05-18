@@ -131,6 +131,11 @@ impl YouTubePoster {
         }
     }
 
+    /// Set a previously published video to "private" (used by the veto flow).
+    pub async fn set_private(&self, _video_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("YouTube set_private not yet implemented")
+    }
+
     pub async fn post(&self, video_path: &Path, copy: &YouTubeShortsCopy) -> PostResult {
         let google = match self.google.as_ref() {
             Some(g) => g,

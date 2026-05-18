@@ -126,6 +126,11 @@ pub struct Config {
     #[arg(long, env = "CLIP_SOCIAL_COPY_DISABLED", default_value_t = false)]
     pub clip_social_copy_disabled: bool,
 
+    /// Source for overlay hook text: "llm" (default, from social copy LLM),
+    /// "ranker" (truncated ranker hook), or "ab_test" (alternate per clip).
+    #[arg(long, env = "CLIP_HOOK_SOURCE", default_value = "llm")]
+    pub clip_hook_source: String,
+
     /// Which aspect ratios to render per clip. Comma-separated list of any of:
     /// `9x16` (Shorts/TikTok/Reels/Threads), `1x1` (LinkedIn/X feed),
     /// `16x9` (LinkedIn landscape / Bluesky / YouTube re-upload).

@@ -32,6 +32,89 @@ pub struct SocialCopy {
     pub bluesky: BlueskyCopy,
     #[serde(default)]
     pub overlay_hook: String,
+    /// Where the final overlay_hook text came from: "llm", "ranker", or "fallback".
+    #[serde(default)]
+    pub hook_source: String,
+}
+
+/// Which source to use for the on-screen overlay hook text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSource {
+    /// Always use the LLM-generated hook from social copy.
+    Llm,
+    /// Always use the ranker-generated hook (truncated to ≤5 words).
+    Ranker,
+    /// Alternate between LLM and ranker per clip for A/B testing.
+    AbTest,
+}
+
+impl HookSource {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ranker" => Self::Ranker,
+            "ab_test" | "ab" | "abtest" => Self::AbTest,
+            _ => Self::Llm,
+        }
+    }
+}
+
+/// Maximum number of words allowed in an overlay hook.
+const HOOK_MAX_WORDS: usize = 5;
+
+/// Validate and sanitize an overlay hook: trim, enforce ≤5 words, strip
+/// trailing punctuation that looks bad on-screen.
+pub fn validate_hook(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let capped: String = words.iter().take(HOOK_MAX_WORDS).copied().collect::<Vec<_>>().join(" ");
+    // Strip trailing period — overlay text reads better without it.
+    capped.trim_end_matches('.').to_string()
+}
+
+/// Build an overlay hook from the ranker's sentence-level hook by taking
+/// the first 5 words. Used as fallback or when `HookSource::Ranker` is chosen.
+pub fn hook_from_ranker(ranker_hook: &str) -> String {
+    validate_hook(ranker_hook)
+}
+
+/// Resolve the final overlay hook for a clip given the LLM and ranker hooks,
+/// the configured source strategy, and the clip index (for A/B alternation).
+pub fn resolve_hook(
+    social: &mut SocialCopy,
+    ranker_hook: &str,
+    source: HookSource,
+    clip_index: usize,
+) {
+    let (hook, label) = match source {
+        HookSource::Llm => {
+            let validated = validate_hook(&social.overlay_hook);
+            if validated.is_empty() {
+                // Fallback to ranker if LLM returned empty.
+                let fallback = hook_from_ranker(ranker_hook);
+                (fallback, "fallback")
+            } else {
+                (validated, "llm")
+            }
+        }
+        HookSource::Ranker => (hook_from_ranker(ranker_hook), "ranker"),
+        HookSource::AbTest => {
+            if clip_index % 2 == 0 {
+                let validated = validate_hook(&social.overlay_hook);
+                if validated.is_empty() {
+                    (hook_from_ranker(ranker_hook), "fallback")
+                } else {
+                    (validated, "llm")
+                }
+            } else {
+                (hook_from_ranker(ranker_hook), "ranker")
+            }
+        }
+    };
+    social.overlay_hook = hook;
+    social.hook_source = label.to_string();
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -322,5 +405,108 @@ mod tests {
         assert_eq!(fmt_mmss(0.0), "00:00");
         assert_eq!(fmt_mmss(125.5), "02:05");
         assert_eq!(fmt_mmss(3661.0), "61:01");
+    }
+
+    // ── Hook validation tests ──────────────────────────────────────────
+
+    #[test]
+    fn validate_hook_passes_short_text() {
+        assert_eq!(validate_hook("Wait for it"), "Wait for it");
+    }
+
+    #[test]
+    fn validate_hook_truncates_to_five_words() {
+        assert_eq!(
+            validate_hook("This is way too many words for a hook"),
+            "This is way too many"
+        );
+    }
+
+    #[test]
+    fn validate_hook_strips_trailing_period() {
+        assert_eq!(validate_hook("He was wrong."), "He was wrong");
+    }
+
+    #[test]
+    fn validate_hook_returns_empty_for_blank() {
+        assert_eq!(validate_hook(""), "");
+        assert_eq!(validate_hook("   "), "");
+    }
+
+    #[test]
+    fn hook_from_ranker_truncates_sentence() {
+        let ranker = "He says the old defense is hopeless and nobody can stop it";
+        let result = hook_from_ranker(ranker);
+        assert_eq!(result.split_whitespace().count(), 5);
+        assert_eq!(result, "He says the old defense");
+    }
+
+    #[test]
+    fn resolve_hook_llm_preferred_when_valid() {
+        let mut sc = SocialCopy {
+            overlay_hook: "Wait for it".into(),
+            ..Default::default()
+        };
+        resolve_hook(&mut sc, "ranker sentence hook", HookSource::Llm, 0);
+        assert_eq!(sc.overlay_hook, "Wait for it");
+        assert_eq!(sc.hook_source, "llm");
+    }
+
+    #[test]
+    fn resolve_hook_falls_back_to_ranker_when_llm_empty() {
+        let mut sc = SocialCopy::default(); // overlay_hook is ""
+        resolve_hook(&mut sc, "He drops the bombshell live", HookSource::Llm, 0);
+        assert_eq!(sc.overlay_hook, "He drops the bombshell live");
+        assert_eq!(sc.hook_source, "fallback");
+    }
+
+    #[test]
+    fn resolve_hook_ranker_mode_always_uses_ranker() {
+        let mut sc = SocialCopy {
+            overlay_hook: "LLM hook".into(),
+            ..Default::default()
+        };
+        resolve_hook(&mut sc, "The ranker generated this long hook text", HookSource::Ranker, 0);
+        assert_eq!(sc.overlay_hook, "The ranker generated this long");
+        assert_eq!(sc.hook_source, "ranker");
+    }
+
+    #[test]
+    fn resolve_hook_ab_test_alternates() {
+        let mut sc0 = SocialCopy {
+            overlay_hook: "LLM hook".into(),
+            ..Default::default()
+        };
+        resolve_hook(&mut sc0, "Ranker hook text here", HookSource::AbTest, 0);
+        assert_eq!(sc0.hook_source, "llm", "even index should use LLM");
+
+        let mut sc1 = SocialCopy {
+            overlay_hook: "LLM hook".into(),
+            ..Default::default()
+        };
+        resolve_hook(&mut sc1, "Ranker hook text here", HookSource::AbTest, 1);
+        assert_eq!(sc1.hook_source, "ranker", "odd index should use ranker");
+    }
+
+    #[test]
+    fn hook_source_from_str_variants() {
+        assert_eq!(HookSource::from_str("llm"), HookSource::Llm);
+        assert_eq!(HookSource::from_str("ranker"), HookSource::Ranker);
+        assert_eq!(HookSource::from_str("ab_test"), HookSource::AbTest);
+        assert_eq!(HookSource::from_str("ab"), HookSource::AbTest);
+        assert_eq!(HookSource::from_str("abtest"), HookSource::AbTest);
+        assert_eq!(HookSource::from_str("unknown"), HookSource::Llm);
+    }
+
+    #[test]
+    fn hook_source_serialized_in_social_copy() {
+        let sc = SocialCopy {
+            overlay_hook: "test".into(),
+            hook_source: "llm".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&sc).expect("serialize");
+        assert_eq!(json["hook_source"], "llm");
+        assert_eq!(json["overlay_hook"], "test");
     }
 }

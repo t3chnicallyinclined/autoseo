@@ -100,6 +100,24 @@ pub async fn render_clip(
     profile: &RenderProfile,
     subtitle_paths: &[&Path],
 ) -> anyhow::Result<()> {
+    render_clip_with_audio(ffmpeg, input, None, start_secs, end_secs, output, profile, subtitle_paths).await
+}
+
+/// Like [`render_clip`] but optionally replaces the audio track with an
+/// enhanced audio file (e.g. from DeepFilterNet3). When `enhanced_audio` is
+/// `Some`, the video stream comes from `input` and the audio stream from the
+/// enhanced file.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_clip_with_audio(
+    ffmpeg: &str,
+    input: &Path,
+    enhanced_audio: Option<&Path>,
+    start_secs: f64,
+    end_secs: f64,
+    output: &Path,
+    profile: &RenderProfile,
+    subtitle_paths: &[&Path],
+) -> anyhow::Result<()> {
     if !matches!(end_secs.partial_cmp(&start_secs), Some(std::cmp::Ordering::Greater)) {
         anyhow::bail!(
             "render_clip: end ({end_secs}) must be after start ({start_secs})"
@@ -113,19 +131,36 @@ pub async fn render_clip(
     let vf = build_video_filter(profile, subtitle_paths);
     let af = build_audio_filter(profile);
 
-    let status = Command::new(ffmpeg)
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-nostats"])
-        .args(["-ss", &format!("{start_secs:.3}")])
-        .arg("-i")
-        .arg(input)
-        .args(["-t", &format!("{duration:.3}")])
-        .args(["-vf", &vf])
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-nostats"]);
+
+    if let Some(audio_path) = enhanced_audio {
+        // Two inputs: video from `input`, audio from the enhanced file.
+        // Both seek to the same start position.
+        cmd.args(["-ss", &format!("{start_secs:.3}")])
+            .arg("-i")
+            .arg(input)
+            .args(["-ss", &format!("{start_secs:.3}")])
+            .arg("-i")
+            .arg(audio_path)
+            .args(["-t", &format!("{duration:.3}")])
+            .args(["-map", "0:v:0", "-map", "1:a:0"]);
+    } else {
+        cmd.args(["-ss", &format!("{start_secs:.3}")])
+            .arg("-i")
+            .arg(input)
+            .args(["-t", &format!("{duration:.3}")]);
+    }
+
+    cmd.args(["-vf", &vf])
         .args(["-af", &af])
         .args(["-c:v", "libx264", "-preset", "medium", "-crf", &profile.crf.to_string()])
         .args(["-pix_fmt", "yuv420p"])
         .args(["-c:a", "aac", "-b:a", "128k"])
         .args(["-movflags", "+faststart"])
-        .arg(output)
+        .arg(output);
+
+    let status = cmd
         .status()
         .await
         .with_context(|| format!("run ffmpeg render to {}", output.display()))?;

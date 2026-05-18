@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-05-18
+- Added DeepFilterNet3 speech enhancement pre-stage (`src/enhance.rs`). New envs: `ENHANCE_AUDIO` (default false), `ENHANCE_MODEL_PATH` (default `./models/DeepFilterNet3.tar.gz`). New cargo feature: `enhance`. When enabled, extracted audio is denoised at 48 kHz via DeepFilterNet3 before chunking/STT and clip rendering. Model is auto-downloaded from GitHub releases on first use. Graceful fallback: if the model fails to load or enhancement errors, the pipeline continues with the original audio unchanged. Enhanced audio is also passed to `render_clip_with_audio` so final clips use the denoised track. 4 tests covering disabled path, missing model fallback, 48kHz extraction, and file reuse.
+
 ## 2026-05-11
 - Started clipper-agent extension on `feat/clipper` branch — turning autoseo into an autonomous clipper that produces N platform-specific short clips per episode. See [PLAN.md](PLAN.md) for the locked-in design.
 - Added SQLite storage layer (`src/storage.rs`) backed by bundled `rusqlite`. Schema covers the full M1 surface: `jobs`, `clips`, `clip_renders`, `posts`, `analytics`, `trends`. WAL mode + foreign keys enabled. Idempotent migration via `PRAGMA user_version`.

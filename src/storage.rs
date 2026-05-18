@@ -47,6 +47,21 @@ impl JobStatus {
     }
 }
 
+/// A row from the clips + analytics join — used to feed historical
+/// performance data back into the ranker prompt.
+#[derive(Debug, Clone)]
+pub struct ClipPerformanceRow {
+    pub clip_id: String,
+    pub hook: Option<String>,
+    pub score: Option<f64>,
+    pub rank: Option<i64>,
+    pub views: Option<i64>,
+    pub ctr: Option<f64>,
+    pub watch_pct: Option<f64>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
 /// A row from the `jobs` table.
 #[derive(Debug, Clone)]
 pub struct JobRow {
@@ -178,6 +193,13 @@ impl Storage {
         Self {
             conn: Arc::new(Mutex::new(conn)),
         }
+    }
+
+    /// Expose the raw connection for cross-module tests that need to insert
+    /// seed data directly. NOT for production use.
+    #[cfg(test)]
+    pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
     }
 
     /// Compatibility: import a flat newline-delimited dedupe file as completed jobs.
@@ -542,6 +564,52 @@ impl Storage {
         .await
         .context("join insert_clip_render")??;
         Ok(())
+    }
+
+    /// Fetch historical clip performance data by joining clips → analytics.
+    /// Returns up to `limit` rows ordered by CTR descending (best first).
+    /// Gracefully returns an empty vec if the analytics table has no data.
+    pub async fn get_clip_performance_history(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ClipPerformanceRow>> {
+        let conn = self.conn.clone();
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipPerformanceRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.id, c.hook, c.score, c.rank,
+                            a.views, a.ctr, a.watch_pct,
+                            c.start_ms, c.end_ms
+                     FROM clips c
+                     INNER JOIN analytics a ON a.clip_id = c.id
+                     WHERE a.ctr IS NOT NULL
+                     ORDER BY a.ctr DESC
+                     LIMIT ?1",
+                )
+                .context("prepare get_clip_performance_history")?;
+            let rows = stmt
+                .query_map([limit as i64], |r| {
+                    Ok(ClipPerformanceRow {
+                        clip_id: r.get(0)?,
+                        hook: r.get(1)?,
+                        score: r.get(2)?,
+                        rank: r.get(3)?,
+                        views: r.get(4)?,
+                        ctr: r.get(5)?,
+                        watch_pct: r.get(6)?,
+                        start_ms: r.get(7)?,
+                        end_ms: r.get(8)?,
+                    })
+                })
+                .context("query get_clip_performance_history")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect get_clip_performance_history")?;
+            Ok(rows)
+        })
+        .await
+        .context("join get_clip_performance_history")??;
+        Ok(rows)
     }
 
     /// Insert a post row. Idempotent (INSERT OR REPLACE).

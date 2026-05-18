@@ -20,6 +20,7 @@ mod media_server;
 mod mime;
 mod openai;
 mod parse;
+mod performance_history;
 mod platforms;
 mod posting;
 mod prosody;

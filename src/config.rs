@@ -282,6 +282,13 @@ pub struct Config {
     #[arg(long, env = "VLM_PREMIUM_BLEND_WEIGHT", default_value_t = 0.6)]
     pub vlm_premium_blend_weight: f64,
 
+    /// Enable CTR history injection into the ranker prompt. When true, the
+    /// ranker prompt includes top/worst historical clip performance data from
+    /// the analytics table, helping the LLM learn from past successes/failures.
+    /// Disable for A/B comparison runs.
+    #[arg(long, env = "CTR_HISTORY_ENABLED", default_value_t = true)]
+    pub ctr_history_enabled: bool,
+
     /// VAD backend: "silero" (Silero VAD ONNX, default) or "ffmpeg" (silencedetect fallback).
     /// If silero is selected but the model file is missing, falls back to ffmpeg automatically.
     #[arg(long, env = "VAD_BACKEND", default_value = "silero")]

@@ -1,7 +1,7 @@
 Episode show: {{show_name}}
 Hosts: {{hosts}}
 Guest: {{guest}}
-
+{{performance_history}}
 Below is a JSON array of candidate clip windows from this episode. Each
 candidate has:
 - index, start_secs, end_secs: where in the episode

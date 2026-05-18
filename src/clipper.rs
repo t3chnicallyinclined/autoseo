@@ -24,6 +24,7 @@ use crate::gmail::GmailClient;
 use crate::google_auth::GoogleAuth;
 use crate::media;
 use crate::mime::build_mime_email;
+use crate::performance_history;
 use crate::prosody;
 use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
@@ -274,12 +275,24 @@ async fn run_clipper_pipeline_inner(
         .trim()
         .to_string();
 
-    let ranker = Ranker::new(
+    let mut ranker = Ranker::new(
         ai.openai.clone(),
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
     );
+
+    // Inject CTR history into ranker prompt when enabled.
+    if cfg.ctr_history_enabled {
+        let history = performance_history::build_performance_history(storage).await;
+        if !history.is_empty() {
+            tracing::info!(
+                chars = history.len(),
+                "clipper: injecting CTR performance history into ranker"
+            );
+        }
+        ranker.performance_history = history;
+    }
 
     let final_top_k = cfg.clip_top_k.max(1);
     let llm_top_k = if cfg.vlm_rerank_enabled {
@@ -881,12 +894,26 @@ async fn run_clipper_inner(
         .trim()
         .to_string();
 
-    let ranker = Ranker::new(
+    let mut ranker = Ranker::new(
         ai.openai.clone(),
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
     );
+
+    // Inject CTR history into ranker prompt when enabled.
+    if cfg.ctr_history_enabled {
+        if let Some(st) = storage {
+            let history = performance_history::build_performance_history(st).await;
+            if !history.is_empty() {
+                tracing::info!(
+                    chars = history.len(),
+                    "clipper: injecting CTR performance history into ranker"
+                );
+            }
+            ranker.performance_history = history;
+        }
+    }
 
     let final_top_k = cfg.clip_top_k.max(1);
     // If VLM re-rank is on, pass a wider top-K through the LLM ranker so the

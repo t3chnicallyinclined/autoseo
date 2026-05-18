@@ -34,6 +34,9 @@ pub struct Ranker {
     pub user_prompt_template: String,
     pub batch_size: usize,
     pub refine_drift_secs: f64,
+    /// Pre-formatted performance history block to inject via `{{performance_history}}`.
+    /// Empty string when no history is available (backward-compatible).
+    pub performance_history: String,
 }
 
 impl Ranker {
@@ -50,6 +53,7 @@ impl Ranker {
             user_prompt_template,
             batch_size: 10,
             refine_drift_secs: 5.0,
+            performance_history: String::new(),
         }
     }
 
@@ -133,7 +137,8 @@ impl Ranker {
         out = out
             .replace("{{show_name}}", &show_name)
             .replace("{{hosts}}", &hosts)
-            .replace("{{guest}}", &guest);
+            .replace("{{guest}}", &guest)
+            .replace("{{performance_history}}", &self.performance_history);
         out
     }
 

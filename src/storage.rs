@@ -160,6 +160,58 @@ CREATE TABLE IF NOT EXISTS show_loudness (
 );
 "#;
 
+const SCHEMA_V4: &str = r#"
+ALTER TABLE clips ADD COLUMN status TEXT NOT NULL DEFAULT 'generated';
+ALTER TABLE clips ADD COLUMN social_copy_json TEXT;
+"#;
+
+/// A clip row with its renders and posts joined.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClipDetail {
+    pub id: String,
+    pub job_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub rank: Option<i64>,
+    pub score: Option<f64>,
+    pub hook: Option<String>,
+    pub reasoning_json: Option<String>,
+    pub trend_match: Option<String>,
+    pub status: String,
+    pub social_copy_json: Option<String>,
+    pub renders: Vec<ClipRenderRow>,
+    pub posts: Vec<PostRow>,
+    pub job: Option<JobSummary>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClipRenderRow {
+    pub clip_id: String,
+    pub variant: String,
+    pub path: String,
+    pub bytes: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostRow {
+    pub clip_id: String,
+    pub platform: String,
+    pub status: String,
+    pub external_id: Option<String>,
+    pub external_url: Option<String>,
+    pub posted_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobSummary {
+    pub id: String,
+    pub show_slug: Option<String>,
+    pub media_name: Option<String>,
+    pub status: String,
+}
+
 impl Storage {
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -610,6 +662,312 @@ impl Storage {
         .await
         .context("join get_clip_performance_history")??;
         Ok(rows)
+    }
+
+    /// List all clips with optional status filter, including renders and posts.
+    pub async fn list_clips(
+        &self,
+        status_filter: Option<&str>,
+    ) -> anyhow::Result<Vec<ClipDetail>> {
+        let conn = self.conn.clone();
+        let status_filter = status_filter.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipDetail>> {
+            let conn = conn.blocking_lock();
+
+            let clip_sql = if status_filter.is_some() {
+                "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
+                 c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
+                 j.show_slug, j.media_name, j.status as job_status \
+                 FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
+                 WHERE c.status = ?1 ORDER BY c.rank ASC NULLS LAST"
+            } else {
+                "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
+                 c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
+                 j.show_slug, j.media_name, j.status as job_status \
+                 FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
+                 ORDER BY c.rank ASC NULLS LAST"
+            };
+
+            let mut stmt = conn.prepare(clip_sql).context("prepare list_clips")?;
+            let rows: Vec<ClipDetail> = if let Some(ref sf) = status_filter {
+                stmt.query_map([sf], |r| {
+                    Ok(ClipDetail {
+                        id: r.get(0)?,
+                        job_id: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        rank: r.get(4)?,
+                        score: r.get(5)?,
+                        hook: r.get(6)?,
+                        reasoning_json: r.get(7)?,
+                        trend_match: r.get(8)?,
+                        status: r.get(9)?,
+                        social_copy_json: r.get(10)?,
+                        renders: Vec::new(),
+                        posts: Vec::new(),
+                        job: Some(JobSummary {
+                            id: r.get::<_, String>(1)?,
+                            show_slug: r.get(11)?,
+                            media_name: r.get(12)?,
+                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        }),
+                    })
+                })
+                .context("query list_clips")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect list_clips")?
+            } else {
+                stmt.query_map([], |r| {
+                    Ok(ClipDetail {
+                        id: r.get(0)?,
+                        job_id: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        rank: r.get(4)?,
+                        score: r.get(5)?,
+                        hook: r.get(6)?,
+                        reasoning_json: r.get(7)?,
+                        trend_match: r.get(8)?,
+                        status: r.get(9)?,
+                        social_copy_json: r.get(10)?,
+                        renders: Vec::new(),
+                        posts: Vec::new(),
+                        job: Some(JobSummary {
+                            id: r.get::<_, String>(1)?,
+                            show_slug: r.get(11)?,
+                            media_name: r.get(12)?,
+                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        }),
+                    })
+                })
+                .context("query list_clips")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect list_clips")?
+            };
+
+            // Fetch renders and posts for all clips
+            let mut result = rows;
+            for clip in &mut result {
+                let mut render_stmt = conn
+                    .prepare(
+                        "SELECT clip_id, variant, path, bytes, duration_ms \
+                         FROM clip_renders WHERE clip_id = ?1",
+                    )
+                    .context("prepare renders")?;
+                clip.renders = render_stmt
+                    .query_map([&clip.id], |r| {
+                        Ok(ClipRenderRow {
+                            clip_id: r.get(0)?,
+                            variant: r.get(1)?,
+                            path: r.get(2)?,
+                            bytes: r.get(3)?,
+                            duration_ms: r.get(4)?,
+                        })
+                    })
+                    .context("query renders")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("collect renders")?;
+
+                let mut post_stmt = conn
+                    .prepare(
+                        "SELECT clip_id, platform, status, external_id, external_url, posted_at, error \
+                         FROM posts WHERE clip_id = ?1",
+                    )
+                    .context("prepare posts")?;
+                clip.posts = post_stmt
+                    .query_map([&clip.id], |r| {
+                        Ok(PostRow {
+                            clip_id: r.get(0)?,
+                            platform: r.get(1)?,
+                            status: r.get(2)?,
+                            external_id: r.get(3)?,
+                            external_url: r.get(4)?,
+                            posted_at: r.get(5)?,
+                            error: r.get(6)?,
+                        })
+                    })
+                    .context("query posts")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("collect posts")?;
+            }
+            Ok(result)
+        })
+        .await
+        .context("join list_clips")?
+    }
+
+    /// Get a single clip by ID with renders and posts.
+    pub async fn get_clip(&self, clip_id: &str) -> anyhow::Result<Option<ClipDetail>> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ClipDetail>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
+                     c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
+                     j.show_slug, j.media_name, j.status as job_status \
+                     FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
+                     WHERE c.id = ?1",
+                )
+                .context("prepare get_clip")?;
+            let clip = stmt
+                .query_row([&clip_id], |r| {
+                    Ok(ClipDetail {
+                        id: r.get(0)?,
+                        job_id: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        rank: r.get(4)?,
+                        score: r.get(5)?,
+                        hook: r.get(6)?,
+                        reasoning_json: r.get(7)?,
+                        trend_match: r.get(8)?,
+                        status: r.get(9)?,
+                        social_copy_json: r.get(10)?,
+                        renders: Vec::new(),
+                        posts: Vec::new(),
+                        job: Some(JobSummary {
+                            id: r.get::<_, String>(1)?,
+                            show_slug: r.get(11)?,
+                            media_name: r.get(12)?,
+                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        }),
+                    })
+                })
+                .optional()
+                .context("query get_clip")?;
+
+            let Some(mut clip) = clip else {
+                return Ok(None);
+            };
+
+            // Fetch renders
+            let mut render_stmt = conn
+                .prepare("SELECT clip_id, variant, path, bytes, duration_ms FROM clip_renders WHERE clip_id = ?1")
+                .context("prepare clip renders")?;
+            clip.renders = render_stmt
+                .query_map([&clip.id], |r| {
+                    Ok(ClipRenderRow {
+                        clip_id: r.get(0)?,
+                        variant: r.get(1)?,
+                        path: r.get(2)?,
+                        bytes: r.get(3)?,
+                        duration_ms: r.get(4)?,
+                    })
+                })
+                .context("query clip renders")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect clip renders")?;
+
+            // Fetch posts
+            let mut post_stmt = conn
+                .prepare("SELECT clip_id, platform, status, external_id, external_url, posted_at, error FROM posts WHERE clip_id = ?1")
+                .context("prepare clip posts")?;
+            clip.posts = post_stmt
+                .query_map([&clip.id], |r| {
+                    Ok(PostRow {
+                        clip_id: r.get(0)?,
+                        platform: r.get(1)?,
+                        status: r.get(2)?,
+                        external_id: r.get(3)?,
+                        external_url: r.get(4)?,
+                        posted_at: r.get(5)?,
+                        error: r.get(6)?,
+                    })
+                })
+                .context("query clip posts")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect clip posts")?;
+
+            Ok(Some(clip))
+        })
+        .await
+        .context("join get_clip")?
+    }
+
+    /// Update the status of a clip (generated, approved, vetoed, posted).
+    pub async fn update_clip_status(&self, clip_id: &str, status: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let status = status.to_string();
+        let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.blocking_lock();
+            let n = conn
+                .execute(
+                    "UPDATE clips SET status = ?1 WHERE id = ?2",
+                    rusqlite::params![status, clip_id],
+                )
+                .context("update_clip_status")?;
+            Ok(n > 0)
+        })
+        .await
+        .context("join update_clip_status")??;
+        Ok(changed)
+    }
+
+    /// Update the hook text of a clip.
+    pub async fn update_clip_hook(&self, clip_id: &str, hook: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let hook = hook.to_string();
+        let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.blocking_lock();
+            let n = conn
+                .execute(
+                    "UPDATE clips SET hook = ?1 WHERE id = ?2",
+                    rusqlite::params![hook, clip_id],
+                )
+                .context("update_clip_hook")?;
+            Ok(n > 0)
+        })
+        .await
+        .context("join update_clip_hook")??;
+        Ok(changed)
+    }
+
+    /// Update social copy JSON for a clip.
+    pub async fn update_clip_social_copy(&self, clip_id: &str, social_copy_json: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let json = social_copy_json.to_string();
+        let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.blocking_lock();
+            let n = conn
+                .execute(
+                    "UPDATE clips SET social_copy_json = ?1 WHERE id = ?2",
+                    rusqlite::params![json, clip_id],
+                )
+                .context("update_clip_social_copy")?;
+            Ok(n > 0)
+        })
+        .await
+        .context("join update_clip_social_copy")??;
+        Ok(changed)
+    }
+
+    /// Bulk update clip statuses.
+    pub async fn bulk_update_clip_status(&self, clip_ids: &[String], status: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let ids = clip_ids.to_vec();
+        let status = status.to_string();
+        let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.blocking_lock();
+            let mut total = 0usize;
+            for id in &ids {
+                let n = conn
+                    .execute(
+                        "UPDATE clips SET status = ?1 WHERE id = ?2",
+                        rusqlite::params![status, id],
+                    )
+                    .context("bulk_update_clip_status")?;
+                total += n;
+            }
+            Ok(total)
+        })
+        .await
+        .context("join bulk_update_clip_status")??;
+        Ok(count)
     }
 
     /// Insert a post row. Idempotent (INSERT OR REPLACE).

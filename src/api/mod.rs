@@ -1,3 +1,4 @@
+mod clips;
 pub mod config_store;
 
 use axum::{Json, Router, extract::{Path, State}, response::Html, routing::{get, patch, post}};
@@ -314,8 +315,8 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::PUT,
-            axum::http::Method::DELETE,
             axum::http::Method::PATCH,
+            axum::http::Method::DELETE,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
@@ -325,7 +326,8 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
     let api_routes = Router::new()
         .route("/health", get(health))
         .route("/config", get(get_config).patch(patch_config))
-        .route("/config/test/{service}", post(test_service));
+        .route("/config/test/{service}", post(test_service))
+        .merge(clips::router());
 
     let app = Router::new()
         .nest("/api", api_routes)

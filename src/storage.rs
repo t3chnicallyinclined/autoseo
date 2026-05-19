@@ -1186,18 +1186,6 @@ impl Storage {
     }
 }
 
-/// A row from the `posts` table.
-#[derive(Debug, Clone)]
-pub struct PostRow {
-    pub clip_id: String,
-    pub platform: String,
-    pub status: String,
-    pub external_id: Option<String>,
-    pub external_url: Option<String>,
-    pub posted_at: Option<i64>,
-    pub error: Option<String>,
-}
-
 /// A row from the `analytics` table.
 #[derive(Debug, Clone)]
 pub struct AnalyticsRow {
@@ -1216,7 +1204,7 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
 "#;
 
-const SCHEMA_V4: &str = r#"
+const SCHEMA_V5: &str = r#"
 ALTER TABLE analytics ADD COLUMN likes INTEGER;
 ALTER TABLE analytics ADD COLUMN reposts INTEGER;
 ALTER TABLE analytics ADD COLUMN replies INTEGER;
@@ -1248,6 +1236,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA_V4).context("apply schema v4")?;
         conn.pragma_update(None, "user_version", 4)
             .context("set user_version=4")?;
+    }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5).context("apply schema v5")?;
+        conn.pragma_update(None, "user_version", 5)
+            .context("set user_version=5")?;
     }
     Ok(())
 }

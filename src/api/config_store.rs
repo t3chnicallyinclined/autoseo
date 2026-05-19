@@ -90,9 +90,9 @@ impl ConfigStore {
     /// Get a single raw value by key.
     pub async fn get_value(&self, key: &str) -> Option<String> {
         let data = self.data.read().await;
-        data.values.get(key).and_then(|v| match v {
-            serde_json::Value::String(s) => Some(s.clone()),
-            other => Some(other.to_string()),
+        data.values.get(key).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
         })
     }
 
@@ -176,7 +176,12 @@ mod tests {
 
         // Masked response hides secret
         let masked = store.get_masked().await;
-        let key = masked.values.get("OPENAI_API_KEY").unwrap().as_str().unwrap();
+        let key = masked
+            .values
+            .get("OPENAI_API_KEY")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert!(key.contains("••••"));
         assert!(!key.contains("test123456789"));
 

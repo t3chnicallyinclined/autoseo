@@ -24,7 +24,8 @@ pub async fn ensure_model(model_path: &str) -> Result<PathBuf> {
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    let url = "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/DeepFilterNet3.tar.gz";
+    let url =
+        "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/DeepFilterNet3.tar.gz";
     tracing::info!(url, dest = %path.display(), "downloading DeepFilterNet3 model");
 
     let resp = reqwest::get(url)
@@ -33,7 +34,10 @@ pub async fn ensure_model(model_path: &str) -> Result<PathBuf> {
         .error_for_status()
         .context("DeepFilterNet3 model download HTTP error")?;
 
-    let bytes = resp.bytes().await.context("read DeepFilterNet3 model bytes")?;
+    let bytes = resp
+        .bytes()
+        .await
+        .context("read DeepFilterNet3 model bytes")?;
     tokio::fs::write(&path, &bytes)
         .await
         .with_context(|| format!("write model to {}", path.display()))?;
@@ -43,11 +47,7 @@ pub async fn ensure_model(model_path: &str) -> Result<PathBuf> {
 }
 
 /// Extract audio from a media file to a 48 kHz mono WAV (DeepFilterNet's native rate).
-pub async fn extract_48k_wav(
-    ffmpeg: &str,
-    input: &Path,
-    output: &Path,
-) -> Result<()> {
+pub async fn extract_48k_wav(ffmpeg: &str, input: &Path, output: &Path) -> Result<()> {
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
@@ -102,8 +102,7 @@ fn enhance_blocking(model_path: &Path, input_path: &Path, output_path: &Path) ->
     let dfp = DfParams::new(model_path.to_owned())
         .with_context(|| format!("load DeepFilterNet3 model from {}", model_path.display()))?;
     let rp = RuntimeParams::default_with_ch(CHANNELS);
-    let mut df = DfTract::new(dfp, &rp)
-        .context("initialize DeepFilterNet3 runtime")?;
+    let mut df = DfTract::new(dfp, &rp).context("initialize DeepFilterNet3 runtime")?;
 
     // Read input WAV
     let reader = hound::WavReader::open(input_path)
@@ -155,8 +154,8 @@ fn enhance_blocking(model_path: &Path, input_path: &Path, output_path: &Path) ->
         let mut frame_buf = vec![0.0f32; HOP_SIZE];
         frame_buf[..frame_len].copy_from_slice(&samples[start..end]);
 
-        let noisy = Array2::from_shape_vec((CHANNELS, HOP_SIZE), frame_buf)
-            .context("shape noisy frame")?;
+        let noisy =
+            Array2::from_shape_vec((CHANNELS, HOP_SIZE), frame_buf).context("shape noisy frame")?;
         let mut enh = Array2::zeros((CHANNELS, HOP_SIZE));
 
         df.process(noisy.view(), enh.view_mut())
@@ -182,7 +181,9 @@ fn enhance_blocking(model_path: &Path, input_path: &Path, output_path: &Path) ->
     for &s in &enhanced {
         let clamped = s.clamp(-1.0, 1.0);
         let int_val = (clamped * 32767.0) as i16;
-        writer.write_sample(int_val).context("write enhanced sample")?;
+        writer
+            .write_sample(int_val)
+            .context("write enhanced sample")?;
     }
     writer.finalize().context("finalize enhanced wav")?;
 
@@ -196,7 +197,11 @@ fn enhance_blocking(model_path: &Path, input_path: &Path, output_path: &Path) ->
 
 /// Stub when the `enhance` feature is not compiled in.
 #[cfg(not(feature = "enhance"))]
-pub async fn enhance_audio(_model_path: &Path, _input_path: &Path, _output_path: &Path) -> Result<()> {
+pub async fn enhance_audio(
+    _model_path: &Path,
+    _input_path: &Path,
+    _output_path: &Path,
+) -> Result<()> {
     anyhow::bail!(
         "ENHANCE_AUDIO=true requires the `enhance` cargo feature. \
          Recompile with: cargo build --features enhance"
@@ -271,8 +276,18 @@ mod tests {
 
     #[tokio::test]
     async fn maybe_enhance_disabled_returns_none() {
-        let result = maybe_enhance("ffmpeg", Path::new("/nonexistent"), Path::new("/tmp"), "./models/nope.tar.gz", false).await;
-        assert!(result.is_none(), "should return None when enhance_enabled=false");
+        let result = maybe_enhance(
+            "ffmpeg",
+            Path::new("/nonexistent"),
+            Path::new("/tmp"),
+            "./models/nope.tar.gz",
+            false,
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "should return None when enhance_enabled=false"
+        );
     }
 
     #[tokio::test]
@@ -283,11 +298,17 @@ mod tests {
             "ffmpeg",
             Path::new("/nonexistent.mp4"),
             tmp.path(),
-            tmp.path().join("nonexistent_model.tar.gz").to_str().unwrap(),
+            tmp.path()
+                .join("nonexistent_model.tar.gz")
+                .to_str()
+                .unwrap(),
             true,
         )
         .await;
-        assert!(result.is_none(), "should gracefully fall back when model is missing");
+        assert!(
+            result.is_none(),
+            "should gracefully fall back when model is missing"
+        );
     }
 
     #[tokio::test]
@@ -303,7 +324,13 @@ mod tests {
 
         // Generate a 1-second 16kHz mono sine wave via ffmpeg.
         let status = Command::new("ffmpeg")
-            .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=16000"])
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1:sample_rate=16000",
+            ])
             .args(["-ac", "1", "-c:a", "pcm_s16le"])
             .arg(&src)
             .stdout(std::process::Stdio::null())
@@ -329,7 +356,9 @@ mod tests {
         let enhanced_path = tmp.path().join("audio_48k_enhanced.wav");
 
         // Create a dummy enhanced file.
-        tokio::fs::write(&enhanced_path, b"fake enhanced wav").await.unwrap();
+        tokio::fs::write(&enhanced_path, b"fake enhanced wav")
+            .await
+            .unwrap();
 
         let result = maybe_enhance(
             "ffmpeg",
@@ -340,6 +369,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Some(enhanced_path), "should reuse existing enhanced file");
+        assert_eq!(
+            result,
+            Some(enhanced_path),
+            "should reuse existing enhanced file"
+        );
     }
 }

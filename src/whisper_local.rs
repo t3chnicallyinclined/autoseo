@@ -40,9 +40,7 @@ impl WhisperLocal {
             .context("model path is not valid UTF-8")?;
         let ctx = WhisperContext::new_with_params(model_str, WhisperContextParameters::default())
             .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))?;
-        Ok(Self {
-            ctx: Arc::new(ctx),
-        })
+        Ok(Self { ctx: Arc::new(ctx) })
     }
 
     /// Resolve the default model path: `{work_dir}/models/whisper/ggml-large-v3-turbo.bin`
@@ -95,9 +93,7 @@ fn transcribe_blocking(
     for i in 0..n_segments {
         let seg_start = state.full_get_segment_t0(i).unwrap_or(0) as f64 / 100.0;
         let seg_end = state.full_get_segment_t1(i).unwrap_or(0) as f64 / 100.0;
-        let seg_text = state
-            .full_get_segment_text(i)
-            .unwrap_or_default();
+        let seg_text = state.full_get_segment_text(i).unwrap_or_default();
 
         segments.push(TranscriptionSegment {
             id: Some(i as u64),
@@ -159,34 +155,35 @@ fn read_wav_samples(path: &Path) -> anyhow::Result<Vec<f32>> {
         .with_context(|| format!("open wav file {}", path.display()))?;
     let spec = reader.spec();
 
-    let samples_i16: Vec<i16> = if spec.bits_per_sample == 16 && spec.sample_format == hound::SampleFormat::Int {
-        reader
-            .into_samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .context("read wav samples")?
-    } else if spec.bits_per_sample == 32 && spec.sample_format == hound::SampleFormat::Float {
-        let float_samples: Vec<f32> = reader
-            .into_samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .context("read wav float samples")?;
-        // Convert to mono if needed, then return directly as f32.
-        let mono = if spec.channels > 1 {
-            float_samples
-                .chunks(spec.channels as usize)
-                .map(|ch| ch.iter().sum::<f32>() / ch.len() as f32)
-                .collect()
+    let samples_i16: Vec<i16> =
+        if spec.bits_per_sample == 16 && spec.sample_format == hound::SampleFormat::Int {
+            reader
+                .into_samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .context("read wav samples")?
+        } else if spec.bits_per_sample == 32 && spec.sample_format == hound::SampleFormat::Float {
+            let float_samples: Vec<f32> = reader
+                .into_samples::<f32>()
+                .collect::<Result<Vec<_>, _>>()
+                .context("read wav float samples")?;
+            // Convert to mono if needed, then return directly as f32.
+            let mono = if spec.channels > 1 {
+                float_samples
+                    .chunks(spec.channels as usize)
+                    .map(|ch| ch.iter().sum::<f32>() / ch.len() as f32)
+                    .collect()
+            } else {
+                float_samples
+            };
+            // whisper.cpp expects float samples in [-1, 1], which WAV float already is.
+            return Ok(mono);
         } else {
-            float_samples
+            // Try reading as i16 anyway; hound will convert.
+            reader
+                .into_samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .context("read wav samples (fallback i16)")?
         };
-        // whisper.cpp expects float samples in [-1, 1], which WAV float already is.
-        return Ok(mono);
-    } else {
-        // Try reading as i16 anyway; hound will convert.
-        reader
-            .into_samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .context("read wav samples (fallback i16)")?
-    };
 
     // Mix down to mono.
     let mono: Vec<i16> = if spec.channels > 1 {
@@ -224,8 +221,14 @@ mod tests {
         let result = WhisperLocal::load(Path::new("/nonexistent/model.bin"));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not found"), "error should mention not found: {err}");
-        assert!(err.contains("huggingface"), "error should mention download URL: {err}");
+        assert!(
+            err.contains("not found"),
+            "error should mention not found: {err}"
+        );
+        assert!(
+            err.contains("huggingface"),
+            "error should mention download URL: {err}"
+        );
     }
 
     #[test]

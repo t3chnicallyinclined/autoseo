@@ -152,8 +152,7 @@ impl CandidateGenerator {
             }
         };
         let snapped_end = {
-            let by_silence =
-                vad::snap_to_silence_boundary(end, silences, self.silence_drift_secs);
+            let by_silence = vad::snap_to_silence_boundary(end, silences, self.silence_drift_secs);
             if (by_silence - end).abs() < f64::EPSILON {
                 scene::snap_to_shot(end, shots, self.shot_drift_secs)
             } else {
@@ -179,10 +178,7 @@ impl CandidateGenerator {
 /// Attach novelty scores to a candidate set by embedding each window's transcript
 /// and computing cosine distance to the centroid (normalized 0..=1 within the batch).
 /// Mutates in place.
-pub async fn attach_novelty(
-    windows: &mut [CandidateWindow],
-    embedder: &Embedder,
-) -> Result<()> {
+pub async fn attach_novelty(windows: &mut [CandidateWindow], embedder: &Embedder) -> Result<()> {
     if windows.is_empty() {
         return Ok(());
     }
@@ -237,10 +233,7 @@ fn build_window(
 
 /// Attach AST audio-event scores to each candidate by aggregating overlapping
 /// scored windows. Mutates in place.
-pub fn attach_audio_events(
-    windows: &mut [CandidateWindow],
-    scored: &[ScoredWindow],
-) {
+pub fn attach_audio_events(windows: &mut [CandidateWindow], scored: &[ScoredWindow]) {
     for w in windows.iter_mut() {
         w.audio_events = ast::aggregate_events(scored, w.start_secs, w.end_secs);
     }

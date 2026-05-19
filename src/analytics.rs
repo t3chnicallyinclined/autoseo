@@ -67,7 +67,10 @@ pub async fn pull_analytics(
                 "youtube" => fetch_youtube_analytics(google, external_id).await,
                 "bluesky" => fetch_bluesky_analytics(cfg, external_id).await,
                 other => {
-                    tracing::debug!(platform = other, "analytics: unsupported platform, skipping");
+                    tracing::debug!(
+                        platform = other,
+                        "analytics: unsupported platform, skipping"
+                    );
                     continue;
                 }
             };
@@ -149,9 +152,7 @@ async fn fetch_youtube_analytics(
         .context("refresh token for YouTube analytics")?;
 
     let http = reqwest::Client::new();
-    let url = format!(
-        "https://www.googleapis.com/youtube/v3/videos?part=statistics&id={video_id}"
-    );
+    let url = format!("https://www.googleapis.com/youtube/v3/videos?part=statistics&id={video_id}");
     let res = http
         .get(&url)
         .bearer_auth(&token)
@@ -166,10 +167,7 @@ async fn fetch_youtube_analytics(
     }
 
     let parsed: YtVideoListResponse = res.json().await.context("parse youtube videos.list")?;
-    let stats = parsed
-        .items
-        .first()
-        .and_then(|i| i.statistics.as_ref());
+    let stats = parsed.items.first().and_then(|i| i.statistics.as_ref());
 
     let now = unix_now();
     match stats {
@@ -179,7 +177,7 @@ async fn fetch_youtube_analytics(
             fetched_at: now,
             views: s.view_count.as_deref().and_then(|v| v.parse().ok()),
             ctr: None,       // requires YouTube Analytics API (yt-analytics.readonly scope)
-            watch_pct: None,  // requires YouTube Analytics API
+            watch_pct: None, // requires YouTube Analytics API
             likes: s.like_count.as_deref().and_then(|v| v.parse().ok()),
             reposts: None,
             replies: s.comment_count.as_deref().and_then(|v| v.parse().ok()),
@@ -267,13 +265,10 @@ async fn fetch_bluesky_analytics(cfg: &Config, at_uri: &str) -> Result<Analytics
     let session: Session = res.json().await.context("parse bluesky session")?;
 
     // Fetch the thread to get engagement counts.
-    let encoded_uri = percent_encoding::utf8_percent_encode(
-        at_uri,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let thread_url = format!(
-        "{pds_url}/xrpc/app.bsky.feed.getPostThread?uri={encoded_uri}&depth=0"
-    );
+    let encoded_uri =
+        percent_encoding::utf8_percent_encode(at_uri, percent_encoding::NON_ALPHANUMERIC);
+    let thread_url =
+        format!("{pds_url}/xrpc/app.bsky.feed.getPostThread?uri={encoded_uri}&depth=0");
     let res = http
         .get(&thread_url)
         .bearer_auth(&session.access_jwt)
@@ -288,9 +283,7 @@ async fn fetch_bluesky_analytics(cfg: &Config, at_uri: &str) -> Result<Analytics
     }
 
     let parsed: BskyThreadResponse = res.json().await.context("parse bluesky thread")?;
-    let post = parsed
-        .thread
-        .and_then(|t| t.post);
+    let post = parsed.thread.and_then(|t| t.post);
 
     let now = unix_now();
     match post {
@@ -298,7 +291,7 @@ async fn fetch_bluesky_analytics(cfg: &Config, at_uri: &str) -> Result<Analytics
             clip_id: String::new(),
             platform: String::new(),
             fetched_at: now,
-            views: None,      // Bluesky doesn't expose view counts
+            views: None, // Bluesky doesn't expose view counts
             ctr: None,
             watch_pct: None,
             likes: p.like_count,
@@ -410,7 +403,7 @@ mod tests {
         // Create job + clip + post.
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), Some(90.0), None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), Some(90.0), None, None, None)
             .await
             .unwrap();
 
@@ -471,14 +464,22 @@ mod tests {
         let storage = Storage::open_in_memory_sync();
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None)
             .await
             .unwrap();
 
         // Posted 1 hour ago — not yet due for 24h window.
         let now = unix_now();
         storage
-            .insert_post("c1", "bluesky", "posted", Some("at://x"), None, Some(now - 3600), None)
+            .insert_post(
+                "c1",
+                "bluesky",
+                "posted",
+                Some("at://x"),
+                None,
+                Some(now - 3600),
+                None,
+            )
             .await
             .unwrap();
 
@@ -494,7 +495,7 @@ mod tests {
         let storage = Storage::open_in_memory_sync();
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None)
             .await
             .unwrap();
 

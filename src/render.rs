@@ -100,7 +100,17 @@ pub async fn render_clip(
     profile: &RenderProfile,
     subtitle_paths: &[&Path],
 ) -> anyhow::Result<()> {
-    render_clip_with_audio(ffmpeg, input, None, start_secs, end_secs, output, profile, subtitle_paths).await
+    render_clip_with_audio(
+        ffmpeg,
+        input,
+        None,
+        start_secs,
+        end_secs,
+        output,
+        profile,
+        subtitle_paths,
+    )
+    .await
 }
 
 /// Like [`render_clip`] but optionally replaces the audio track with an
@@ -118,10 +128,11 @@ pub async fn render_clip_with_audio(
     profile: &RenderProfile,
     subtitle_paths: &[&Path],
 ) -> anyhow::Result<()> {
-    if !matches!(end_secs.partial_cmp(&start_secs), Some(std::cmp::Ordering::Greater)) {
-        anyhow::bail!(
-            "render_clip: end ({end_secs}) must be after start ({start_secs})"
-        );
+    if !matches!(
+        end_secs.partial_cmp(&start_secs),
+        Some(std::cmp::Ordering::Greater)
+    ) {
+        anyhow::bail!("render_clip: end ({end_secs}) must be after start ({start_secs})");
     }
     if let Some(parent) = output.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -154,7 +165,14 @@ pub async fn render_clip_with_audio(
 
     cmd.args(["-vf", &vf])
         .args(["-af", &af])
-        .args(["-c:v", "libx264", "-preset", "medium", "-crf", &profile.crf.to_string()])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            &profile.crf.to_string(),
+        ])
         .args(["-pix_fmt", "yuv420p"])
         .args(["-c:a", "aac", "-b:a", "128k"])
         .args(["-movflags", "+faststart"])
@@ -248,11 +266,17 @@ mod tests {
         let p = RenderProfile::shorts_vertical();
         let f = build_video_filter(
             &p,
-            &[Path::new("/tmp/overlay.ass"), Path::new("/tmp/captions.ass")],
+            &[
+                Path::new("/tmp/overlay.ass"),
+                Path::new("/tmp/captions.ass"),
+            ],
         );
         let overlay_pos = f.find("/tmp/overlay.ass").expect("overlay in filter");
         let captions_pos = f.find("/tmp/captions.ass").expect("captions in filter");
-        assert!(overlay_pos < captions_pos, "overlay should burn before captions");
+        assert!(
+            overlay_pos < captions_pos,
+            "overlay should burn before captions"
+        );
     }
 
     #[test]
@@ -300,9 +324,22 @@ mod tests {
         // 6s 1920x1080 testsrc with a tone.
         let status = Command::new("ffmpeg")
             .args(["-y", "-hide_banner", "-loglevel", "error"])
-            .args(["-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=6"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1920x1080:rate=30:duration=6",
+            ])
             .args(["-f", "lavfi", "-i", "sine=frequency=1000:duration=6"])
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
             .arg(&src)
             .status()
             .await?;

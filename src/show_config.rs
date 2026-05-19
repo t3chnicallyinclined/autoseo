@@ -151,9 +151,9 @@ impl DigestMode {
             "file" | "disk" | "local" => Ok(DigestMode::File),
             "email" | "mail" | "gmail" => Ok(DigestMode::Email),
             "both" | "all" => Ok(DigestMode::Both),
-            other => anyhow::bail!(
-                "invalid DIGEST_MODE='{other}'; expected one of file, email, both"
-            ),
+            other => {
+                anyhow::bail!("invalid DIGEST_MODE='{other}'; expected one of file, email, both")
+            }
         }
     }
 
@@ -183,9 +183,18 @@ mod tests {
 
     #[test]
     fn slugify_basic() {
-        assert_eq!(slugify("The Fighter and the Kid"), "the_fighter_and_the_kid");
-        assert_eq!(slugify("Hot Boxin' with Mike Tyson"), "hot_boxin_with_mike_tyson");
-        assert_eq!(slugify("TFATK #1147 — Nick Simmons"), "tfatk_1147_nick_simmons");
+        assert_eq!(
+            slugify("The Fighter and the Kid"),
+            "the_fighter_and_the_kid"
+        );
+        assert_eq!(
+            slugify("Hot Boxin' with Mike Tyson"),
+            "hot_boxin_with_mike_tyson"
+        );
+        assert_eq!(
+            slugify("TFATK #1147 — Nick Simmons"),
+            "tfatk_1147_nick_simmons"
+        );
         assert_eq!(slugify("   leading spaces"), "leading_spaces");
         assert_eq!(slugify("trailing___"), "trailing");
         assert_eq!(slugify(""), "");
@@ -254,7 +263,9 @@ mod tests {
         assert_eq!(text, "TFATK-SPECIFIC");
 
         // Unrelated show falls back.
-        let text2 = loader.load(PromptName::SeoSystem, Some("other_show")).await?;
+        let text2 = loader
+            .load(PromptName::SeoSystem, Some("other_show"))
+            .await?;
         assert_eq!(text2, "GLOBAL");
 
         // No slug → global.

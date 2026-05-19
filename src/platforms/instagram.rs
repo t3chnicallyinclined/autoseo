@@ -70,9 +70,9 @@ impl InstagramPoster {
         video_path: &Path,
         caption: &str,
     ) -> Result<String> {
-        let video_bytes = tokio::fs::read(video_path)
-            .await
-            .with_context(|| format!("read video for instagram upload: {}", video_path.display()))?;
+        let video_bytes = tokio::fs::read(video_path).await.with_context(|| {
+            format!("read video for instagram upload: {}", video_path.display())
+        })?;
         let file_size = video_bytes.len();
 
         // 1. Create resumable upload container
@@ -96,9 +96,7 @@ impl InstagramPoster {
         tracing::info!("instagram: container ready");
 
         // 4. Publish
-        let media_id = self
-            .publish(access_token, user_id, &container.id)
-            .await?;
+        let media_id = self.publish(access_token, user_id, &container.id).await?;
         tracing::info!(media_id = %media_id, "instagram: reel published");
 
         Ok(media_id)
@@ -109,7 +107,7 @@ impl InstagramPoster {
         access_token: &str,
         user_id: &str,
         caption: &str,
-        file_size: usize,
+        _file_size: usize,
     ) -> Result<CreateContainerResponse> {
         let url = format!("{GRAPH_API_BASE}/{user_id}/media");
         let res = self
@@ -187,10 +185,7 @@ impl InstagramPoster {
             let res = self
                 .http
                 .get(&url)
-                .query(&[
-                    ("fields", "status_code"),
-                    ("access_token", access_token),
-                ])
+                .query(&[("fields", "status_code"), ("access_token", access_token)])
                 .send()
                 .await
                 .with_context(|| format!("GET container status (attempt {attempt})"))?;
@@ -215,9 +210,7 @@ impl InstagramPoster {
             }
             tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
         }
-        anyhow::bail!(
-            "instagram container polling timed out after {POLL_MAX_ATTEMPTS} attempts"
-        )
+        anyhow::bail!("instagram container polling timed out after {POLL_MAX_ATTEMPTS} attempts")
     }
 
     async fn publish(

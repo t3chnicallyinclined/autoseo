@@ -90,10 +90,7 @@ pub struct F0Stats {
 ///
 /// Returns an empty `Vec` (not an error) if `aubio` is not on PATH, so callers
 /// can treat F0 as a best-effort signal.
-pub async fn f0_curve(
-    aubio_bin: &str,
-    media_path: &Path,
-) -> Vec<F0Sample> {
+pub async fn f0_curve(aubio_bin: &str, media_path: &Path) -> Vec<F0Sample> {
     let output = Command::new(aubio_bin)
         .arg("pitch")
         .arg("-i")
@@ -130,11 +127,7 @@ pub async fn f0_curve(
 /// Compute F0 statistics over the voiced samples in `[start_secs, end_secs)`.
 /// Unvoiced frames (pitch_hz == 0) are excluded. Returns `None` if no voiced
 /// frames fall in the range.
-pub fn f0_stats_in_range(
-    curve: &[F0Sample],
-    start_secs: f64,
-    end_secs: f64,
-) -> Option<F0Stats> {
+pub fn f0_stats_in_range(curve: &[F0Sample], start_secs: f64, end_secs: f64) -> Option<F0Stats> {
     let voiced: Vec<f64> = curve
         .iter()
         .filter(|s| s.time_secs >= start_secs && s.time_secs < end_secs && s.pitch_hz > 0.0)
@@ -148,10 +141,7 @@ pub fn f0_stats_in_range(
     let n = voiced.len() as f64;
     let mean = voiced.iter().sum::<f64>() / n;
     let variance = voiced.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
-    let peak = voiced
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let peak = voiced.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     Some(F0Stats {
         mean_hz: mean,
@@ -371,11 +361,26 @@ lavfi.astats.2.RMS_level=-21.0
     #[test]
     fn f0_stats_computes_mean_variance_peak() {
         let curve = vec![
-            F0Sample { time_secs: 0.0, pitch_hz: 100.0 },
-            F0Sample { time_secs: 0.5, pitch_hz: 200.0 },
-            F0Sample { time_secs: 1.0, pitch_hz: 0.0 },   // unvoiced, excluded
-            F0Sample { time_secs: 1.5, pitch_hz: 300.0 },
-            F0Sample { time_secs: 5.0, pitch_hz: 999.0 },  // outside range
+            F0Sample {
+                time_secs: 0.0,
+                pitch_hz: 100.0,
+            },
+            F0Sample {
+                time_secs: 0.5,
+                pitch_hz: 200.0,
+            },
+            F0Sample {
+                time_secs: 1.0,
+                pitch_hz: 0.0,
+            }, // unvoiced, excluded
+            F0Sample {
+                time_secs: 1.5,
+                pitch_hz: 300.0,
+            },
+            F0Sample {
+                time_secs: 5.0,
+                pitch_hz: 999.0,
+            }, // outside range
         ];
         let stats = f0_stats_in_range(&curve, 0.0, 2.0).unwrap();
         // voiced in [0,2): 100, 200, 300 => mean=200, var=6666.67, peak=300
@@ -386,17 +391,19 @@ lavfi.astats.2.RMS_level=-21.0
 
     #[test]
     fn f0_stats_none_when_no_voiced_frames() {
-        let curve = vec![
-            F0Sample { time_secs: 0.5, pitch_hz: 0.0 },
-        ];
+        let curve = vec![F0Sample {
+            time_secs: 0.5,
+            pitch_hz: 0.0,
+        }];
         assert!(f0_stats_in_range(&curve, 0.0, 2.0).is_none());
     }
 
     #[test]
     fn f0_stats_none_when_out_of_range() {
-        let curve = vec![
-            F0Sample { time_secs: 5.0, pitch_hz: 440.0 },
-        ];
+        let curve = vec![F0Sample {
+            time_secs: 5.0,
+            pitch_hz: 440.0,
+        }];
         assert!(f0_stats_in_range(&curve, 0.0, 2.0).is_none());
     }
 
@@ -404,7 +411,10 @@ lavfi.astats.2.RMS_level=-21.0
     async fn f0_curve_returns_empty_when_aubio_missing() {
         // Use a nonexistent binary name to verify graceful fallback.
         let result = f0_curve("__nonexistent_aubio_binary__", Path::new("/dev/null")).await;
-        assert!(result.is_empty(), "should return empty vec when aubio not found");
+        assert!(
+            result.is_empty(),
+            "should return empty vec when aubio not found"
+        );
     }
 
     #[tokio::test]
@@ -424,10 +434,7 @@ lavfi.astats.2.RMS_level=-21.0
             .args(["-f", "lavfi", "-i", "sine=frequency=440:r=16000:d=1"])
             .args(["-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=1"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:r=16000:d=1"])
-            .args([
-                "-filter_complex",
-                "[0][1][2][3]concat=n=4:v=0:a=1[a]",
-            ])
+            .args(["-filter_complex", "[0][1][2][3]concat=n=4:v=0:a=1[a]"])
             .args(["-map", "[a]"])
             .arg(&wav)
             .status()
@@ -456,7 +463,10 @@ lavfi.astats.2.RMS_level=-21.0
                 .map(|w| w.rms_db)
                 .filter(|v| v.is_finite())
                 .fold(f64::NEG_INFINITY, f64::max);
-            assert!(max > -30.0, "expected a loud window above -30dB, got peak {max}");
+            assert!(
+                max > -30.0,
+                "expected a loud window above -30dB, got peak {max}"
+            );
         }
         Ok(())
     }

@@ -92,8 +92,14 @@ pub async fn detect_silences(
             let canonical_str = canonical.to_str().ok_or_else(|| {
                 anyhow::anyhow!("VAD model path is not valid UTF-8: {}", canonical.display())
             })?;
-            detect_silences_silero(ffmpeg, media_path, canonical_str, threshold, min_duration_secs)
-                .await
+            detect_silences_silero(
+                ffmpeg,
+                media_path,
+                canonical_str,
+                threshold,
+                min_duration_secs,
+            )
+            .await
         }
         VadBackend::Ffmpeg => {
             detect_silences_ffmpeg(ffmpeg, media_path, noise_db, min_duration_secs).await
@@ -214,7 +220,7 @@ fn run_silero_vad(
     let mut state = Array::zeros((2, 1, 128_usize)).into_dyn();
     let sr_tensor = Array::from_elem((1,), sample_rate).into_dyn();
 
-    let total_chunks = (samples.len() + chunk_size - 1) / chunk_size;
+    let total_chunks = samples.len().div_ceil(chunk_size);
     let mut speech_probs: Vec<f64> = Vec::with_capacity(total_chunks);
 
     for chunk_idx in 0..total_chunks {
@@ -563,10 +569,7 @@ mod tests {
             .args(["-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=1.5"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:r=16000:d=1"])
             .args(["-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=1.5"])
-            .args([
-                "-filter_complex",
-                "[0][1][2]concat=n=3:v=0:a=1[a]",
-            ])
+            .args(["-filter_complex", "[0][1][2]concat=n=3:v=0:a=1[a]"])
             .args(["-map", "[a]"])
             .arg(&wav)
             .status()
@@ -574,16 +577,8 @@ mod tests {
         anyhow::ensure!(status.success(), "ffmpeg synthetic wav generation failed");
 
         // Test ffmpeg backend explicitly
-        let silences = detect_silences(
-            "ffmpeg",
-            &wav,
-            -30.0,
-            0.3,
-            VadBackend::Ffmpeg,
-            "",
-            0.5,
-        )
-        .await?;
+        let silences =
+            detect_silences("ffmpeg", &wav, -30.0, 0.3, VadBackend::Ffmpeg, "", 0.5).await?;
         assert!(
             !silences.is_empty(),
             "expected silence windows in synthetic audio, got none"
@@ -616,17 +611,12 @@ mod tests {
             .await?;
         anyhow::ensure!(status.success());
 
-        let silences = detect_silences(
-            "ffmpeg",
-            &wav,
-            -30.0,
-            0.3,
-            VadBackend::Ffmpeg,
-            "",
-            0.5,
-        )
-        .await?;
-        assert!(silences.is_empty(), "got silences in tone-only audio: {silences:?}");
+        let silences =
+            detect_silences("ffmpeg", &wav, -30.0, 0.3, VadBackend::Ffmpeg, "", 0.5).await?;
+        assert!(
+            silences.is_empty(),
+            "got silences in tone-only audio: {silences:?}"
+        );
         Ok(())
     }
 }

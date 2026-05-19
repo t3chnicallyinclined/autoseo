@@ -31,8 +31,7 @@ struct GdeltArticle {
     seendate: String,
 }
 
-const GDELT_API_URL: &str =
-    "https://api.gdeltproject.org/api/v2/doc/doc?query=trending&mode=ArtList&maxrecords=30&format=json&sort=DateDesc&timespan=1h";
+const GDELT_API_URL: &str = "https://api.gdeltproject.org/api/v2/doc/doc?query=trending&mode=ArtList&maxrecords=30&format=json&sort=DateDesc&timespan=1h";
 
 impl GdeltFetcher {
     pub fn new() -> Self {

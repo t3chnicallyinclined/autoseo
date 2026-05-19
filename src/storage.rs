@@ -486,10 +486,8 @@ impl Storage {
                         show_slug: r.get(1)?,
                         media_name: r.get(2)?,
                         drive_file_id: r.get(3)?,
-                        status: JobStatus::from_str(
-                            &r.get::<_, String>(4)?,
-                        )
-                        .unwrap_or(JobStatus::Pending),
+                        status: JobStatus::from_str(&r.get::<_, String>(4)?)
+                            .unwrap_or(JobStatus::Pending),
                         retry_count: r.get(5)?,
                         cost_cents: r.get(6)?,
                         error: r.get(7)?,
@@ -613,7 +611,17 @@ impl Storage {
                 "INSERT OR REPLACE INTO clips \
                  (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![clip_id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match],
+                rusqlite::params![
+                    clip_id,
+                    job_id,
+                    start_ms,
+                    end_ms,
+                    rank,
+                    score,
+                    hook,
+                    reasoning_json,
+                    trend_match
+                ],
             )
             .context("insert_clip")?;
             Ok(())
@@ -660,11 +668,12 @@ impl Storage {
         limit: usize,
     ) -> anyhow::Result<Vec<ClipPerformanceRow>> {
         let conn = self.conn.clone();
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipPerformanceRow>> {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT c.id, c.hook, c.score, c.rank,
+        let rows =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipPerformanceRow>> {
+                let conn = conn.blocking_lock();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT c.id, c.hook, c.score, c.rank,
                             a.views, a.ctr, a.watch_pct,
                             c.start_ms, c.end_ms
                      FROM clips c
@@ -672,37 +681,34 @@ impl Storage {
                      WHERE a.ctr IS NOT NULL
                      ORDER BY a.ctr DESC
                      LIMIT ?1",
-                )
-                .context("prepare get_clip_performance_history")?;
-            let rows = stmt
-                .query_map([limit as i64], |r| {
-                    Ok(ClipPerformanceRow {
-                        clip_id: r.get(0)?,
-                        hook: r.get(1)?,
-                        score: r.get(2)?,
-                        rank: r.get(3)?,
-                        views: r.get(4)?,
-                        ctr: r.get(5)?,
-                        watch_pct: r.get(6)?,
-                        start_ms: r.get(7)?,
-                        end_ms: r.get(8)?,
+                    )
+                    .context("prepare get_clip_performance_history")?;
+                let rows = stmt
+                    .query_map([limit as i64], |r| {
+                        Ok(ClipPerformanceRow {
+                            clip_id: r.get(0)?,
+                            hook: r.get(1)?,
+                            score: r.get(2)?,
+                            rank: r.get(3)?,
+                            views: r.get(4)?,
+                            ctr: r.get(5)?,
+                            watch_pct: r.get(6)?,
+                            start_ms: r.get(7)?,
+                            end_ms: r.get(8)?,
+                        })
                     })
-                })
-                .context("query get_clip_performance_history")?
-                .collect::<Result<Vec<_>, _>>()
-                .context("collect get_clip_performance_history")?;
-            Ok(rows)
-        })
-        .await
-        .context("join get_clip_performance_history")??;
+                    .context("query get_clip_performance_history")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("collect get_clip_performance_history")?;
+                Ok(rows)
+            })
+            .await
+            .context("join get_clip_performance_history")??;
         Ok(rows)
     }
 
     /// List all clips with optional status filter, including renders and posts.
-    pub async fn list_clips(
-        &self,
-        status_filter: Option<&str>,
-    ) -> anyhow::Result<Vec<ClipDetail>> {
+    pub async fn list_clips(&self, status_filter: Option<&str>) -> anyhow::Result<Vec<ClipDetail>> {
         let conn = self.conn.clone();
         let status_filter = status_filter.map(str::to_string);
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipDetail>> {
@@ -961,7 +967,11 @@ impl Storage {
     }
 
     /// Update social copy JSON for a clip.
-    pub async fn update_clip_social_copy(&self, clip_id: &str, social_copy_json: &str) -> anyhow::Result<bool> {
+    pub async fn update_clip_social_copy(
+        &self,
+        clip_id: &str,
+        social_copy_json: &str,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
         let clip_id = clip_id.to_string();
         let json = social_copy_json.to_string();
@@ -981,7 +991,11 @@ impl Storage {
     }
 
     /// Bulk update clip statuses.
-    pub async fn bulk_update_clip_status(&self, clip_ids: &[String], status: &str) -> anyhow::Result<usize> {
+    pub async fn bulk_update_clip_status(
+        &self,
+        clip_ids: &[String],
+        status: &str,
+    ) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
         let ids = clip_ids.to_vec();
         let status = status.to_string();
@@ -1065,7 +1079,15 @@ impl Storage {
                 "INSERT OR REPLACE INTO posts \
                  (clip_id, platform, status, external_id, external_url, posted_at, error) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![clip_id, platform, status, external_id, external_url, posted_at, error],
+                rusqlite::params![
+                    clip_id,
+                    platform,
+                    status,
+                    external_id,
+                    external_url,
+                    posted_at,
+                    error
+                ],
             )
             .context("insert_post")?;
             Ok(())
@@ -1086,9 +1108,15 @@ impl Storage {
                  (clip_id, platform, fetched_at, views, ctr, watch_pct, likes, reposts, replies) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
-                    row.clip_id, row.platform, row.fetched_at,
-                    row.views, row.ctr, row.watch_pct,
-                    row.likes, row.reposts, row.replies,
+                    row.clip_id,
+                    row.platform,
+                    row.fetched_at,
+                    row.views,
+                    row.ctr,
+                    row.watch_pct,
+                    row.likes,
+                    row.reposts,
+                    row.replies,
                 ],
             )
             .context("insert_analytics")?;
@@ -1350,24 +1378,36 @@ mod tests {
         let storage = Storage::open(dir.path().join("test.db")).await?;
 
         // Create a job.
-        storage.create_job("job1", Some("show"), Some("ep.mp4"), None).await?;
+        storage
+            .create_job("job1", Some("show"), Some("ep.mp4"), None)
+            .await?;
         let job = storage.get_job("job1").await?.expect("job should exist");
         assert_eq!(job.status, JobStatus::Pending);
         assert_eq!(job.retry_count, 0);
         assert!(job.error.is_none());
 
         // Walk through the pipeline stages.
-        storage.update_job_status("job1", JobStatus::Transcribed, None).await?;
+        storage
+            .update_job_status("job1", JobStatus::Transcribed, None)
+            .await?;
         let job = storage.get_job("job1").await?.unwrap();
         assert_eq!(job.status, JobStatus::Transcribed);
 
-        storage.update_job_status("job1", JobStatus::Ranked, None).await?;
+        storage
+            .update_job_status("job1", JobStatus::Ranked, None)
+            .await?;
         let job = storage.get_job("job1").await?.unwrap();
         assert_eq!(job.status, JobStatus::Ranked);
 
-        storage.update_job_status("job1", JobStatus::Rendered, None).await?;
-        storage.update_job_status("job1", JobStatus::Posted, None).await?;
-        storage.update_job_status("job1", JobStatus::Done, None).await?;
+        storage
+            .update_job_status("job1", JobStatus::Rendered, None)
+            .await?;
+        storage
+            .update_job_status("job1", JobStatus::Posted, None)
+            .await?;
+        storage
+            .update_job_status("job1", JobStatus::Done, None)
+            .await?;
         let job = storage.get_job("job1").await?.unwrap();
         assert_eq!(job.status, JobStatus::Done);
 
@@ -1380,10 +1420,14 @@ mod tests {
         let storage = Storage::open(dir.path().join("test.db")).await?;
 
         storage.create_job("job2", None, None, None).await?;
-        storage.update_job_status("job2", JobStatus::Transcribed, None).await?;
+        storage
+            .update_job_status("job2", JobStatus::Transcribed, None)
+            .await?;
 
         // Fail with an error message.
-        storage.update_job_status("job2", JobStatus::Failed, Some("LLM timeout")).await?;
+        storage
+            .update_job_status("job2", JobStatus::Failed, Some("LLM timeout"))
+            .await?;
         let job = storage.get_job("job2").await?.unwrap();
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(job.error.as_deref(), Some("LLM timeout"));
@@ -1417,13 +1461,23 @@ mod tests {
         let storage = Storage::open(dir.path().join("test.db")).await?;
 
         storage.create_job("j1", None, Some("a.mp4"), None).await?;
-        storage.update_job_status("j1", JobStatus::Transcribed, None).await?;
+        storage
+            .update_job_status("j1", JobStatus::Transcribed, None)
+            .await?;
 
         // Second create should be a no-op (INSERT OR IGNORE).
         storage.create_job("j1", None, Some("b.mp4"), None).await?;
         let job = storage.get_job("j1").await?.unwrap();
-        assert_eq!(job.status, JobStatus::Transcribed, "status should not have been reset");
-        assert_eq!(job.media_name.as_deref(), Some("a.mp4"), "media_name should not change");
+        assert_eq!(
+            job.status,
+            JobStatus::Transcribed,
+            "status should not have been reset"
+        );
+        assert_eq!(
+            job.media_name.as_deref(),
+            Some("a.mp4"),
+            "media_name should not change"
+        );
 
         Ok(())
     }
@@ -1436,18 +1490,66 @@ mod tests {
         storage.create_job("j1", None, None, None).await?;
 
         // Insert a clip.
-        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), None).await?;
+        storage
+            .insert_clip(
+                "c1",
+                "j1",
+                10000,
+                30000,
+                Some(1),
+                Some(85.0),
+                Some("hook"),
+                Some("{}"),
+                None,
+            )
+            .await?;
 
         // Insert a render variant.
-        storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
+        storage
+            .insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000))
+            .await?;
 
         // Insert a post.
-        storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), Some("https://yt.be/abc"), Some(1700000000), None).await?;
+        storage
+            .insert_post(
+                "c1",
+                "youtube_shorts",
+                "posted",
+                Some("abc123"),
+                Some("https://yt.be/abc"),
+                Some(1700000000),
+                None,
+            )
+            .await?;
 
         // Idempotent re-insert should not error.
-        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), None).await?;
-        storage.insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000)).await?;
-        storage.insert_post("c1", "youtube_shorts", "posted", Some("abc123"), None, None, None).await?;
+        storage
+            .insert_clip(
+                "c1",
+                "j1",
+                10000,
+                30000,
+                Some(1),
+                Some(85.0),
+                Some("hook"),
+                Some("{}"),
+                None,
+            )
+            .await?;
+        storage
+            .insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000))
+            .await?;
+        storage
+            .insert_post(
+                "c1",
+                "youtube_shorts",
+                "posted",
+                Some("abc123"),
+                None,
+                None,
+                None,
+            )
+            .await?;
 
         Ok(())
     }
@@ -1471,7 +1573,10 @@ mod tests {
 
         // Open with new code — should apply V2 migration.
         let storage = Storage::open(&db_path).await?;
-        let job = storage.get_job("old_job").await?.expect("old_job should exist");
+        let job = storage
+            .get_job("old_job")
+            .await?
+            .expect("old_job should exist");
         assert_eq!(job.status, JobStatus::Done);
         assert_eq!(job.retry_count, 0, "retry_count should default to 0");
 
@@ -1575,15 +1680,26 @@ mod tests {
         storage.create_job("j1", None, None, None).await?;
 
         // Insert a clip with trend_match.
-        storage.insert_clip("c1", "j1", 10000, 30000, Some(1), Some(85.0), Some("hook"), Some("{}"), Some("AI Safety")).await?;
+        storage
+            .insert_clip(
+                "c1",
+                "j1",
+                10000,
+                30000,
+                Some(1),
+                Some(85.0),
+                Some("hook"),
+                Some("{}"),
+                Some("AI Safety"),
+            )
+            .await?;
 
         // Verify trend_match was stored.
         let conn = storage.conn.lock().await;
-        let tm: Option<String> = conn.query_row(
-            "SELECT trend_match FROM clips WHERE id = 'c1'",
-            [],
-            |r| r.get(0),
-        )?;
+        let tm: Option<String> =
+            conn.query_row("SELECT trend_match FROM clips WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })?;
         assert_eq!(tm.as_deref(), Some("AI Safety"));
 
         Ok(())

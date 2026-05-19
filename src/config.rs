@@ -270,7 +270,11 @@ pub struct Config {
 
     /// Base URL for the premium VLM API (OpenRouter or self-hosted).
     /// Defaults to OpenRouter's endpoint.
-    #[arg(long, env = "VLM_PREMIUM_BASE_URL", default_value = "https://openrouter.ai/api")]
+    #[arg(
+        long,
+        env = "VLM_PREMIUM_BASE_URL",
+        default_value = "https://openrouter.ai/api"
+    )]
     pub vlm_premium_base_url: String,
 
     /// API key for the premium VLM endpoint (e.g. OpenRouter API key).
@@ -300,7 +304,11 @@ pub struct Config {
     pub vad_backend: String,
 
     /// Path to silero_vad.onnx model file. Downloaded automatically if missing.
-    #[arg(long, env = "VAD_MODEL_PATH", default_value = "./models/silero_vad.onnx")]
+    #[arg(
+        long,
+        env = "VAD_MODEL_PATH",
+        default_value = "./models/silero_vad.onnx"
+    )]
     pub vad_model_path: String,
 
     /// Silero VAD speech probability threshold (0.0–1.0). Frames above this are speech.
@@ -491,7 +499,11 @@ pub struct Config {
 
     /// Comma-separated CORS allowed origins for the API server.
     /// Default allows the Vite dev server.
-    #[arg(long, env = "API_CORS_ORIGINS", default_value = "http://localhost:5173")]
+    #[arg(
+        long,
+        env = "API_CORS_ORIGINS",
+        default_value = "http://localhost:5173"
+    )]
     pub api_cors_origins: String,
 
     /// Start the API server instead of the pipeline. Can also be set via

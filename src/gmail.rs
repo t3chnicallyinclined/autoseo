@@ -149,9 +149,7 @@ impl GmailClient {
             if let Some(body) = &part.body {
                 if let Some(data) = &body.data {
                     out.push(TextSource::InlineData(data.clone()));
-                } else if is_text
-                    && let Some(attachment_id) = &body.attachment_id
-                {
+                } else if is_text && let Some(attachment_id) = &body.attachment_id {
                     out.push(TextSource::AttachmentId(attachment_id.clone()));
                 }
             }

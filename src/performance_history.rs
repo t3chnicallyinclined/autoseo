@@ -18,7 +18,10 @@ const WORST_N: usize = 3;
 pub async fn build_performance_history(storage: &Storage) -> String {
     // Fetch enough rows to get both top and worst examples.
     // We fetch top by CTR desc, then reverse to get worst.
-    let top = match storage.get_clip_performance_history(TOP_N + WORST_N + 10).await {
+    let top = match storage
+        .get_clip_performance_history(TOP_N + WORST_N + 10)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = ?e, "failed to fetch performance history; proceeding without it");
@@ -58,10 +61,22 @@ pub async fn build_performance_history(storage: &Storage) -> String {
 
 fn format_row(idx: usize, row: &ClipPerformanceRow) -> String {
     let hook = row.hook.as_deref().unwrap_or("(no hook)");
-    let score = row.score.map(|s| format!("{s:.0}")).unwrap_or_else(|| "?".into());
-    let views = row.views.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
-    let ctr = row.ctr.map(|c| format!("{c:.2}%")).unwrap_or_else(|| "?".into());
-    let watch = row.watch_pct.map(|w| format!("{w:.1}%")).unwrap_or_else(|| "?".into());
+    let score = row
+        .score
+        .map(|s| format!("{s:.0}"))
+        .unwrap_or_else(|| "?".into());
+    let views = row
+        .views
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    let ctr = row
+        .ctr
+        .map(|c| format!("{c:.2}%"))
+        .unwrap_or_else(|| "?".into());
+    let watch = row
+        .watch_pct
+        .map(|w| format!("{w:.1}%"))
+        .unwrap_or_else(|| "?".into());
     let dur_s = (row.end_ms - row.start_ms) as f64 / 1000.0;
 
     format!(
@@ -119,7 +134,10 @@ mod tests {
     async fn empty_analytics_returns_empty_string() {
         let storage = Storage::open_in_memory_sync();
         let result = build_performance_history(&storage).await;
-        assert!(result.is_empty(), "expected empty string for empty analytics table");
+        assert!(
+            result.is_empty(),
+            "expected empty string for empty analytics table"
+        );
     }
 
     #[tokio::test]
@@ -129,11 +147,12 @@ mod tests {
         // Insert a job, clips, and analytics rows.
         {
             let conn = storage.conn_for_test();
-            let conn = conn.blocking_lock();
+            let conn = conn.lock().await;
             conn.execute(
                 "INSERT INTO jobs (id, status, created_at, updated_at) VALUES ('j1', 'done', 0, 0)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             for i in 1..=8 {
                 let clip_id = format!("c{i}");
                 conn.execute(
@@ -147,7 +166,8 @@ mod tests {
                         50.0 + (i as f64) * 5.0,
                         format!("hook_{i}"),
                     ],
-                ).unwrap();
+                )
+                .unwrap();
                 conn.execute(
                     "INSERT INTO analytics (clip_id, platform, fetched_at, views, ctr, watch_pct) \
                      VALUES (?1, 'youtube', 1000, ?2, ?3, ?4)",

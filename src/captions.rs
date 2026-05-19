@@ -236,7 +236,11 @@ pub fn render_ass(
     play_res_h: u32,
     style: &CaptionStyle,
 ) -> String {
-    let phrases = group_into_phrases(words, style.max_words_per_phrase, style.max_chars_per_phrase);
+    let phrases = group_into_phrases(
+        words,
+        style.max_words_per_phrase,
+        style.max_chars_per_phrase,
+    );
     let karaoke = style.highlight_bgr.is_some();
 
     let mut out = String::new();
@@ -308,15 +312,13 @@ impl Phrase {
         }
         // Check that at least two words have different start times.
         let first_start = self.words[0].start_secs;
-        self.words.iter().any(|w| (w.start_secs - first_start).abs() > 0.001)
+        self.words
+            .iter()
+            .any(|w| (w.start_secs - first_start).abs() > 0.001)
     }
 }
 
-fn group_into_phrases(
-    words: &[AlignedWord],
-    max_words: usize,
-    max_chars: usize,
-) -> Vec<Phrase> {
+fn group_into_phrases(words: &[AlignedWord], max_words: usize, max_chars: usize) -> Vec<Phrase> {
     let max_words = max_words.max(1);
     let max_chars = max_chars.max(8);
 
@@ -637,10 +639,7 @@ mod tests {
 
     #[test]
     fn karaoke_disabled_when_highlight_none() {
-        let words = vec![
-            w("Hello", 0.0, 0.3),
-            w("world", 0.3, 0.7),
-        ];
+        let words = vec![w("Hello", 0.0, 0.3), w("world", 0.3, 0.7)];
         let mut style = CaptionStyle::default();
         style.highlight_bgr = None;
         let body = render_ass(&words, 1080, 1920, &style);
@@ -677,7 +676,10 @@ mod tests {
         assert_eq!(dialogue_count, 2, "body: {body}");
 
         // First phrase: words with {\k} tags.
-        assert!(body.contains("{\\k20}one {\\k20}two {\\k20}three"), "body: {body}");
+        assert!(
+            body.contains("{\\k20}one {\\k20}two {\\k20}three"),
+            "body: {body}"
+        );
         // Second phrase.
         assert!(body.contains("{\\k20}four {\\k20}five"), "body: {body}");
     }
@@ -690,7 +692,10 @@ mod tests {
         ];
         let body = render_ass(&words, 1080, 1920, &CaptionStyle::default());
         assert!(body.contains("{\\k5}fast"), "body: {body}");
-        assert!(body.contains("{\\k150}slow") || body.contains("{\\k151}slow"), "body: {body}");
+        assert!(
+            body.contains("{\\k150}slow") || body.contains("{\\k151}slow"),
+            "body: {body}"
+        );
     }
 
     #[test]

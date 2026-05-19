@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Build stage ──────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
 # Copy source

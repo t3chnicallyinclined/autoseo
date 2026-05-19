@@ -125,10 +125,7 @@ impl AxisFilter {
 /// resets so that the next detection starts fresh (B-roll gap handling).
 ///
 /// Returns one [`SmoothedPoint`] per input sample that had a face detection.
-pub fn smooth_trajectory(
-    samples: &[CropSample],
-    params: &OneEuroParams,
-) -> Vec<SmoothedPoint> {
+pub fn smooth_trajectory(samples: &[CropSample], params: &OneEuroParams) -> Vec<SmoothedPoint> {
     let mut fx = AxisFilter::new();
     let mut fy = AxisFilter::new();
     let mut last_face_time: Option<f64> = None;

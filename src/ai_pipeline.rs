@@ -25,9 +25,7 @@ impl SttBackend {
         match s.to_ascii_lowercase().as_str() {
             "api" => Ok(Self::Api),
             "local" => Ok(Self::Local),
-            other => anyhow::bail!(
-                "invalid STT_BACKEND={other:?} — expected \"api\" or \"local\""
-            ),
+            other => anyhow::bail!("invalid STT_BACKEND={other:?} — expected \"api\" or \"local\""),
         }
     }
 }
@@ -204,7 +202,8 @@ impl AiPipeline {
                     .await
             }
             SttBackend::Local => {
-                self.transcribe_chunks_local(chunks, &progress, &completed, total_chunks).await?
+                self.transcribe_chunks_local(chunks, &progress, &completed, total_chunks)
+                    .await?
             }
         };
         progress.finish_with_message("transcription complete");
@@ -258,48 +257,53 @@ impl AiPipeline {
         );
         let completed = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>> = match self.stt_backend {
-            SttBackend::Api => {
-                let client = self.openai.clone();
-                let stt_model = self.stt_model.clone();
-                let concurrency = self.stt_concurrency;
-                let stt_rpm_gate = self.stt_rpm_gate.clone();
-                stream::iter(chunks.iter().cloned().enumerate())
-                    .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
-                        let client = client.clone();
-                        let stt_model = stt_model.clone();
-                        let progress = progress.clone();
-                        let completed = completed.clone();
-                        let total_chunks = total_chunks;
-                        let stt_rpm_gate = stt_rpm_gate.clone();
-                        async move {
-                            let chunk_label = chunk_path.display().to_string();
-                            if let Some(gate) = stt_rpm_gate.as_ref() {
-                                gate.wait().await;
+        let results: Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>> =
+            match self.stt_backend {
+                SttBackend::Api => {
+                    let client = self.openai.clone();
+                    let stt_model = self.stt_model.clone();
+                    let concurrency = self.stt_concurrency;
+                    let stt_rpm_gate = self.stt_rpm_gate.clone();
+                    stream::iter(chunks.iter().cloned().enumerate())
+                        .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
+                            let client = client.clone();
+                            let stt_model = stt_model.clone();
+                            let progress = progress.clone();
+                            let completed = completed.clone();
+                            let total_chunks = total_chunks;
+                            let stt_rpm_gate = stt_rpm_gate.clone();
+                            async move {
+                                let chunk_label = chunk_path.display().to_string();
+                                if let Some(gate) = stt_rpm_gate.as_ref() {
+                                    gate.wait().await;
+                                }
+                                let tr = client
+                                    .transcribe_words(&stt_model, &chunk_path)
+                                    .await
+                                    .with_context(|| format!("stt-words for {chunk_label}"))?;
+
+                                let segments = map_segments_or_synthesize_words(
+                                    &tr,
+                                    offset_secs,
+                                    chunk_duration_secs,
+                                );
+                                let words = align::shift_words(&tr.words, offset_secs);
+
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                progress.set_message(format!("chunk {done}/{total_chunks}"));
+                                progress.inc(1);
+                                Ok::<_, anyhow::Error>((idx, segments, words))
                             }
-                            let tr = client
-                                .transcribe_words(&stt_model, &chunk_path)
-                                .await
-                                .with_context(|| format!("stt-words for {chunk_label}"))?;
-
-                            let segments =
-                                map_segments_or_synthesize_words(&tr, offset_secs, chunk_duration_secs);
-                            let words = align::shift_words(&tr.words, offset_secs);
-
-                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            progress.set_message(format!("chunk {done}/{total_chunks}"));
-                            progress.inc(1);
-                            Ok::<_, anyhow::Error>((idx, segments, words))
-                        }
-                    })
-                    .buffer_unordered(concurrency)
-                    .collect::<Vec<_>>()
-                    .await
-            }
-            SttBackend::Local => {
-                self.transcribe_word_chunks_local(chunks, &progress, &completed, total_chunks).await?
-            }
-        };
+                        })
+                        .buffer_unordered(concurrency)
+                        .collect::<Vec<_>>()
+                        .await
+                }
+                SttBackend::Local => {
+                    self.transcribe_word_chunks_local(chunks, &progress, &completed, total_chunks)
+                        .await?
+                }
+            };
         progress.finish_with_message("word transcription complete");
 
         let mut per_chunk = Vec::with_capacity(results.len());
@@ -339,16 +343,19 @@ impl AiPipeline {
         completed: &Arc<AtomicUsize>,
         total_chunks: usize,
     ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>), anyhow::Error>>> {
-        let wl = self.whisper_local.as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
+        let wl = self.whisper_local.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "STT_BACKEND=local but no whisper model loaded. Compile with --features local-stt \
                  and set WHISPER_MODEL_PATH."
-            ))?;
+            )
+        })?;
         let mut results = Vec::with_capacity(chunks.len());
         // Local inference is CPU-bound; run sequentially to avoid thrashing.
         for (idx, (chunk_path, offset_secs, chunk_duration_secs)) in chunks.iter().enumerate() {
             let wav_path = convert_to_wav16k(&self.ffmpeg_path, chunk_path).await?;
-            let tr = wl.transcribe(&wav_path).await
+            let tr = wl
+                .transcribe(&wav_path)
+                .await
                 .with_context(|| format!("local stt for {}", chunk_path.display()))?;
             // Clean up temp wav
             tokio::fs::remove_file(&wav_path).await.ok();
@@ -382,19 +389,24 @@ impl AiPipeline {
         progress: &ProgressBar,
         completed: &Arc<AtomicUsize>,
         total_chunks: usize,
-    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>> {
-        let wl = self.whisper_local.as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>>
+    {
+        let wl = self.whisper_local.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "STT_BACKEND=local but no whisper model loaded. Compile with --features local-stt \
                  and set WHISPER_MODEL_PATH."
-            ))?;
+            )
+        })?;
         let mut results = Vec::with_capacity(chunks.len());
         for (idx, (chunk_path, offset_secs, chunk_duration_secs)) in chunks.iter().enumerate() {
             let wav_path = convert_to_wav16k(&self.ffmpeg_path, chunk_path).await?;
-            let tr = wl.transcribe(&wav_path).await
+            let tr = wl
+                .transcribe(&wav_path)
+                .await
                 .with_context(|| format!("local stt-words for {}", chunk_path.display()))?;
             tokio::fs::remove_file(&wav_path).await.ok();
-            let segments = map_segments_or_synthesize_words(&tr, *offset_secs, *chunk_duration_secs);
+            let segments =
+                map_segments_or_synthesize_words(&tr, *offset_secs, *chunk_duration_secs);
             let words = align::shift_words(&tr.words, *offset_secs);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             progress.set_message(format!("chunk {done}/{total_chunks}"));
@@ -411,7 +423,8 @@ impl AiPipeline {
         _progress: &ProgressBar,
         _completed: &Arc<AtomicUsize>,
         _total_chunks: usize,
-    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>> {
+    ) -> anyhow::Result<Vec<Result<(usize, Vec<TranscriptSegment>, Vec<AlignedWord>), anyhow::Error>>>
+    {
         anyhow::bail!(
             "STT_BACKEND=local requires the `local-stt` cargo feature. \
              Recompile with: cargo build --features local-stt"

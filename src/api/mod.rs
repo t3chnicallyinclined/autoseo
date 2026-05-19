@@ -1,7 +1,12 @@
 mod clips;
 pub mod config_store;
 
-use axum::{Json, Router, extract::{Path, State}, response::Html, routing::{get, patch, post}};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    response::Html,
+    routing::{get, post},
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,9 +141,18 @@ async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
             }
         }
         "google" => {
-            let client_id = store.get_value("GOOGLE_CLIENT_ID").await.unwrap_or_default();
-            let client_secret = store.get_value("GOOGLE_CLIENT_SECRET").await.unwrap_or_default();
-            let refresh_token = store.get_value("GOOGLE_REFRESH_TOKEN").await.unwrap_or_default();
+            let client_id = store
+                .get_value("GOOGLE_CLIENT_ID")
+                .await
+                .unwrap_or_default();
+            let client_secret = store
+                .get_value("GOOGLE_CLIENT_SECRET")
+                .await
+                .unwrap_or_default();
+            let refresh_token = store
+                .get_value("GOOGLE_REFRESH_TOKEN")
+                .await
+                .unwrap_or_default();
             if client_id.is_empty() || client_secret.is_empty() || refresh_token.is_empty() {
                 return TestResult {
                     service: service.to_string(),
@@ -161,7 +175,10 @@ async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
         }
         "bluesky" => {
             let handle = store.get_value("BLUESKY_HANDLE").await.unwrap_or_default();
-            let password = store.get_value("BLUESKY_APP_PASSWORD").await.unwrap_or_default();
+            let password = store
+                .get_value("BLUESKY_APP_PASSWORD")
+                .await
+                .unwrap_or_default();
             let pds = store
                 .get_value("BLUESKY_PDS_URL")
                 .await
@@ -187,7 +204,10 @@ async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
             }
         }
         "ayrshare" => {
-            let key = store.get_value("AYRSHARE_API_KEY").await.unwrap_or_default();
+            let key = store
+                .get_value("AYRSHARE_API_KEY")
+                .await
+                .unwrap_or_default();
             if key.is_empty() {
                 return TestResult {
                     service: service.to_string(),
@@ -227,7 +247,11 @@ async fn test_openai(base_url: &str, api_key: &str) -> anyhow::Result<String> {
     if resp.status().is_success() {
         Ok("Connected — models endpoint reachable".to_string())
     } else {
-        anyhow::bail!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default())
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )
     }
 }
 
@@ -242,11 +266,19 @@ async fn test_huggingface(api_key: &str) -> anyhow::Result<String> {
     if resp.status().is_success() {
         Ok("Connected — token valid".to_string())
     } else {
-        anyhow::bail!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default())
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )
     }
 }
 
-async fn test_google(client_id: &str, client_secret: &str, refresh_token: &str) -> anyhow::Result<String> {
+async fn test_google(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let resp = client
         .post("https://oauth2.googleapis.com/token")
@@ -262,7 +294,11 @@ async fn test_google(client_id: &str, client_secret: &str, refresh_token: &str) 
     if resp.status().is_success() {
         Ok("Connected — token refresh successful".to_string())
     } else {
-        anyhow::bail!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default())
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )
     }
 }
 
@@ -281,7 +317,11 @@ async fn test_bluesky(pds_url: &str, handle: &str, password: &str) -> anyhow::Re
     if resp.status().is_success() {
         Ok("Connected — session created".to_string())
     } else {
-        anyhow::bail!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default())
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )
     }
 }
 
@@ -296,7 +336,11 @@ async fn test_ayrshare(api_key: &str) -> anyhow::Result<String> {
     if resp.status().is_success() {
         Ok("Connected — API key valid".to_string())
     } else {
-        anyhow::bail!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default())
+        anyhow::bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        )
     }
 }
 
@@ -327,7 +371,10 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         .route("/health", get(health))
         .route("/config", get(get_config).patch(patch_config))
         .route("/config/test/{service}", post(test_service))
-        .merge(clips::router());
+        .merge(clips::router())
+        // Unknown /api/* paths must return JSON 404, not fall through to the
+        // SPA index.html fallback below.
+        .fallback(api_not_found);
 
     let app = Router::new()
         .nest("/api", api_routes)
@@ -339,19 +386,25 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         Some(dist_path) if dist_path.is_dir() => {
             let index_file = dist_path.join("index.html");
             // SPA fallback: serve index.html for any path not matched by a static file
-            let serve_dir = ServeDir::new(&dist_path)
-                .not_found_service(ServeFile::new(index_file));
+            let serve_dir = ServeDir::new(&dist_path).not_found_service(ServeFile::new(index_file));
             app.fallback_service(serve_dir)
         }
-        _ => {
-            app.fallback(dist_not_found)
-        }
+        _ => app.fallback(dist_not_found),
     }
+}
+
+/// JSON 404 for unmatched routes under `/api`.
+async fn api_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not found" })),
+    )
 }
 
 /// Shown when the dashboard dist/ folder doesn't exist.
 async fn dist_not_found() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!DOCTYPE html>
 <html>
 <head><title>autoseo - Dashboard Not Built</title></head>
 <body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px;">
@@ -364,11 +417,17 @@ npm run build</pre>
   <p>Then restart the server. The built files will be served automatically.</p>
   <p><strong>API is running:</strong> <a href="/api/health">/api/health</a></p>
 </body>
-</html>"#)
+</html>"#,
+    )
 }
 
 /// Start the API server on the given port with graceful shutdown.
-pub async fn serve(state: AppState, port: u16, cors_origins: &str, open_browser: bool) -> anyhow::Result<()> {
+pub async fn serve(
+    state: AppState,
+    port: u16,
+    cors_origins: &str,
+    open_browser: bool,
+) -> anyhow::Result<()> {
     let app = router(state, cors_origins);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -377,7 +436,7 @@ pub async fn serve(state: AppState, port: u16, cors_origins: &str, open_browser:
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     if open_browser {
-        let url = format!("http://localhost:{}", port);
+        let url = format!("http://localhost:{port}");
         tracing::info!(url = %url, "opening browser");
         if let Err(e) = open::that(&url) {
             tracing::warn!(error = %e, "failed to open browser");
@@ -397,9 +456,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {},
             _ = sigterm.recv() => {},
@@ -421,15 +479,11 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let storage = Storage::open_in_memory_sync();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.json");
-        let config_store = Arc::new(
-            tokio::runtime::Handle::current()
-                .block_on(ConfigStore::load(config_path))
-                .unwrap(),
-        );
+        let config_store = Arc::new(ConfigStore::load(config_path).await.unwrap());
         // Leak the tempdir so it lives for the test duration
         std::mem::forget(dir);
         AppState {
@@ -442,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_ok() {
-        let app = router(test_state(), "http://localhost:5173");
+        let app = router(test_state().await, "http://localhost:5173");
 
         let req = Request::builder()
             .uri("/api/health")
@@ -452,16 +506,14 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), 1024)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
     }
 
     #[tokio::test]
     async fn cors_allows_configured_origin() {
-        let app = router(test_state(), "http://localhost:5173");
+        let app = router(test_state().await, "http://localhost:5173");
 
         let req = Request::builder()
             .method("OPTIONS")
@@ -481,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_returns_404() {
-        let app = router(test_state(), "http://localhost:5173");
+        let app = router(test_state().await, "http://localhost:5173");
 
         let req = Request::builder()
             .uri("/api/nonexistent")
@@ -494,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_config_returns_needs_setup() {
-        let app = router(test_state(), "http://localhost:5173");
+        let app = router(test_state().await, "http://localhost:5173");
 
         let req = Request::builder()
             .uri("/api/config")
@@ -511,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_config_stores_and_masks_secrets() {
-        let state = test_state();
+        let state = test_state().await;
         let app = router(state.clone(), "http://localhost:5173");
 
         // PATCH config to set a key
@@ -535,7 +587,10 @@ mod tests {
         // Secret should be masked
         let key = json["config"]["OPENAI_API_KEY"].as_str().unwrap();
         assert!(key.contains("••••"), "secret should be masked: {key}");
-        assert!(!key.contains("realkey"), "secret should not be in clear text");
+        assert!(
+            !key.contains("realkey"),
+            "secret should not be in clear text"
+        );
 
         // Non-secret should be visible
         assert_eq!(json["config"]["MODE"], "clipper");
@@ -546,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_service() {
-        let app = router(test_state(), "http://localhost:5173");
+        let app = router(test_state().await, "http://localhost:5173");
 
         let req = Request::builder()
             .method("POST")
@@ -560,6 +615,11 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], false);
-        assert!(json["message"].as_str().unwrap().contains("Unknown service"));
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown service")
+        );
     }
 }

@@ -203,121 +203,121 @@ pub async fn segment_wav(
     }
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<std::path::PathBuf>> {
-            let mut reader = hound::WavReader::open(&wav_path)
-                .with_context(|| format!("open wav {}", wav_path.display()))?;
-            let spec = reader.spec();
-            let channels = spec.channels as u64;
-            let samples_per_chunk = spec.sample_rate as u64 * segment_secs * channels;
-            if samples_per_chunk == 0 {
-                anyhow::bail!("invalid wav chunk size");
-            }
+        let mut reader = hound::WavReader::open(&wav_path)
+            .with_context(|| format!("open wav {}", wav_path.display()))?;
+        let spec = reader.spec();
+        let channels = spec.channels as u64;
+        let samples_per_chunk = spec.sample_rate as u64 * segment_secs * channels;
+        if samples_per_chunk == 0 {
+            anyhow::bail!("invalid wav chunk size");
+        }
 
-            let mut out_paths = Vec::new();
-            let mut chunk_idx: u64 = 0;
-            let mut written_in_chunk: u64 = 0;
+        let mut out_paths = Vec::new();
+        let mut chunk_idx: u64 = 0;
+        let mut written_in_chunk: u64 = 0;
 
-            let mut writer_i16: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
-            let mut writer_i32: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
-            let mut writer_f32: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut writer_i16: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut writer_i32: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut writer_f32: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
 
-            let open_new = |chunk_idx: u64,
-                            out_paths: &mut Vec<std::path::PathBuf>|
-             -> anyhow::Result<std::path::PathBuf> {
-                let out_path = out_dir.join(format!("chunk_{chunk_idx:05}.wav"));
-                out_paths.push(out_path.clone());
-                Ok(out_path)
-            };
+        let open_new = |chunk_idx: u64,
+                        out_paths: &mut Vec<std::path::PathBuf>|
+         -> anyhow::Result<std::path::PathBuf> {
+            let out_path = out_dir.join(format!("chunk_{chunk_idx:05}.wav"));
+            out_paths.push(out_path.clone());
+            Ok(out_path)
+        };
 
-            match spec.sample_format {
-                hound::SampleFormat::Int => {
-                    if spec.bits_per_sample <= 16 {
-                        for s in reader.samples::<i16>() {
-                            let sample = s.context("read wav sample(i16)")?;
-                            if writer_i16.is_none() {
-                                let out_path = open_new(chunk_idx, &mut out_paths)?;
-                                writer_i16 =
-                                    Some(hound::WavWriter::create(&out_path, spec).with_context(
-                                        || format!("create wav chunk {}", out_path.display()),
-                                    )?);
-                            }
-                            writer_i16
-                                .as_mut()
-                                .context("missing wav writer")?
-                                .write_sample(sample)
-                                .context("write wav sample")?;
-                            written_in_chunk += 1;
-                            if written_in_chunk >= samples_per_chunk {
-                                writer_i16.take().unwrap().finalize().ok();
-                                chunk_idx += 1;
-                                written_in_chunk = 0;
-                            }
-                        }
-                        if let Some(w) = writer_i16.take() {
-                            w.finalize().ok();
-                        }
-                    } else {
-                        for s in reader.samples::<i32>() {
-                            let sample = s.context("read wav sample(i32)")?;
-                            if writer_i32.is_none() {
-                                let out_path = open_new(chunk_idx, &mut out_paths)?;
-                                writer_i32 =
-                                    Some(hound::WavWriter::create(&out_path, spec).with_context(
-                                        || format!("create wav chunk {}", out_path.display()),
-                                    )?);
-                            }
-                            writer_i32
-                                .as_mut()
-                                .context("missing wav writer")?
-                                .write_sample(sample)
-                                .context("write wav sample")?;
-                            written_in_chunk += 1;
-                            if written_in_chunk >= samples_per_chunk {
-                                writer_i32.take().unwrap().finalize().ok();
-                                chunk_idx += 1;
-                                written_in_chunk = 0;
-                            }
-                        }
-                        if let Some(w) = writer_i32.take() {
-                            w.finalize().ok();
-                        }
-                    }
-                }
-                hound::SampleFormat::Float => {
-                    for s in reader.samples::<f32>() {
-                        let sample = s.context("read wav sample(f32)")?;
-                        if writer_f32.is_none() {
+        match spec.sample_format {
+            hound::SampleFormat::Int => {
+                if spec.bits_per_sample <= 16 {
+                    for s in reader.samples::<i16>() {
+                        let sample = s.context("read wav sample(i16)")?;
+                        if writer_i16.is_none() {
                             let out_path = open_new(chunk_idx, &mut out_paths)?;
-                            writer_f32 =
+                            writer_i16 =
                                 Some(hound::WavWriter::create(&out_path, spec).with_context(
                                     || format!("create wav chunk {}", out_path.display()),
                                 )?);
                         }
-                        writer_f32
+                        writer_i16
                             .as_mut()
                             .context("missing wav writer")?
                             .write_sample(sample)
                             .context("write wav sample")?;
                         written_in_chunk += 1;
                         if written_in_chunk >= samples_per_chunk {
-                            writer_f32.take().unwrap().finalize().ok();
+                            writer_i16.take().unwrap().finalize().ok();
                             chunk_idx += 1;
                             written_in_chunk = 0;
                         }
                     }
-                    if let Some(w) = writer_f32.take() {
+                    if let Some(w) = writer_i16.take() {
+                        w.finalize().ok();
+                    }
+                } else {
+                    for s in reader.samples::<i32>() {
+                        let sample = s.context("read wav sample(i32)")?;
+                        if writer_i32.is_none() {
+                            let out_path = open_new(chunk_idx, &mut out_paths)?;
+                            writer_i32 =
+                                Some(hound::WavWriter::create(&out_path, spec).with_context(
+                                    || format!("create wav chunk {}", out_path.display()),
+                                )?);
+                        }
+                        writer_i32
+                            .as_mut()
+                            .context("missing wav writer")?
+                            .write_sample(sample)
+                            .context("write wav sample")?;
+                        written_in_chunk += 1;
+                        if written_in_chunk >= samples_per_chunk {
+                            writer_i32.take().unwrap().finalize().ok();
+                            chunk_idx += 1;
+                            written_in_chunk = 0;
+                        }
+                    }
+                    if let Some(w) = writer_i32.take() {
                         w.finalize().ok();
                     }
                 }
             }
+            hound::SampleFormat::Float => {
+                for s in reader.samples::<f32>() {
+                    let sample = s.context("read wav sample(f32)")?;
+                    if writer_f32.is_none() {
+                        let out_path = open_new(chunk_idx, &mut out_paths)?;
+                        writer_f32 =
+                            Some(hound::WavWriter::create(&out_path, spec).with_context(|| {
+                                format!("create wav chunk {}", out_path.display())
+                            })?);
+                    }
+                    writer_f32
+                        .as_mut()
+                        .context("missing wav writer")?
+                        .write_sample(sample)
+                        .context("write wav sample")?;
+                    written_in_chunk += 1;
+                    if written_in_chunk >= samples_per_chunk {
+                        writer_f32.take().unwrap().finalize().ok();
+                        chunk_idx += 1;
+                        written_in_chunk = 0;
+                    }
+                }
+                if let Some(w) = writer_f32.take() {
+                    w.finalize().ok();
+                }
+            }
+        }
 
-            // If we produced an empty last chunk file (possible when samples align exactly), drop it.
-            out_paths.retain(|p| {
-                std::fs::metadata(p)
-                    .map(|m| m.len() > 44) // WAV header is 44 bytes
-                    .unwrap_or(false)
-            });
-            out_paths.sort();
-            Ok(out_paths)
+        // If we produced an empty last chunk file (possible when samples align exactly), drop it.
+        out_paths.retain(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.len() > 44) // WAV header is 44 bytes
+                .unwrap_or(false)
+        });
+        out_paths.sort();
+        Ok(out_paths)
     })
     .await
     .context("join segment_wav")?
@@ -362,10 +362,7 @@ where
 
 /// Measure integrated loudness (LUFS) of a media file using ffmpeg's loudnorm filter.
 /// Returns the measured integrated loudness in LUFS (a negative number, e.g. -16.2).
-pub async fn measure_loudness(
-    ffmpeg: &str,
-    media_path: &std::path::Path,
-) -> anyhow::Result<f64> {
+pub async fn measure_loudness(ffmpeg: &str, media_path: &std::path::Path) -> anyhow::Result<f64> {
     let output = Command::new(ffmpeg)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
@@ -375,7 +372,12 @@ pub async fn measure_loudness(
         .arg("-")
         .output()
         .await
-        .with_context(|| format!("run ffmpeg loudnorm measurement on {}", media_path.display()))?;
+        .with_context(|| {
+            format!(
+                "run ffmpeg loudnorm measurement on {}",
+                media_path.display()
+            )
+        })?;
 
     if !output.status.success() {
         anyhow::bail!(

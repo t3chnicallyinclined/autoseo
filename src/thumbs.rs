@@ -40,7 +40,7 @@ pub async fn generate_thumbnails(
     if moments.len() >= thumbnail_count {
         for (i, m) in moments.iter().take(thumbnail_count).enumerate() {
             let center = m.center_seconds.max(0.0).min(last_frame_ts);
-            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{sec:.0}.jpg", sec = center));
+            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{center:.0}.jpg"));
             tasks.push((out_path, center));
         }
     } else {
@@ -49,14 +49,14 @@ pub async fn generate_thumbnails(
                 break;
             }
             let center = m.center_seconds.max(0.0).min(last_frame_ts);
-            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{sec:.0}.jpg", sec = center));
+            let out_path = thumbs_dir.join(format!("thumb_{i:02}_{center:.0}.jpg"));
             tasks.push((out_path, center));
 
             if tasks.len() >= max_tasks {
                 break;
             }
             let alt = (center + (window / 2.0)).min(last_frame_ts);
-            let out_path2 = thumbs_dir.join(format!("thumb_{i:02}_alt_{sec:.0}.jpg", sec = alt));
+            let out_path2 = thumbs_dir.join(format!("thumb_{i:02}_alt_{alt:.0}.jpg"));
             tasks.push((out_path2, alt));
         }
     }

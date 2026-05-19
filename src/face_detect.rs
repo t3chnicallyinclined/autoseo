@@ -121,9 +121,9 @@ impl ScrfdDetector {
             let feat_h = sz / stride as usize;
             let feat_w = sz / stride as usize;
 
-            let score_key = format!("score_{}", stride);
-            let bbox_key = format!("bbox_{}", stride);
-            let kps_key = format!("kps_{}", stride);
+            let score_key = format!("score_{stride}");
+            let bbox_key = format!("bbox_{stride}");
+            let kps_key = format!("kps_{stride}");
 
             let scores = match outputs.get(&*score_key) {
                 Some(v) => v
@@ -133,7 +133,9 @@ impl ScrfdDetector {
                     // Fall back to positional indexing
                     outputs[stride_idx * 3]
                         .try_extract_tensor::<f32>()
-                        .with_context(|| format!("extract score tensor at index {}", stride_idx * 3))?
+                        .with_context(|| {
+                            format!("extract score tensor at index {}", stride_idx * 3)
+                        })?
                 }
             };
 
@@ -141,22 +143,22 @@ impl ScrfdDetector {
                 Some(v) => v
                     .try_extract_tensor::<f32>()
                     .with_context(|| format!("extract {bbox_key}"))?,
-                None => {
-                    outputs[stride_idx * 3 + 1]
-                        .try_extract_tensor::<f32>()
-                        .with_context(|| format!("extract bbox tensor at index {}", stride_idx * 3 + 1))?
-                }
+                None => outputs[stride_idx * 3 + 1]
+                    .try_extract_tensor::<f32>()
+                    .with_context(|| {
+                        format!("extract bbox tensor at index {}", stride_idx * 3 + 1)
+                    })?,
             };
 
             let kps = match outputs.get(&*kps_key) {
                 Some(v) => v
                     .try_extract_tensor::<f32>()
                     .with_context(|| format!("extract {kps_key}"))?,
-                None => {
-                    outputs[stride_idx * 3 + 2]
-                        .try_extract_tensor::<f32>()
-                        .with_context(|| format!("extract kps tensor at index {}", stride_idx * 3 + 2))?
-                }
+                None => outputs[stride_idx * 3 + 2]
+                    .try_extract_tensor::<f32>()
+                    .with_context(|| {
+                        format!("extract kps tensor at index {}", stride_idx * 3 + 2)
+                    })?,
             };
 
             for row in 0..feat_h {
@@ -192,12 +194,13 @@ impl ScrfdDetector {
                         // Landmarks (5 keypoints)
                         let mut landmarks = Vec::with_capacity(5);
                         for k in 0..5 {
-                            let lx = (anchor_cx + kps[[0, idx, k * 2]] * stride as f32 - rr.pad_x) / rr.scale;
-                            let ly = (anchor_cy + kps[[0, idx, k * 2 + 1]] * stride as f32 - rr.pad_y) / rr.scale;
-                            landmarks.push([
-                                lx.clamp(0.0, width as f32),
-                                ly.clamp(0.0, height as f32),
-                            ]);
+                            let lx = (anchor_cx + kps[[0, idx, k * 2]] * stride as f32 - rr.pad_x)
+                                / rr.scale;
+                            let ly = (anchor_cy + kps[[0, idx, k * 2 + 1]] * stride as f32
+                                - rr.pad_y)
+                                / rr.scale;
+                            landmarks
+                                .push([lx.clamp(0.0, width as f32), ly.clamp(0.0, height as f32)]);
                         }
 
                         detections.push(FaceDetection {
@@ -234,7 +237,12 @@ pub async fn extract_frame_rgb(
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .output()
         .await
-        .with_context(|| format!("ffmpeg extract frame at {ts}s from {}", video_path.display()))?;
+        .with_context(|| {
+            format!(
+                "ffmpeg extract frame at {ts}s from {}",
+                video_path.display()
+            )
+        })?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -452,7 +460,7 @@ fn normalize_to_nchw(rgb: &[u8], size: usize) -> Array4<f32> {
 }
 
 /// Greedy NMS (non-maximum suppression) sorted by confidence descending.
-fn nms(detections: &mut Vec<FaceDetection>, threshold: f32) -> Vec<FaceDetection> {
+fn nms(detections: &mut [FaceDetection], threshold: f32) -> Vec<FaceDetection> {
     detections.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
@@ -732,7 +740,12 @@ mod tests {
         let status = Command::new("ffmpeg")
             .arg("-y")
             .args(["-hide_banner", "-loglevel", "error"])
-            .args(["-f", "lavfi", "-i", "color=red:size=320x180:duration=1:rate=15"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=320x180:duration=1:rate=15",
+            ])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&video)
             .status()
@@ -748,7 +761,10 @@ mod tests {
         let r = rgb[0] as u32;
         let g = rgb[1] as u32;
         let b = rgb[2] as u32;
-        assert!(r > g && r > b, "expected reddish pixel, got R={r} G={g} B={b}");
+        assert!(
+            r > g && r > b,
+            "expected reddish pixel, got R={r} G={g} B={b}"
+        );
 
         Ok(())
     }

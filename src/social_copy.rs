@@ -69,7 +69,12 @@ pub fn validate_hook(raw: &str) -> String {
         return String::new();
     }
     let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let capped: String = words.iter().take(HOOK_MAX_WORDS).copied().collect::<Vec<_>>().join(" ");
+    let capped: String = words
+        .iter()
+        .take(HOOK_MAX_WORDS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
     // Strip trailing period — overlay text reads better without it.
     capped.trim_end_matches('.').to_string()
 }
@@ -217,8 +222,7 @@ impl SocialCopyGenerator {
             .chat_json(&self.chat_model, &self.system_prompt, &user)
             .await
             .with_context(|| format!("social copy for clip {}", clip.candidate_index))?;
-        let parsed: SocialCopy =
-            serde_json::from_value(raw).context("parse social copy JSON")?;
+        let parsed: SocialCopy = serde_json::from_value(raw).context("parse social copy JSON")?;
         Ok(parsed)
     }
 
@@ -238,11 +242,7 @@ impl SocialCopyGenerator {
         };
         let transcript = clamp_chars(&candidate.transcript, self.transcript_char_budget);
         let duration = (clip.end_secs - clip.start_secs).max(0.0) as u64;
-        let time_range = format!(
-            "{}-{}",
-            fmt_mmss(clip.start_secs),
-            fmt_mmss(clip.end_secs)
-        );
+        let time_range = format!("{}-{}", fmt_mmss(clip.start_secs), fmt_mmss(clip.end_secs));
         self.user_prompt_template
             .replace("{{show_name}}", &show_name)
             .replace("{{hosts}}", &hosts)
@@ -308,19 +308,19 @@ mod tests {
     fn builds_user_prompt_with_substitutions() {
         let openai = OpenAiClient::new("https://example.com".into(), "x".into());
         let template = "show={{show_name}}|hosts={{hosts}}|time={{time_range}}|dur={{duration_secs}}|hook={{hook}}|why={{reasoning}}|tx={{transcript}}";
-        let sc_gen = SocialCopyGenerator::new(
-            openai,
-            "model".into(),
-            "sys".into(),
-            template.into(),
-        );
+        let sc_gen =
+            SocialCopyGenerator::new(openai, "model".into(), "sys".into(), template.into());
         let ctx = ShowContext {
             show_name: Some("TFATK".into()),
             hosts: vec!["Brendan".into(), "Bryan".into()],
             guest: None,
             evidence: vec![],
         };
-        let prompt = sc_gen.build_user_prompt(&dummy_clip(), &dummy_candidate("test transcript"), Some(&ctx));
+        let prompt = sc_gen.build_user_prompt(
+            &dummy_clip(),
+            &dummy_candidate("test transcript"),
+            Some(&ctx),
+        );
         assert!(prompt.contains("show=TFATK"));
         assert!(prompt.contains("hosts=Brendan, Bryan"));
         assert!(prompt.contains("time=02:10-03:05"));
@@ -333,12 +333,8 @@ mod tests {
     fn missing_show_context_yields_empty_substitutions() {
         let openai = OpenAiClient::new("https://example.com".into(), "x".into());
         let template = "host={{hosts}}|show={{show_name}}|guest={{guest}}";
-        let sc_gen = SocialCopyGenerator::new(
-            openai,
-            "model".into(),
-            "sys".into(),
-            template.into(),
-        );
+        let sc_gen =
+            SocialCopyGenerator::new(openai, "model".into(), "sys".into(), template.into());
         let prompt = sc_gen.build_user_prompt(&dummy_clip(), &dummy_candidate("t"), None);
         assert!(prompt.contains("host=") && !prompt.contains("{{hosts}}"));
         assert!(prompt.contains("show=") && !prompt.contains("{{show_name}}"));
@@ -467,7 +463,12 @@ mod tests {
             overlay_hook: "LLM hook".into(),
             ..Default::default()
         };
-        resolve_hook(&mut sc, "The ranker generated this long hook text", HookSource::Ranker, 0);
+        resolve_hook(
+            &mut sc,
+            "The ranker generated this long hook text",
+            HookSource::Ranker,
+            0,
+        );
         assert_eq!(sc.overlay_hook, "The ranker generated this long");
         assert_eq!(sc.hook_source, "ranker");
     }

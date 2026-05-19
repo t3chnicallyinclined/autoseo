@@ -109,11 +109,7 @@ fn today_utc() -> String {
 }
 
 impl YouTubePoster {
-    pub fn new(
-        privacy_status: String,
-        category_id: String,
-        google: Option<GoogleAuth>,
-    ) -> Self {
+    pub fn new(privacy_status: String, category_id: String, google: Option<GoogleAuth>) -> Self {
         Self {
             privacy_status: if privacy_status.is_empty() {
                 "unlisted".to_string()
@@ -139,10 +135,12 @@ impl YouTubePoster {
     pub async fn post(&self, video_path: &Path, copy: &YouTubeShortsCopy) -> PostResult {
         let google = match self.google.as_ref() {
             Some(g) => g,
-            None => return PostResult::skipped(
-                "youtube",
-                "Google creds missing (set GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN)",
-            ),
+            None => {
+                return PostResult::skipped(
+                    "youtube",
+                    "Google creds missing (set GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN)",
+                );
+            }
         };
         if copy.title.trim().is_empty() {
             return PostResult::skipped("youtube", "title was empty");
@@ -198,7 +196,10 @@ impl YouTubePoster {
                 self.http
                     .post(INIT_URL)
                     .bearer_auth(&token)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json; charset=UTF-8")
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/json; charset=UTF-8",
+                    )
                     .header("X-Upload-Content-Length", content_length.to_string())
                     .header("X-Upload-Content-Type", "video/mp4")
                     .body(metadata_json.clone())
@@ -252,10 +253,7 @@ impl YouTubePoster {
     /// Send an HTTP request with exponential backoff retry on transient errors
     /// (5xx, 429). Returns the response on success or the last error after
     /// exhausting retries.
-    async fn send_with_retry<F>(
-        &self,
-        build_request: F,
-    ) -> Result<reqwest::Response>
+    async fn send_with_retry<F>(&self, build_request: F) -> Result<reqwest::Response>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {

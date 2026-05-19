@@ -106,11 +106,7 @@ impl AstScorer {
     ///
     /// The mel computation and ONNX inference are CPU-bound and run inside
     /// `spawn_blocking` to avoid stalling the Tokio executor.
-    pub async fn score_file(
-        &self,
-        ffmpeg: &str,
-        audio_path: &Path,
-    ) -> Result<Vec<ScoredWindow>> {
+    pub async fn score_file(&self, ffmpeg: &str, audio_path: &Path) -> Result<Vec<ScoredWindow>> {
         let pcm = extract_pcm_f32(ffmpeg, audio_path).await?;
         if pcm.len() < WIN_LENGTH {
             return Ok(Vec::new());
@@ -161,7 +157,6 @@ impl AstScorer {
 
         Ok(windows)
     }
-
 }
 
 /// Run inference on a single mel-spectrogram frame (blocking, not async).
@@ -181,9 +176,8 @@ fn infer_sync(session: &Session, fbank: &[Vec<f32>]) -> Result<AudioEvents> {
         *v = (*v - AUDIOSET_MEAN) / (2.0 * AUDIOSET_STD);
     }
 
-    let input =
-        Array3::<f32>::from_shape_vec((1, TARGET_FRAMES, N_MELS), flat)
-            .context("build AST input tensor")?;
+    let input = Array3::<f32>::from_shape_vec((1, TARGET_FRAMES, N_MELS), flat)
+        .context("build AST input tensor")?;
 
     let outputs = session
         .run(ort::inputs![input].context("build ort inputs")?)
@@ -304,19 +298,12 @@ fn compute_fbank(
         fft.process(&mut buffer);
 
         // Power spectrum (positive frequencies only).
-        let power: Vec<f32> = buffer[..n_freqs]
-            .iter()
-            .map(|c| c.norm_sqr())
-            .collect();
+        let power: Vec<f32> = buffer[..n_freqs].iter().map(|c| c.norm_sqr()).collect();
 
         // Apply mel filterbank.
         let mut mel: Vec<f32> = Vec::with_capacity(N_MELS);
         for filter in mel_filterbank {
-            let energy: f32 = filter
-                .iter()
-                .zip(power.iter())
-                .map(|(f, p)| f * p)
-                .sum();
+            let energy: f32 = filter.iter().zip(power.iter()).map(|(f, p)| f * p).sum();
             // Log-mel (floor to avoid log(0)).
             mel.push((energy.max(1e-10)).ln());
         }
@@ -330,9 +317,7 @@ fn compute_fbank(
 /// Build a Hann window of the given length.
 fn build_hann_window(length: usize) -> Vec<f32> {
     (0..length)
-        .map(|i| {
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / length as f32).cos())
-        })
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / length as f32).cos()))
         .collect()
 }
 
@@ -471,10 +456,7 @@ mod tests {
         assert_eq!(fb[0].len(), 257); // N_FFT/2 + 1
         // The first few filters may be sub-bin resolution at low frequencies
         // (mel spacing < FFT bin width). Check that the majority are non-zero.
-        let nonzero_count = fb
-            .iter()
-            .filter(|f| f.iter().any(|&v| v > 0.0))
-            .count();
+        let nonzero_count = fb.iter().filter(|f| f.iter().any(|&v| v > 0.0)).count();
         assert!(
             nonzero_count >= 120,
             "expected most filters to be non-zero, got {nonzero_count}/128"
@@ -609,6 +591,9 @@ mod tests {
         // 440 Hz in mel space should be around bin 20-30 (rough estimate).
         let mid_frame = &fbank[fbank.len() / 2];
         let max_energy = mid_frame.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        assert!(max_energy > -20.0, "expected detectable energy for 440 Hz tone");
+        assert!(
+            max_energy > -20.0,
+            "expected detectable energy for 440 Hz tone"
+        );
     }
 }

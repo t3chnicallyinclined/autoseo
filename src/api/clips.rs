@@ -6,12 +6,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch, post},
-    Router,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +66,9 @@ async fn get_clip(
     Path(clip_id): Path<String>,
 ) -> impl IntoResponse {
     match state.storage.get_clip(&clip_id).await {
-        Ok(Some(clip)) => (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response(),
+        Ok(Some(clip)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
+        }
         Ok(None) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -87,21 +88,28 @@ async fn patch_clip(
     if let Some(ref status) = body.status {
         let valid = ["generated", "approved", "vetoed", "posted"];
         if !valid.contains(&status.as_str()) {
-            return err_json(StatusCode::BAD_REQUEST, format!("invalid status: {status}")).into_response();
+            return err_json(StatusCode::BAD_REQUEST, format!("invalid status: {status}"))
+                .into_response();
         }
         if let Err(e) = state.storage.update_clip_status(&clip_id, status).await {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
         }
     }
     if let Some(ref social_copy) = body.social_copy_json {
-        if let Err(e) = state.storage.update_clip_social_copy(&clip_id, social_copy).await {
+        if let Err(e) = state
+            .storage
+            .update_clip_social_copy(&clip_id, social_copy)
+            .await
+        {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
         }
     }
 
     // Return the updated clip
     match state.storage.get_clip(&clip_id).await {
-        Ok(Some(clip)) => (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response(),
+        Ok(Some(clip)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
+        }
         Ok(None) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -113,12 +121,12 @@ async fn approve_clip(
     Path(clip_id): Path<String>,
 ) -> impl IntoResponse {
     match state.storage.update_clip_status(&clip_id, "approved").await {
-        Ok(true) => {
-            match state.storage.get_clip(&clip_id).await {
-                Ok(Some(clip)) => (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response(),
-                _ => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(true) => match state.storage.get_clip(&clip_id).await {
+            Ok(Some(clip)) => {
+                (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
             }
-        }
+            _ => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        },
         Ok(false) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -130,12 +138,12 @@ async fn veto_clip(
     Path(clip_id): Path<String>,
 ) -> impl IntoResponse {
     match state.storage.update_clip_status(&clip_id, "vetoed").await {
-        Ok(true) => {
-            match state.storage.get_clip(&clip_id).await {
-                Ok(Some(clip)) => (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response(),
-                _ => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(true) => match state.storage.get_clip(&clip_id).await {
+            Ok(Some(clip)) => {
+                (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
             }
-        }
+            _ => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        },
         Ok(false) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -173,7 +181,9 @@ async fn post_clip(
     }
 
     match state.storage.get_clip(&clip_id).await {
-        Ok(Some(clip)) => (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response(),
+        Ok(Some(clip)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
+        }
         Ok(None) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
@@ -193,11 +203,16 @@ async fn bulk_action(
         "veto" => "vetoed",
         "post" => "posted",
         other => {
-            return err_json(StatusCode::BAD_REQUEST, format!("unknown action: {other}")).into_response();
+            return err_json(StatusCode::BAD_REQUEST, format!("unknown action: {other}"))
+                .into_response();
         }
     };
 
-    match state.storage.bulk_update_clip_status(&body.clip_ids, status).await {
+    match state
+        .storage
+        .bulk_update_clip_status(&body.clip_ids, status)
+        .await
+    {
         Ok(count) => {
             // If posting, also insert pending post rows
             if body.action == "post" {
@@ -213,7 +228,11 @@ async fn bulk_action(
                     }
                 }
             }
-            (StatusCode::OK, Json(serde_json::json!({ "updated": count }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "updated": count })),
+            )
+                .into_response()
         }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }

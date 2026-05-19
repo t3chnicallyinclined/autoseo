@@ -29,7 +29,10 @@ pub fn router(work_dir: PathBuf) -> Router {
         work_dir: Arc::new(work_dir),
     };
     Router::new()
-        .route("/api/media/video/{job_id}/{clip_id}/{variant}", get(serve_video))
+        .route(
+            "/api/media/video/{job_id}/{clip_id}/{variant}",
+            get(serve_video),
+        )
         .route("/api/media/thumb/{job_id}/{clip_id}", get(serve_thumb))
         .route("/api/media/manifest/{job_id}", get(serve_manifest))
         .with_state(state)
@@ -41,7 +44,8 @@ fn is_safe_segment(s: &str) -> bool {
     if s.is_empty() || s == "." || s == ".." {
         return false;
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
         && !s.contains("..")
 }
 
@@ -85,12 +89,10 @@ async fn serve_video(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let clips_dir = resolve_job_clips_dir(&state.work_dir, &job_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let clips_dir = resolve_job_clips_dir(&state.work_dir, &job_id).ok_or(StatusCode::NOT_FOUND)?;
 
     // Find the video file: clip_{clip_id}_*_{variant}.mp4
-    let filename = find_clip_file(&clips_dir, &clip_id, &variant)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let filename = find_clip_file(&clips_dir, &clip_id, &variant).ok_or(StatusCode::NOT_FOUND)?;
 
     let path = clips_dir.join(&filename);
     if !path.is_file() {
@@ -99,7 +101,9 @@ async fn serve_video(
 
     // Verify the resolved path is still under clips_dir (defense in depth)
     let canonical = path.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
-    let canonical_clips = clips_dir.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+    let canonical_clips = clips_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     if !canonical.starts_with(&canonical_clips) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -119,16 +123,23 @@ async fn serve_thumb(
 
     // Thumbnails live under work_dir/clipper/{show}/{ts}/thumbnails/
     // or directly work_dir/local/{show}/{ts}/thumbnails/
-    let thumb_path = find_thumbnail(&state.work_dir, &job_id, &clip_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let thumb_path =
+        find_thumbnail(&state.work_dir, &job_id, &clip_id).ok_or(StatusCode::NOT_FOUND)?;
 
-    let canonical = thumb_path.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
-    let canonical_work = state.work_dir.canonicalize().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let canonical = thumb_path
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let canonical_work = state
+        .work_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !canonical.starts_with(&canonical_work) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let body = tokio::fs::read(&canonical).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let body = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok((
         StatusCode::OK,
         [
@@ -136,7 +147,8 @@ async fn serve_thumb(
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         body,
-    ).into_response())
+    )
+        .into_response())
 }
 
 /// Serve manifest.json for a job.
@@ -148,21 +160,26 @@ async fn serve_manifest(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let clips_dir = resolve_job_clips_dir(&state.work_dir, &job_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let clips_dir = resolve_job_clips_dir(&state.work_dir, &job_id).ok_or(StatusCode::NOT_FOUND)?;
 
     let manifest_path = clips_dir.join("manifest.json");
     if !manifest_path.is_file() {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let canonical = manifest_path.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
-    let canonical_clips = clips_dir.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+    let canonical = manifest_path
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let canonical_clips = clips_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     if !canonical.starts_with(&canonical_clips) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let body = tokio::fs::read(&canonical).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let body = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok((
         StatusCode::OK,
         [
@@ -170,7 +187,8 @@ async fn serve_manifest(
             (header::CACHE_CONTROL, "no-cache"),
         ],
         body,
-    ).into_response())
+    )
+        .into_response())
 }
 
 /// Serve a file with HTTP Range header support (for video seeking).
@@ -179,21 +197,25 @@ async fn serve_file_with_range(
     content_type: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let metadata = tokio::fs::metadata(path).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     let file_size = metadata.len();
 
-    let range_header = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok());
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
     match range_header {
         Some(range_str) => {
-            let (start, end) = parse_range(range_str, file_size)
-                .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+            let (start, end) =
+                parse_range(range_str, file_size).ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
             let length = end - start + 1;
 
-            let mut file = tokio::fs::File::open(path).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            file.seek(std::io::SeekFrom::Start(start)).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
             let limited = tokio::io::AsyncReadExt::take(file, length);
             let stream = tokio_util::io::ReaderStream::new(limited);
@@ -203,14 +225,19 @@ async fn serve_file_with_range(
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, length.to_string())
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_size}"))
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{file_size}"),
+                )
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CACHE_CONTROL, "public, max-age=86400")
                 .body(body)
                 .unwrap())
         }
         None => {
-            let file = tokio::fs::File::open(path).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let stream = tokio_util::io::ReaderStream::new(file);
             let body = axum::body::Body::from_stream(stream);
 
@@ -409,7 +436,9 @@ mod tests {
             "application/json"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["schema_version"], 1);
     }
@@ -485,7 +514,11 @@ mod tests {
     #[tokio::test]
     async fn serves_thumbnail() {
         let dir = tempfile::tempdir().unwrap();
-        let thumbs = dir.path().join("clipper").join("testjob").join("thumbnails");
+        let thumbs = dir
+            .path()
+            .join("clipper")
+            .join("testjob")
+            .join("thumbnails");
         std::fs::create_dir_all(&thumbs).unwrap();
 
         // Create a fake JPEG (just some bytes with JPEG header)

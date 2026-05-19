@@ -167,10 +167,7 @@ impl Platform {
                 Ok(())
             }
             Platform::Ayrshare(_) => {
-                tracing::warn!(
-                    id = external_id,
-                    "ayrshare: veto not implemented"
-                );
+                tracing::warn!(id = external_id, "ayrshare: veto not implemented");
                 Ok(())
             }
         }

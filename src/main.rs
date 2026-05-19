@@ -2,16 +2,16 @@
 
 mod active_speaker;
 mod ai_pipeline;
+mod align;
 mod analytics;
 mod api;
-mod align;
 mod ast;
 mod candidates;
 mod captions;
 mod clipper;
 mod config;
-mod cost;
 mod context;
+mod cost;
 mod drive;
 mod embed;
 mod enhance;
@@ -55,9 +55,9 @@ use gmail::GmailClient;
 use google_auth::GoogleAuth;
 use mime::build_mime_email;
 use openai::OpenAiClient;
-use std::time::{SystemTime, UNIX_EPOCH};
 use show_config::{DigestMode, GlobalPromptPaths, PromptLoader, PromptName};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{JobStatus, Storage};
 use tracing_subscriber::EnvFilter;
 
@@ -97,9 +97,8 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         let config_path = std::path::PathBuf::from(&cfg.work_dir).join("config.json");
-        let config_store = std::sync::Arc::new(
-            api::config_store::ConfigStore::load(config_path).await?,
-        );
+        let config_store =
+            std::sync::Arc::new(api::config_store::ConfigStore::load(config_path).await?);
         let state = api::AppState {
             storage,
             work_dir: cfg.work_dir.clone(),
@@ -131,8 +130,8 @@ async fn main() -> anyhow::Result<()> {
     //   - clipper mode + DIGEST_MODE includes email: requires Google + RESULT_TO
     //   - clipper mode + DIGEST_MODE=file (default): no Google required
     //   - polling loop (no LOCAL_VIDEO_PATH) for seo-only: requires Google (Gmail/Drive ingest)
-    let needs_google = mode.produces_seo_emails()
-        || (mode.produces_clips() && digest_mode.sends_email());
+    let needs_google =
+        mode.produces_seo_emails() || (mode.produces_clips() && digest_mode.sends_email());
     if needs_google && google.is_none() {
         anyhow::bail!(
             "GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN are required \
@@ -140,8 +139,8 @@ async fn main() -> anyhow::Result<()> {
              MODE=clipper with DIGEST_MODE=file to run Google-free."
         );
     }
-    let needs_result_to = mode.produces_seo_emails()
-        || (mode.produces_clips() && digest_mode.sends_email());
+    let needs_result_to =
+        mode.produces_seo_emails() || (mode.produces_clips() && digest_mode.sends_email());
     if needs_result_to && cfg.result_to.as_deref().unwrap_or("").is_empty() && !cfg.dry_run {
         anyhow::bail!(
             "RESULT_TO is required when any code path sends email. Set it or use \
@@ -198,19 +197,24 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(local_path) = cfg.local_video_path.as_deref() {
         if mode.produces_clips() {
-            let openai_ref = openai_client.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)")
-            })?;
+            let openai_ref = openai_client
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("clipper mode requires OPENAI_API_KEY (unset)"))?;
             let ai_for_clipper = build_ai_pipeline(&cfg, openai_ref, &prompt_loader, None).await?;
             // Generate a stable job ID from the local file path so retries
             // reuse the same row.
-            let job_id = format!("local:{}", sanitize_filename(
-                std::path::Path::new(local_path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(local_path),
-            ));
-            storage.create_job(&job_id, None, Some(local_path), None).await?;
+            let job_id = format!(
+                "local:{}",
+                sanitize_filename(
+                    std::path::Path::new(local_path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(local_path),
+                )
+            );
+            storage
+                .create_job(&job_id, None, Some(local_path), None)
+                .await?;
             clipper::run_clipper_local_once(
                 &cfg,
                 google.as_ref(),
@@ -230,8 +234,7 @@ async fn main() -> anyhow::Result<()> {
             let openai_ref = openai_client
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("AI pipeline not configured"))?;
-            run_local_once(&cfg, g, &gmail, openai_ref, &prompt_loader, local_path)
-                .await?;
+            run_local_once(&cfg, g, &gmail, openai_ref, &prompt_loader, local_path).await?;
         }
         return Ok(());
     }
@@ -343,9 +346,7 @@ async fn build_ai_pipeline(
             Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
             _ => whisper_local::WhisperLocal::default_model_path(&cfg.work_dir),
         };
-        pipeline = pipeline.with_whisper_local(
-            whisper_local::WhisperLocal::load(&model_path)?
-        );
+        pipeline = pipeline.with_whisper_local(whisper_local::WhisperLocal::load(&model_path)?);
     }
 
     #[cfg(not(feature = "local-stt"))]
@@ -721,22 +722,25 @@ async fn run_once(
                 let media_name = media_name.clone();
                 let transcript_text = transcript_text.clone();
                 async move {
-                    ai_ref.seo_variant_text_with_context(
-                        transcript_text.as_str(),
-                        inst.as_str(),
-                        i,
-                        variant_total,
-                        show_context.as_ref(),
-                        Some(media_name.as_str()),
-                    )
-                    .await
+                    ai_ref
+                        .seo_variant_text_with_context(
+                            transcript_text.as_str(),
+                            inst.as_str(),
+                            i,
+                            variant_total,
+                            show_context.as_ref(),
+                            Some(media_name.as_str()),
+                        )
+                        .await
                 }
             },
         ));
 
         let (seo_texts, moments) = if is_video {
-            let (seo_texts_res, moments_res) =
-                tokio::join!(seo_fut, ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+            let (seo_texts_res, moments_res) = tokio::join!(
+                seo_fut,
+                ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
+            );
             let seo_texts = seo_texts_res?;
             let moments = match moments_res {
                 Ok(m) if !m.is_empty() => m,
@@ -784,7 +788,10 @@ async fn run_once(
                 )
             }
         } else {
-            format!("{} SEO package (audio): {}", cfg.result_subject_prefix, meta.name)
+            format!(
+                "{} SEO package (audio): {}",
+                cfg.result_subject_prefix, meta.name
+            )
         };
 
         for (i, body) in seo_texts.iter().enumerate() {
@@ -877,7 +884,9 @@ async fn run_clipper_once(
             tracing::info!(message_id, "clipper: no drive file ids found");
             // Mark as done so we don't re-check this message every poll.
             storage.create_job(&job_id, None, None, None).await?;
-            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            storage
+                .update_job_status(&job_id, JobStatus::Done, None)
+                .await?;
             continue;
         }
 
@@ -888,8 +897,12 @@ async fn run_clipper_once(
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(message_id, file_id, error=?e, "clipper: drive metadata failed; skipping");
-                storage.create_job(&job_id, None, None, Some(file_id)).await?;
-                storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+                storage
+                    .create_job(&job_id, None, None, Some(file_id))
+                    .await?;
+                storage
+                    .update_job_status(&job_id, JobStatus::Done, None)
+                    .await?;
                 continue;
             }
         };
@@ -909,15 +922,23 @@ async fn run_clipper_once(
                 name = %meta.name,
                 "clipper: skipping non-video file"
             );
-            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
-            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            storage
+                .create_job(&job_id, None, Some(&meta.name), Some(file_id))
+                .await?;
+            storage
+                .update_job_status(&job_id, JobStatus::Done, None)
+                .await?;
             continue;
         }
 
         if cfg.dry_run {
             tracing::info!(message_id, file_id, name = %meta.name, "clipper: dry-run skip");
-            storage.create_job(&job_id, None, Some(&meta.name), Some(file_id)).await?;
-            storage.update_job_status(&job_id, JobStatus::Done, None).await?;
+            storage
+                .create_job(&job_id, None, Some(&meta.name), Some(file_id))
+                .await?;
+            storage
+                .update_job_status(&job_id, JobStatus::Done, None)
+                .await?;
             continue;
         }
 
@@ -1155,7 +1176,10 @@ async fn run_local_once(
         .transcribe_chunks(&chunks, Some(pb_transcribe.clone()))
         .await?;
 
-    let show_context = match ai_global.infer_show_context(&file_name, &transcript.full_text).await {
+    let show_context = match ai_global
+        .infer_show_context(&file_name, &transcript.full_text)
+        .await
+    {
         Ok(ctx) => Some(ctx),
         Err(e) => {
             tracing::warn!(error = %e, file_name=%file_name, "show inference failed; proceeding without show context");
@@ -1210,22 +1234,25 @@ async fn run_local_once(
             let media_name = media_name.clone();
             let transcript_text = transcript_text.clone();
             async move {
-                ai_ref.seo_variant_text_with_context(
-                    transcript_text.as_str(),
-                    inst.as_str(),
-                    i,
-                    variant_total,
-                    show_context.as_ref(),
-                    Some(media_name.as_str()),
-                )
-                .await
+                ai_ref
+                    .seo_variant_text_with_context(
+                        transcript_text.as_str(),
+                        inst.as_str(),
+                        i,
+                        variant_total,
+                        show_context.as_ref(),
+                        Some(media_name.as_str()),
+                    )
+                    .await
             }
         },
     ));
 
     let (seo_texts, moments) = if is_video {
-        let (seo_texts_res, moments_res) =
-            tokio::join!(seo_fut, ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots));
+        let (seo_texts_res, moments_res) = tokio::join!(
+            seo_fut,
+            ai_ref.thumbnail_windows(&transcript.segments, cfg.thumbnail_slots)
+        );
         let seo_texts = seo_texts_res?;
         let moments = match moments_res {
             Ok(m) if !m.is_empty() => m,
@@ -1272,7 +1299,10 @@ async fn run_local_once(
             )
         }
     } else {
-        format!("{} SEO package (audio): {}", cfg.result_subject_prefix, file_name)
+        format!(
+            "{} SEO package (audio): {}",
+            cfg.result_subject_prefix, file_name
+        )
     };
 
     for (i, body) in seo_texts.iter().enumerate() {

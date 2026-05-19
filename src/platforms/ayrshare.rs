@@ -57,17 +57,14 @@ impl AyrsharePoster {
         match self.post_inner(api_key, video_path, &caption).await {
             Ok(resp) => {
                 let id = resp.id.unwrap_or_default();
-                let posted_platforms: Vec<&str> = self.platforms.iter().map(|s| s.as_str()).collect();
+                let posted_platforms: Vec<&str> =
+                    self.platforms.iter().map(|s| s.as_str()).collect();
                 tracing::info!(
                     id = %id,
                     platforms = ?posted_platforms,
                     "ayrshare: post created"
                 );
-                PostResult::posted(
-                    "ayrshare",
-                    id,
-                    resp.post_url.unwrap_or_default(),
-                )
+                PostResult::posted("ayrshare", id, resp.post_url.unwrap_or_default())
             }
             Err(e) => PostResult::failed("ayrshare", format!("{e:#}")),
         }
@@ -93,8 +90,8 @@ impl AyrsharePoster {
             .mime_str("video/mp4")
             .context("set mime type")?;
 
-        let platforms_json = serde_json::to_string(&self.platforms)
-            .context("serialize platforms")?;
+        let platforms_json =
+            serde_json::to_string(&self.platforms).context("serialize platforms")?;
 
         let form = reqwest::multipart::Form::new()
             .text("post", caption.to_string())

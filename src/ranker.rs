@@ -110,7 +110,10 @@ impl Ranker {
                     score: clip.score.clamp(0, 100),
                     hook: clip.hook.trim().to_string(),
                     reasoning: clip.reasoning.trim().to_string(),
-                    trend_match: clip.trend_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    trend_match: clip
+                        .trend_match
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 });
             }
         }
@@ -139,9 +142,9 @@ impl Ranker {
             None => (String::new(), String::new(), String::new()),
         };
         let trends_block = match current_trends {
-            Some(t) if !t.is_empty() => format!(
-                "CURRENT TRENDS (boost candidates that align with these topics):\n{t}"
-            ),
+            Some(t) if !t.is_empty() => {
+                format!("CURRENT TRENDS (boost candidates that align with these topics):\n{t}")
+            }
             _ => String::new(),
         };
         out = out
@@ -323,7 +326,10 @@ mod tests {
         // Degenerate suggestion where end < start — bump end forward.
         let (s3, e3) = r.clamp_refinement(&c, 70.0, 60.0);
         assert_eq!(s3, 65.0);
-        assert!(e3 > s3, "end should be after start, got start={s3} end={e3}");
+        assert!(
+            e3 > s3,
+            "end should be after start, got start={s3} end={e3}"
+        );
     }
 
     #[test]

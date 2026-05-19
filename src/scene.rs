@@ -126,9 +126,24 @@ mod tests {
         let status = Command::new("ffmpeg")
             .arg("-y")
             .args(["-hide_banner", "-loglevel", "error"])
-            .args(["-f", "lavfi", "-i", "color=red:size=320x180:duration=2:rate=15"])
-            .args(["-f", "lavfi", "-i", "color=green:size=320x180:duration=2:rate=15"])
-            .args(["-f", "lavfi", "-i", "color=blue:size=320x180:duration=2:rate=15"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=320x180:duration=2:rate=15",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=green:size=320x180:duration=2:rate=15",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=blue:size=320x180:duration=2:rate=15",
+            ])
             .args(["-filter_complex", "[0][1][2]concat=n=3:v=1:a=0[v]"])
             .args(["-map", "[v]"])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
@@ -169,7 +184,12 @@ mod tests {
         let status = Command::new("ffmpeg")
             .arg("-y")
             .args(["-hide_banner", "-loglevel", "error"])
-            .args(["-f", "lavfi", "-i", "color=red:size=320x180:duration=3:rate=15"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=320x180:duration=3:rate=15",
+            ])
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&video)
             .status()
@@ -177,7 +197,10 @@ mod tests {
         anyhow::ensure!(status.success(), "ffmpeg flat video generation failed");
 
         let cuts = detect_shots("ffmpeg", &video, 0.3).await?;
-        assert!(cuts.is_empty(), "expected no cuts on constant video, got {cuts:?}");
+        assert!(
+            cuts.is_empty(),
+            "expected no cuts on constant video, got {cuts:?}"
+        );
         Ok(())
     }
 }

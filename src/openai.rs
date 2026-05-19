@@ -294,7 +294,12 @@ impl OpenAiClient {
 
         let parsed: ChatResponse = res.json().await.context("parse chat response")?;
         if let Some(u) = &parsed.usage {
-            self.record_usage(CostCategory::Chat, model, u.prompt_tokens, u.completion_tokens);
+            self.record_usage(
+                CostCategory::Chat,
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+            );
         }
         let content = parsed
             .choices
@@ -356,7 +361,12 @@ impl OpenAiClient {
 
         let parsed: ChatResponse = res.json().await.context("parse chat response")?;
         if let Some(u) = &parsed.usage {
-            self.record_usage(CostCategory::Chat, model, u.prompt_tokens, u.completion_tokens);
+            self.record_usage(
+                CostCategory::Chat,
+                model,
+                u.prompt_tokens,
+                u.completion_tokens,
+            );
         }
         let content = parsed
             .choices

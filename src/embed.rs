@@ -35,7 +35,10 @@ impl Embedder {
     }
 
     /// Like [`from_config`] but attaches a cost tracker for usage estimation.
-    pub fn from_config_with_tracker(cfg: &Config, cost_tracker: Option<&CostTracker>) -> anyhow::Result<Self> {
+    pub fn from_config_with_tracker(
+        cfg: &Config,
+        cost_tracker: Option<&CostTracker>,
+    ) -> anyhow::Result<Self> {
         if let Some(key) = cfg.hf_api_key.as_ref().filter(|k| !k.is_empty()) {
             let mut embedder = HfEmbedder::new(
                 cfg.hf_router_url.clone(),
@@ -48,8 +51,8 @@ impl Embedder {
             }
             Ok(Embedder::Hf(embedder))
         } else {
-            let cache_dir = (!cfg.embed_model_dir.is_empty())
-                .then(|| PathBuf::from(&cfg.embed_model_dir));
+            let cache_dir =
+                (!cfg.embed_model_dir.is_empty()).then(|| PathBuf::from(&cfg.embed_model_dir));
             Ok(Embedder::Fastembed(FastembedEmbedder::try_new(cache_dir)?))
         }
     }
@@ -408,9 +411,16 @@ mod tests {
         ];
         let vecs = e.embed(texts).await?;
         assert_eq!(vecs.len(), 2);
-        assert!(vecs[0].len() >= 384, "embedding dim should be large; got {}", vecs[0].len());
+        assert!(
+            vecs[0].len() >= 384,
+            "embedding dim should be large; got {}",
+            vecs[0].len()
+        );
         let sim = cosine_similarity(&vecs[0], &vecs[1]);
-        assert!(sim < 0.7, "unrelated texts should have low cosine; got {sim}");
+        assert!(
+            sim < 0.7,
+            "unrelated texts should have low cosine; got {sim}"
+        );
         Ok(())
     }
 

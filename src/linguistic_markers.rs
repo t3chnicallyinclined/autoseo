@@ -65,9 +65,8 @@ static TOPIC_SHIFT_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static regex")
 });
 
-static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b\d[\d,\.]*\b").expect("static regex")
-});
+static NUMBER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d[\d,\.]*\b").expect("static regex"));
 
 /// Sentence splitter: a `.`, `!`, or `?` followed by whitespace or end of input.
 /// Lossy for abbreviations ("Mr.") but adequate for ranker-feature counting.
@@ -212,7 +211,9 @@ mod tests {
 
     #[test]
     fn picks_quotable_lines_by_brevity() {
-        let f = extract_features("Wow. That changes everything. I think it does change everything in this particular case. Or does it?");
+        let f = extract_features(
+            "Wow. That changes everything. I think it does change everything in this particular case. Or does it?",
+        );
         // Declarative short sentences: "Wow" (1 word), "That changes everything" (3 words),
         // and the long one (~9 words). Quotables should be the two shortest.
         assert_eq!(f.quotable_lines.len(), 2);

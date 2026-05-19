@@ -42,16 +42,9 @@ impl VlmReranker {
         if !cfg.vlm_rerank_enabled {
             return None;
         }
-        let key = cfg
-            .hf_api_key
-            .as_ref()
-            .filter(|k| !k.is_empty())?
-            .clone();
+        let key = cfg.hf_api_key.as_ref().filter(|k| !k.is_empty())?.clone();
         // The OpenAI-compatible chat endpoint lives under {router}/v1.
-        let base_url = format!(
-            "{}/v1",
-            cfg.hf_router_url.trim_end_matches('/')
-        );
+        let base_url = format!("{}/v1", cfg.hf_router_url.trim_end_matches('/'));
         Some(Self {
             base_url,
             api_key: key,
@@ -85,7 +78,14 @@ impl VlmReranker {
         for i in 0..n_to_rerank {
             let clip = &out[i];
             let frames = match self
-                .extract_frames(ffmpeg, video_path, clip.start_secs, clip.end_secs, &work_dir, i)
+                .extract_frames(
+                    ffmpeg,
+                    video_path,
+                    clip.start_secs,
+                    clip.end_secs,
+                    &work_dir,
+                    i,
+                )
                 .await
             {
                 Ok(f) if !f.is_empty() => f,
@@ -101,9 +101,9 @@ impl VlmReranker {
             match self.score_clip(&frames, clip).await {
                 Ok((vlm_score, vlm_reason)) => {
                     let llm = out[i].score as f64;
-                    let blended =
-                        ((1.0 - self.blend_weight) * llm + self.blend_weight * vlm_score as f64)
-                            .round() as i32;
+                    let blended = ((1.0 - self.blend_weight) * llm
+                        + self.blend_weight * vlm_score as f64)
+                        .round() as i32;
                     let combined_reason = if vlm_reason.is_empty() {
                         out[i].reasoning.clone()
                     } else {
@@ -154,11 +154,7 @@ impl VlmReranker {
         .await
     }
 
-    async fn score_clip(
-        &self,
-        frames: &[Vec<u8>],
-        clip: &RankedClip,
-    ) -> Result<(i32, String)> {
+    async fn score_clip(&self, frames: &[Vec<u8>], clip: &RankedClip) -> Result<(i32, String)> {
         let mut content: Vec<ChatContent> = Vec::with_capacity(frames.len() + 1);
         let text = format!(
             "You are scoring a podcast clip for short-form viral potential.\n\
@@ -214,7 +210,8 @@ impl VlmReranker {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
-                        let parsed: ChatResponseWithUsage = r.json().await.context("parse vlm response")?;
+                        let parsed: ChatResponseWithUsage =
+                            r.json().await.context("parse vlm response")?;
                         if let (Some(tracker), Some(u)) = (&self.cost_tracker, &parsed.usage) {
                             tracker.record(UsageRecord {
                                 category: CostCategory::Vlm,
@@ -229,8 +226,8 @@ impl VlmReranker {
                             .next()
                             .and_then(|c| c.message.content)
                             .context("vlm response missing content")?;
-                        let score: VlmScore = serde_json::from_str(content.trim())
-                            .with_context(|| {
+                        let score: VlmScore =
+                            serde_json::from_str(content.trim()).with_context(|| {
                                 format!("parse vlm json (content={})", truncate(&content, 400))
                             })?;
                         return Ok((score.score.clamp(0, 100), score.reasoning));
@@ -285,17 +282,18 @@ pub struct PremiumVlmReranker {
 impl PremiumVlmReranker {
     /// Build from config. Returns `None` when `VLM_PREMIUM_MODEL` is not set.
     pub fn from_config(cfg: &Config, cost_tracker: Option<&CostTracker>) -> Option<Self> {
-        let model = cfg.vlm_premium_model.as_ref().filter(|m| !m.is_empty())?.clone();
+        let model = cfg
+            .vlm_premium_model
+            .as_ref()
+            .filter(|m| !m.is_empty())?
+            .clone();
         let api_key = cfg
             .vlm_premium_api_key
             .as_ref()
             .or(cfg.hf_api_key.as_ref())
             .filter(|k| !k.is_empty())?
             .clone();
-        let base_url = format!(
-            "{}/v1",
-            cfg.vlm_premium_base_url.trim_end_matches('/')
-        );
+        let base_url = format!("{}/v1", cfg.vlm_premium_base_url.trim_end_matches('/'));
         Some(Self {
             base_url,
             api_key,
@@ -500,8 +498,8 @@ impl PremiumVlmReranker {
                             .next()
                             .and_then(|c| c.message.content)
                             .context("premium vlm response missing content")?;
-                        let score: VlmScore = serde_json::from_str(content.trim())
-                            .with_context(|| {
+                        let score: VlmScore =
+                            serde_json::from_str(content.trim()).with_context(|| {
                                 format!(
                                     "parse premium vlm json (content={})",
                                     truncate(&content, 400)

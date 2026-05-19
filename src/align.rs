@@ -42,11 +42,7 @@ pub fn shift_words(words: &[TranscriptionWord], offset_secs: f64) -> Vec<Aligned
 /// Snap a target time to the nearest word boundary (start or end of any word) within
 /// `max_drift_secs`. Returns the original target if no boundary is close enough.
 /// Use this so clip cuts land at word edges, never mid-word.
-pub fn snap_to_word_boundary(
-    target_secs: f64,
-    words: &[AlignedWord],
-    max_drift_secs: f64,
-) -> f64 {
+pub fn snap_to_word_boundary(target_secs: f64, words: &[AlignedWord], max_drift_secs: f64) -> f64 {
     if words.is_empty() {
         return target_secs;
     }

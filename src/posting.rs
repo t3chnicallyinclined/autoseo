@@ -39,7 +39,10 @@ pub async fn post_one_clip(
     }
     let Some(social) = social else {
         for p in platforms {
-            results.push(PostResult::skipped(p.name(), "no social copy for this clip"));
+            results.push(PostResult::skipped(
+                p.name(),
+                "no social copy for this clip",
+            ));
         }
         return results;
     };

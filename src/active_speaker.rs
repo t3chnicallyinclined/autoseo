@@ -101,11 +101,7 @@ fn is_speech_at(timestamp: f64, speech_segments: &[SpeechSegment]) -> bool {
 
 /// Compute seconds of overlap between a time range `[start, end)` and the
 /// union of speech segments.
-fn speech_overlap_secs(
-    start: f64,
-    end: f64,
-    speech_segments: &[SpeechSegment],
-) -> f64 {
+fn speech_overlap_secs(start: f64, end: f64, speech_segments: &[SpeechSegment]) -> f64 {
     let mut total = 0.0_f64;
     for seg in speech_segments {
         let overlap_start = start.max(seg.start_secs);
@@ -123,10 +119,7 @@ fn speech_overlap_secs(
 /// (Euclidean center distance) detection in the previous frame that hasn't
 /// already been claimed. New detections that are farther than
 /// `max_match_distance` pixels start a new track.
-fn assign_tracks(
-    frames: &[FrameFaces],
-    max_match_distance: f64,
-) -> Vec<Vec<TrackedFace>> {
+fn assign_tracks(frames: &[FrameFaces], max_match_distance: f64) -> Vec<Vec<TrackedFace>> {
     let mut next_id: usize = 0;
     // Previous frame's (track_id, center_x, center_y) for matching.
     let mut prev_tracks: Vec<(usize, f64, f64)> = Vec::new();
@@ -138,8 +131,7 @@ fn assign_tracks(
 
         // Sort current faces by descending confidence so the best detections
         // claim tracks first.
-        let mut indexed_faces: Vec<(usize, &FaceBbox)> =
-            frame.faces.iter().enumerate().collect();
+        let mut indexed_faces: Vec<(usize, &FaceBbox)> = frame.faces.iter().enumerate().collect();
         indexed_faces.sort_by(|a, b| {
             b.1.confidence
                 .partial_cmp(&a.1.confidence)
@@ -157,10 +149,8 @@ fn assign_tracks(
                     continue;
                 }
                 let dist = ((cx - px).powi(2) + (cy - py).powi(2)).sqrt();
-                if dist <= max_match_distance {
-                    if best.is_none() || dist < best.unwrap().1 {
-                        best = Some((pi, dist));
-                    }
+                if dist <= max_match_distance && (best.is_none() || dist < best.unwrap().1) {
+                    best = Some((pi, dist));
                 }
             }
 
@@ -300,14 +290,23 @@ pub fn detect_active_speaker(
                 .max_by(|a, b| {
                     let sa = score_map.get(&a.track_id).copied().unwrap_or(0.0);
                     let sb = score_map.get(&b.track_id).copied().unwrap_or(0.0);
-                    sa.partial_cmp(&sb)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            a.bbox
-                                .confidence
-                                .partial_cmp(&b.bbox.confidence)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                    // Compute overlap_ratio from sums of small floats, so
+                    // numerically equal ratios can differ at ~1e-16. Treat
+                    // anything inside the noise floor as a tie and fall through
+                    // to the confidence tie-break.
+                    let primary = if (sa - sb).abs() < 1e-9 {
+                        std::cmp::Ordering::Equal
+                    } else if sa > sb {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                    primary.then_with(|| {
+                        a.bbox
+                            .confidence
+                            .partial_cmp(&b.bbox.confidence)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                 })
         } else {
             None
@@ -606,7 +605,7 @@ mod tests {
                 timestamp_secs: 0.033,
                 faces: vec![
                     face(102.0, 101.0, 50.0, 60.0, 0.9), // Face A moved slightly
-                    face(298.0, 99.0, 50.0, 60.0, 0.8),   // Face B moved slightly
+                    face(298.0, 99.0, 50.0, 60.0, 0.8),  // Face B moved slightly
                 ],
             },
         ];
@@ -635,7 +634,7 @@ mod tests {
                 timestamp_secs: 0.033,
                 faces: vec![
                     face(100.0, 100.0, 50.0, 60.0, 0.9), // Same face
-                    face(800.0, 500.0, 50.0, 60.0, 0.7),  // New face, far away
+                    face(800.0, 500.0, 50.0, 60.0, 0.7), // New face, far away
                 ],
             },
         ];

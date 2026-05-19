@@ -27,22 +27,27 @@ use crate::google_auth::GoogleAuth;
 use crate::media;
 use crate::mime::build_mime_email;
 use crate::performance_history;
+use crate::platforms::{self, PostResult, PostStatus};
+use crate::posting;
 use crate::prosody;
 use crate::ranker::{RankedClip, Ranker};
 use crate::render::{self, RenderProfile};
-use crate::platforms::{self, PostResult, PostStatus};
-use crate::posting;
 use crate::scene;
 use crate::show_config::{self, DigestMode};
 use crate::social_copy::{HookSource, SocialCopy, SocialCopyGenerator, resolve_hook};
-use crate::storage::{JobStatus, Storage, TrendRow};
+use crate::storage::{JobStatus, Storage};
 use crate::vad;
 use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
 
 /// Update job status in storage if both storage and job_id are provided.
 /// Errors from the status update itself are logged but not propagated,
 /// so a DB hiccup never masks the real pipeline error.
-async fn set_job_status(storage: Option<&Storage>, job_id: Option<&str>, status: JobStatus, error: Option<&str>) {
+async fn set_job_status(
+    storage: Option<&Storage>,
+    job_id: Option<&str>,
+    status: JobStatus,
+    error: Option<&str>,
+) {
     if let (Some(st), Some(jid)) = (storage, job_id) {
         if let Err(e) = st.update_job_status(jid, status, error).await {
             tracing::warn!(job_id = jid, status = status.as_str(), error = ?e, "failed to update job status");
@@ -72,7 +77,15 @@ pub async fn run_clipper_from_drive(
     // Run the pipeline and update status at each gate. On error, mark the
     // job as failed so the caller (polling loop) can decide whether to retry.
     let result = run_clipper_pipeline_inner(
-        cfg, google, gmail, ai, video_path, media_name, digest_mode, storage, job_id,
+        cfg,
+        google,
+        gmail,
+        ai,
+        video_path,
+        media_name,
+        digest_mode,
+        storage,
+        job_id,
     )
     .await;
 
@@ -268,9 +281,18 @@ async fn run_clipper_pipeline_inner(
         .ok();
 
     let cand_gen = CandidateGenerator::new();
-    let mut candidates =
-        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
-    tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
+    let mut candidates = cand_gen.generate(
+        total_duration_secs,
+        &transcript.words,
+        &silences,
+        &shots,
+        &rms,
+        &f0,
+    );
+    tracing::info!(
+        candidates = candidates.len(),
+        "clipper: candidates generated"
+    );
 
     if candidates.is_empty() {
         anyhow::bail!("no candidate windows produced — episode may be too short or too quiet");
@@ -278,7 +300,10 @@ async fn run_clipper_pipeline_inner(
 
     match Embedder::from_config_with_tracker(cfg, Some(&cost_tracker)) {
         Ok(embedder) => {
-            tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
+            tracing::info!(
+                backend = embedder.backend_name(),
+                "clipper: embedding novelty"
+            );
             if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
                 tracing::warn!(error = ?e, "novelty scoring failed; proceeding without it");
             }
@@ -351,7 +376,12 @@ async fn run_clipper_pipeline_inner(
         final_top_k
     };
     let ranked = ranker
-        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
+        .rank(
+            &candidates,
+            llm_top_k,
+            show_context.as_ref(),
+            trends_text.as_deref(),
+        )
         .await
         .context("LLM rank")?;
     tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
@@ -370,7 +400,12 @@ async fn run_clipper_pipeline_inner(
                 Err(e) => {
                     tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
+                        .rank(
+                            &candidates,
+                            llm_top_k,
+                            show_context.as_ref(),
+                            trends_text.as_deref(),
+                        )
                         .await
                         .context("LLM rank (refetch after VLM failure)")?
                 }
@@ -479,9 +514,14 @@ async fn run_clipper_pipeline_inner(
             let profile = (spec.profile)();
             let style = (spec.style)();
 
-            if let Err(e) =
-                captions::write_ass(&ass_path, &clip_words, profile.width, profile.height, &style)
-                    .await
+            if let Err(e) = captions::write_ass(
+                &ass_path,
+                &clip_words,
+                profile.width,
+                profile.height,
+                &style,
+            )
+            .await
             {
                 tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
                 continue;
@@ -618,7 +658,13 @@ async fn run_clipper_pipeline_inner(
     }
 
     // Write digest
-    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
+    let body = build_digest_body(
+        &file_name,
+        total_duration_secs,
+        &clips_dir,
+        &rendered,
+        &cost_snap,
+    );
 
     if digest_mode.writes_file() {
         let digest_path = clips_dir.join("digest.md");
@@ -628,10 +674,15 @@ async fn run_clipper_pipeline_inner(
         tracing::info!(path = %digest_path.display(), "clipper: digest written to disk");
 
         let manifest_path = clips_dir.join("manifest.json");
-        let manifest =
-            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
-        let manifest_text = serde_json::to_string_pretty(&manifest)
-            .unwrap_or_else(|_| "{}".to_string());
+        let manifest = build_manifest_json(
+            &file_name,
+            total_duration_secs,
+            &clips_dir,
+            &rendered,
+            &cost_snap,
+        );
+        let manifest_text =
+            serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string());
         if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
             tracing::warn!(error = ?e, "manifest.json write failed (non-fatal)");
         }
@@ -673,7 +724,17 @@ pub async fn run_clipper_local_once(
     storage: Option<&Storage>,
     job_id: Option<&str>,
 ) -> Result<()> {
-    let result = run_clipper_inner(cfg, google, gmail, ai, local_path, digest_mode, storage, job_id).await;
+    let result = run_clipper_inner(
+        cfg,
+        google,
+        gmail,
+        ai,
+        local_path,
+        digest_mode,
+        storage,
+        job_id,
+    )
+    .await;
     if let Err(ref e) = result {
         let msg = format!("{e:#}");
         set_job_status(storage, job_id, JobStatus::Failed, Some(&msg)).await;
@@ -693,9 +754,7 @@ async fn run_clipper_inner(
 ) -> Result<()> {
     if digest_mode.sends_email() {
         if google.is_none() {
-            anyhow::bail!(
-                "DIGEST_MODE includes email but Google credentials are missing"
-            );
+            anyhow::bail!("DIGEST_MODE includes email but Google credentials are missing");
         }
         if cfg.result_to.as_deref().unwrap_or("").is_empty() {
             anyhow::bail!("DIGEST_MODE includes email but RESULT_TO is unset");
@@ -719,9 +778,7 @@ async fn run_clipper_inner(
     let is_audio_only = !is_video_extension(&lower);
     if is_audio_only {
         // Clipper renders video clips; an audio-only input can't produce vertical reformat.
-        anyhow::bail!(
-            "clipper mode requires a video input, got: {file_name}"
-        );
+        anyhow::bail!("clipper mode requires a video input, got: {file_name}");
     }
 
     ensure_tool(&cfg.ffmpeg, "ffmpeg").await?;
@@ -912,9 +969,18 @@ async fn run_clipper_inner(
     };
 
     let cand_gen = CandidateGenerator::new();
-    let mut candidates =
-        cand_gen.generate(total_duration_secs, &transcript.words, &silences, &shots, &rms, &f0);
-    tracing::info!(candidates = candidates.len(), "clipper: candidates generated");
+    let mut candidates = cand_gen.generate(
+        total_duration_secs,
+        &transcript.words,
+        &silences,
+        &shots,
+        &rms,
+        &f0,
+    );
+    tracing::info!(
+        candidates = candidates.len(),
+        "clipper: candidates generated"
+    );
 
     if candidates.is_empty() {
         anyhow::bail!("no candidate windows produced — episode may be too short or too quiet");
@@ -924,11 +990,17 @@ async fn run_clipper_inner(
     // (network blip, missing model cache), we proceed without the signal.
     match Embedder::from_config_with_tracker(cfg, Some(&cost_tracker)) {
         Ok(embedder) => {
-            tracing::info!(backend = embedder.backend_name(), "clipper: embedding novelty");
+            tracing::info!(
+                backend = embedder.backend_name(),
+                "clipper: embedding novelty"
+            );
             if let Err(e) = candidates::attach_novelty(&mut candidates, &embedder).await {
                 tracing::warn!(error = ?e, "novelty scoring failed; proceeding without it");
             } else {
-                let with_scores = candidates.iter().filter(|c| c.novelty_score.is_some()).count();
+                let with_scores = candidates
+                    .iter()
+                    .filter(|c| c.novelty_score.is_some())
+                    .count();
                 tracing::info!(
                     with_scores,
                     total = candidates.len(),
@@ -1034,7 +1106,12 @@ async fn run_clipper_inner(
         final_top_k
     };
     let ranked = ranker
-        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
+        .rank(
+            &candidates,
+            llm_top_k,
+            show_context.as_ref(),
+            trends_text.as_deref(),
+        )
         .await
         .context("LLM rank")?;
     tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
@@ -1092,7 +1169,12 @@ async fn run_clipper_inner(
                     tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
                     // re-fetch from ranker since we moved it; just re-do the call cheaply
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
+                        .rank(
+                            &candidates,
+                            llm_top_k,
+                            show_context.as_ref(),
+                            trends_text.as_deref(),
+                        )
                         .await
                         .context("LLM rank (refetch after VLM failure)")?
                 }
@@ -1122,7 +1204,12 @@ async fn run_clipper_inner(
                     tracing::warn!(error = ?e, "premium VLM re-rank failed; keeping standard order");
                     // Re-fetch needed since we moved ranked into the call.
                     ranker
-                        .rank(&candidates, llm_top_k, show_context.as_ref(), trends_text.as_deref())
+                        .rank(
+                            &candidates,
+                            llm_top_k,
+                            show_context.as_ref(),
+                            trends_text.as_deref(),
+                        )
                         .await
                         .context("LLM rank (refetch after premium VLM failure)")?
                 }
@@ -1243,8 +1330,7 @@ async fn run_clipper_inner(
                 spec.label
             );
             let out_path = clips_dir.join(&basename);
-            let ass_path =
-                clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
+            let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
             let profile = match per_show_lufs {
                 Some(lufs) => (spec.profile)().with_loudness(lufs),
@@ -1252,9 +1338,14 @@ async fn run_clipper_inner(
             };
             let style = (spec.style)();
 
-            if let Err(e) =
-                captions::write_ass(&ass_path, &clip_words, profile.width, profile.height, &style)
-                    .await
+            if let Err(e) = captions::write_ass(
+                &ass_path,
+                &clip_words,
+                profile.width,
+                profile.height,
+                &style,
+            )
+            .await
             {
                 tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
                 continue;
@@ -1263,7 +1354,8 @@ async fn run_clipper_inner(
             // Optional overlay hook .ass for the first ~1.5s. Only write if the
             // social-copy LLM produced a hook. The render filter chain takes both
             // (captions first, overlay second so it draws on top).
-            let overlay_ass_path = clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
+            let overlay_ass_path =
+                clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
             let mut overlay_written = false;
             if let Some(sc) = social {
                 let hook = sc.overlay_hook.trim();
@@ -1356,14 +1448,7 @@ async fn run_clipper_inner(
             match ai.thumbnail_windows(&clip_segments, 1).await {
                 Ok(moments) if !moments.is_empty() => {
                     let ts = moments[0].center_seconds;
-                    match media::screenshot_jpeg(
-                        &cfg.ffmpeg,
-                        &input_path,
-                        ts,
-                        &cover_path,
-                        0,
-                    )
-                    .await
+                    match media::screenshot_jpeg(&cfg.ffmpeg, &input_path, ts, &cover_path, 0).await
                     {
                         Ok(()) => {
                             tracing::info!(
@@ -1381,7 +1466,10 @@ async fn run_clipper_inner(
                     }
                 }
                 Ok(_) => {
-                    tracing::warn!(clip = idx, "thumbnail_windows returned no moments for cover");
+                    tracing::warn!(
+                        clip = idx,
+                        "thumbnail_windows returned no moments for cover"
+                    );
                     None
                 }
                 Err(e) => {
@@ -1514,7 +1602,13 @@ async fn run_clipper_inner(
         );
     }
 
-    let body = build_digest_body(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
+    let body = build_digest_body(
+        &file_name,
+        total_duration_secs,
+        &clips_dir,
+        &rendered,
+        &cost_snap,
+    );
 
     if digest_mode.writes_file() {
         let digest_path = clips_dir.join("digest.md");
@@ -1527,10 +1621,15 @@ async fn run_clipper_inner(
         // Structured manifest for the HTML viewer (rich UI loads this instead of
         // regex-parsing digest.md).
         let manifest_path = clips_dir.join("manifest.json");
-        let manifest =
-            build_manifest_json(&file_name, total_duration_secs, &clips_dir, &rendered, &cost_snap);
-        let manifest_text = serde_json::to_string_pretty(&manifest)
-            .unwrap_or_else(|_| "{}".to_string());
+        let manifest = build_manifest_json(
+            &file_name,
+            total_duration_secs,
+            &clips_dir,
+            &rendered,
+            &cost_snap,
+        );
+        let manifest_text =
+            serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string());
         if let Err(e) = tokio::fs::write(&manifest_path, manifest_text).await {
             tracing::warn!(error = ?e, "manifest.json write failed (non-fatal)");
         } else {
@@ -1713,9 +1812,7 @@ fn build_digest_body(
                         .clone()
                         .or_else(|| p.external_id.clone())
                         .unwrap_or_default(),
-                    PostStatus::Skipped | PostStatus::Failed => {
-                        p.error.clone().unwrap_or_default()
-                    }
+                    PostStatus::Skipped | PostStatus::Failed => p.error.clone().unwrap_or_default(),
                     PostStatus::DryRun => String::new(),
                 };
                 out.push_str(&format!("  [{tag}] {:<10} {detail}\n", p.platform));
@@ -1758,7 +1855,10 @@ fn append_social_copy(out: &mut String, s: &SocialCopy) {
         out.push_str(&indent_block("Caption", &s.tiktok.caption));
     }
     if !s.tiktok.hashtags.is_empty() {
-        out.push_str(&format!("  Hashtags:     {}\n", s.tiktok.hashtags.join(" ")));
+        out.push_str(&format!(
+            "  Hashtags:     {}\n",
+            s.tiktok.hashtags.join(" ")
+        ));
     }
 
     out.push_str("\n  ── Instagram Reels ─────────────\n");
@@ -1929,7 +2029,10 @@ fn indent_block(label: &str, body: &str) -> String {
     let mut first = true;
     for line in body.lines() {
         if first {
-            out.push_str(&format!("  {label}: {pad}{line}\n", pad = " ".repeat(13_usize.saturating_sub(label.len() + 2))));
+            out.push_str(&format!(
+                "  {label}: {pad}{line}\n",
+                pad = " ".repeat(13_usize.saturating_sub(label.len() + 2))
+            ));
             first = false;
         } else {
             out.push_str(&format!("  {pad}{line}\n", pad = " ".repeat(15)));
@@ -2009,7 +2112,10 @@ async fn build_trends_text(
                     .score
                     .map(|s| format!(" (score: {s:.0})"))
                     .unwrap_or_default();
-                lines.push(format!("- {label}{score_tag} [{source}]", source = t.source));
+                lines.push(format!(
+                    "- {label}{score_tag} [{source}]",
+                    source = t.source
+                ));
             }
         }
         Err(e) => {
@@ -2153,7 +2259,10 @@ mod tests {
         assert!(body.contains("01:00-02:00"));
         assert!(body.contains("score 90"));
         // File entries should appear under each clip's variants block.
-        assert!(body.contains("clip_01_9x16.mp4"), "expected variant filename, got:\n{body}");
+        assert!(
+            body.contains("clip_01_9x16.mp4"),
+            "expected variant filename, got:\n{body}"
+        );
         assert!(body.contains("[9x16]"));
         assert!(body.contains("Clips directory:"));
     }
@@ -2164,7 +2273,10 @@ mod tests {
         clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
         let dir = std::path::PathBuf::from("/tmp/clips");
         let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
-        assert!(body.contains("cover:"), "expected cover line in digest, got:\n{body}");
+        assert!(
+            body.contains("cover:"),
+            "expected cover line in digest, got:\n{body}"
+        );
         assert!(body.contains("clip_01_cover.jpg"));
     }
 
@@ -2173,7 +2285,10 @@ mod tests {
         let clip = dummy_clip(1, 85, 30.0, 90.0, "hook");
         let dir = std::path::PathBuf::from("/tmp/clips");
         let body = build_digest_body("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
-        assert!(!body.contains("cover:"), "unexpected cover line in digest:\n{body}");
+        assert!(
+            !body.contains("cover:"),
+            "unexpected cover line in digest:\n{body}"
+        );
     }
 
     #[test]
@@ -2183,7 +2298,10 @@ mod tests {
         let dir = std::path::PathBuf::from("/tmp/clips");
         let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
-        assert!(!clip_val["cover_frame"].is_null(), "cover_frame should be present");
+        assert!(
+            !clip_val["cover_frame"].is_null(),
+            "cover_frame should be present"
+        );
         assert_eq!(clip_val["cover_frame"]["filename"], "clip_01_cover.jpg");
     }
 
@@ -2202,7 +2320,10 @@ mod tests {
         let clips = vec![dummy_clip(1, 90, 60.0, 120.0, "hook")];
         let dir = std::path::PathBuf::from("/tmp/clips");
         let body = build_digest_body("ep.mp4", 600.0, &dir, &clips, &snap);
-        assert!(body.contains("Cost breakdown"), "digest should contain cost section");
+        assert!(
+            body.contains("Cost breakdown"),
+            "digest should contain cost section"
+        );
         assert!(body.contains("Chat/LLM"), "digest should list chat costs");
         assert!(body.contains("STT"), "digest should list STT costs");
         assert!(body.contains("TOTAL"), "digest should have total line");
@@ -2233,7 +2354,10 @@ mod tests {
         let dir = std::path::PathBuf::from("/tmp/clips");
         let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
-        assert!(clip_val["cover_frame"].is_null(), "cover_frame should be null when absent");
+        assert!(
+            clip_val["cover_frame"].is_null(),
+            "cover_frame should be null when absent"
+        );
     }
 
     #[test]
@@ -2245,7 +2369,7 @@ mod tests {
             ..Default::default()
         });
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
         assert_eq!(clip_val["overlay_hook"], "Wait for it");
         assert_eq!(clip_val["hook_source"], "llm");
@@ -2257,7 +2381,7 @@ mod tests {
     fn manifest_overlay_hook_empty_when_no_social() {
         let clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
         let dir = std::path::PathBuf::from("/tmp/clips");
-        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip]);
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
         let clip_val = &manifest["clips"][0];
         assert_eq!(clip_val["overlay_hook"], "");
         assert_eq!(clip_val["hook_source"], "");

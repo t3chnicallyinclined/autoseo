@@ -7,11 +7,10 @@
 //! - `R2_SECRET_ACCESS_KEY` — API token secret
 //! - `R2_BUCKET`          — bucket name (e.g. `autoseo-clips`)
 //! - `R2_PUBLIC_BASE_URL` — public read URL prefix that maps to the bucket;
-//!                          either `https://pub-<hash>.r2.dev` (R2's built-in
-//!                          public dev URL — already includes the bucket root)
-//!                          or `https://media.your-domain.com` (custom domain
-//!                          mounted at the bucket root). The returned object
-//!                          URL is `{R2_PUBLIC_BASE_URL}/{key}`.
+//!   either `https://pub-<hash>.r2.dev` (R2's built-in public dev URL —
+//!   already includes the bucket root) or `https://media.your-domain.com`
+//!   (custom domain mounted at the bucket root). The returned object URL
+//!   is `{R2_PUBLIC_BASE_URL}/{key}`.
 //!
 //! If any required var is unset, [`R2Uploader::from_env`] returns `Ok(None)`
 //! and the clipper falls back to local-disk storage.

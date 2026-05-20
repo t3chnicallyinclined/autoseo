@@ -73,7 +73,7 @@ fn load_manifest_for_clip(clip: &ClipDetail) -> Option<(Value, usize)> {
     let bytes = std::fs::read(&manifest_path).ok()?;
     let manifest: Value = serde_json::from_slice(&bytes).ok()?;
     let clips_arr = manifest.get("clips")?.as_array()?;
-    let rank = clip.rank? as i64;
+    let rank = clip.rank?;
     let idx = clips_arr
         .iter()
         .position(|c| c.get("rank").and_then(|v| v.as_i64()) == Some(rank))?;

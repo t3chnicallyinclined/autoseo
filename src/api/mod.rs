@@ -1,5 +1,7 @@
 mod clips;
 pub mod config_store;
+mod jobs;
+mod stubs;
 
 use axum::{
     Json, Router,
@@ -228,6 +230,50 @@ async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
                 },
             }
         }
+        "r2" => {
+            let endpoint = store.get_value("R2_ENDPOINT").await.unwrap_or_default();
+            let access = store
+                .get_value("R2_ACCESS_KEY_ID")
+                .await
+                .unwrap_or_default();
+            let secret = store
+                .get_value("R2_SECRET_ACCESS_KEY")
+                .await
+                .unwrap_or_default();
+            let bucket = store.get_value("R2_BUCKET").await.unwrap_or_default();
+            let public = store
+                .get_value("R2_PUBLIC_BASE_URL")
+                .await
+                .unwrap_or_default();
+            let region = store
+                .get_value("R2_REGION")
+                .await
+                .unwrap_or_else(|| "auto".to_string());
+            if endpoint.is_empty()
+                || access.is_empty()
+                || secret.is_empty()
+                || bucket.is_empty()
+                || public.is_empty()
+            {
+                return TestResult {
+                    service: service.to_string(),
+                    ok: false,
+                    message: "R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_BASE_URL all required".to_string(),
+                };
+            }
+            match test_r2(&endpoint, &access, &secret, &bucket, &region).await {
+                Ok(msg) => TestResult {
+                    service: service.to_string(),
+                    ok: true,
+                    message: msg,
+                },
+                Err(e) => TestResult {
+                    service: service.to_string(),
+                    ok: false,
+                    message: e.to_string(),
+                },
+            }
+        }
         _ => TestResult {
             service: service.to_string(),
             ok: false,
@@ -325,6 +371,36 @@ async fn test_bluesky(pds_url: &str, handle: &str, password: &str) -> anyhow::Re
     }
 }
 
+/// Test an R2 (S3-compatible) configuration by listing the bucket. Returns
+/// quickly without uploading any data.
+async fn test_r2(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    bucket: &str,
+    region: &str,
+) -> anyhow::Result<String> {
+    use aws_credential_types::Credentials;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::Region;
+
+    let creds = Credentials::new(access_key, secret_key, None, None, "autoseo-r2-test");
+    let cfg = aws_sdk_s3::config::Builder::new()
+        .endpoint_url(endpoint)
+        .region(Region::new(region.to_string()))
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .build();
+    let client = Client::from_conf(cfg);
+
+    // HeadBucket is the cheapest auth + bucket-exists check.
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(format!("Connected — bucket {bucket} reachable")),
+        Err(e) => anyhow::bail!("{}", e.into_service_error()),
+    }
+}
+
 async fn test_ayrshare(api_key: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     let resp = client
@@ -365,6 +441,7 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     let dashboard_dist = state.dashboard_dist.clone();
+    let work_dir = PathBuf::from(&state.work_dir);
 
     // API routes nested under /api — unknown /api/* paths still return 404
     let api_routes = Router::new()
@@ -372,12 +449,22 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         .route("/config", get(get_config).patch(patch_config))
         .route("/config/test/{service}", post(test_service))
         .merge(clips::router())
+        .merge(jobs::router())
+        .merge(stubs::router())
         // Unknown /api/* paths must return JSON 404, not fall through to the
         // SPA index.html fallback below.
         .fallback(api_not_found);
 
+    // Mount the clipper output dir as a static file tree at /media/clipper/*
+    // so the dashboard can stream rendered videos + cover JPGs by URL. The
+    // tower-http ServeDir layer takes care of Range support and refuses
+    // path-traversal (`..`) requests by default.
+    let media_serve =
+        ServeDir::new(work_dir.join("clipper")).append_index_html_on_directories(false);
+
     let app = Router::new()
         .nest("/api", api_routes)
+        .nest_service("/media/clipper", media_serve)
         .layer(cors)
         .with_state(Arc::new(state));
 

@@ -474,8 +474,14 @@ def fallback_html(clips_dir: Path) -> str:
 """
 
 
-class ReuseAddrServer(socketserver.TCPServer):
+class ReuseAddrServer(socketserver.ThreadingTCPServer):
+    """Threaded TCP server so video streams don't block the index page.
+
+    The default single-threaded TCPServer starves as soon as a browser opens
+    multiple <video> elements (each holds its own connection).
+    """
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def main() -> None:

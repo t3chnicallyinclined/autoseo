@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
 
@@ -39,7 +39,17 @@ jobs:
         run: cargo check
 
       - name: Clippy
+        # `-D warnings` plus per-lint allows for style/refactor suggestions
+        # the team has chosen not to act on. These mirror the documented
+        # decisions in PR #40 (too-many-args / range-loop / type-complexity /
+        # redundant-locals) and a new 1.88-only lint on doc list indentation
+        # that fires repo-wide on existing comment formatting.
         run: cargo clippy -- -D warnings
+          -A clippy::too_many_arguments
+          -A clippy::needless_range_loop
+          -A clippy::type_complexity
+          -A clippy::redundant_locals
+          -A clippy::doc_overindented_list_items
 
       - name: Run tests
         run: cargo test -- --skip ignored

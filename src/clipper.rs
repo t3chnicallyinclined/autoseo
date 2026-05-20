@@ -1305,6 +1305,22 @@ async fn run_clipper_inner(
         "clipper: render formats"
     );
 
+    // Construct the optional object-storage uploader once and reuse for
+    // every variant + cover frame. When R2_* envs are unset, uploader is None
+    // and renders stay on local disk.
+    let uploader: Option<crate::r2::R2Uploader> = match crate::r2::R2Uploader::from_env().await {
+        Ok(Some(u)) => {
+            tracing::info!(bucket = %u.bucket(), endpoint = %u.endpoint(), "object-storage uploader configured");
+            Some(u)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = ?e, "R2_* envs set but uploader init failed; renders will stay local");
+            None
+        }
+    };
+    let uploader = uploader.as_ref();
+
     let mut rendered: Vec<RenderedClip> = Vec::with_capacity(ranked.len());
     for (i, (clip, social)) in ranked.iter().zip(social_copies.iter()).enumerate() {
         let idx = i + 1;
@@ -1503,6 +1519,26 @@ async fn run_clipper_inner(
             for v in &r.variants {
                 let path_str = v.path.display().to_string();
                 let dur_ms = r.ranked.end_secs - r.ranked.start_secs;
+                // Optionally upload to object storage (R2 / S3-compatible).
+                // When `R2_*` envs are unset the uploader is `None` and we
+                // store only the local path; the `/media/clipper/*` proxy
+                // serves it. When configured, the URL replaces the proxy.
+                let url = if let Some(uploader) = uploader {
+                    let key = uploader.derive_key(&path_str);
+                    match uploader.upload_file(&v.path, &key, "video/mp4").await {
+                        Ok(u) => {
+                            tracing::info!(clip = r.rank, variant = %v.label, url = %u, "uploaded clip render to object storage");
+                            Some(u)
+                        }
+                        Err(e) => {
+                            tracing::warn!(clip = r.rank, variant = %v.label, error = ?e, "object-storage upload failed; falling back to local path");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 if let Err(e) = st
                     .insert_clip_render(
                         &clip_id,
@@ -1510,10 +1546,34 @@ async fn run_clipper_inner(
                         &path_str,
                         Some(v.bytes as i64),
                         Some((dur_ms * 1000.0) as i64),
+                        url.as_deref(),
                     )
                     .await
                 {
                     tracing::warn!(clip = r.rank, variant = %v.label, error = ?e, "failed to write clip_render to DB");
+                }
+            }
+
+            // Upload + persist the cover frame, if extraction succeeded.
+            if let Some(ref cover_path) = r.cover_frame_path {
+                let cover_str = cover_path.display().to_string();
+                let cover_url = if let Some(uploader) = uploader {
+                    let key = uploader.derive_key(&cover_str);
+                    match uploader.upload_file(cover_path, &key, "image/jpeg").await {
+                        Ok(u) => Some(u),
+                        Err(e) => {
+                            tracing::warn!(clip = r.rank, error = ?e, "cover upload failed; falling back to local path");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Err(e) = st
+                    .set_clip_cover(&clip_id, &cover_str, cover_url.as_deref())
+                    .await
+                {
+                    tracing::warn!(clip = r.rank, error = ?e, "failed to write clip cover to DB");
                 }
             }
         }

@@ -21,6 +21,7 @@ const SECRET_KEYS: &[&str] = &[
     "BLUESKY_APP_PASSWORD",
     "AYRSHARE_API_KEY",
     "VLM_PREMIUM_API_KEY",
+    "R2_SECRET_ACCESS_KEY",
 ];
 
 /// Thread-safe config store backed by a JSON file.

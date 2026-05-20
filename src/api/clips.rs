@@ -3,6 +3,7 @@
 //! Provides CRUD operations for clips, status transitions (approve/veto),
 //! posting to platforms, and bulk actions.
 
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -13,8 +14,10 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::AppState;
+use crate::storage::ClipDetail;
 
 #[derive(Deserialize)]
 pub struct ListClipsQuery {
@@ -49,13 +52,128 @@ fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(ErrorResponse { error: msg.into() }))
 }
 
+/// Convert an absolute file path under `{work_dir}/clipper/...` into a URL
+/// served by the `/media/clipper/*` static-file mount. Returns `None` if the
+/// path doesn't live under the work dir (defensive — DB shouldn't contain
+/// such rows but we don't trust them).
+fn media_url_from_path(work_dir: &str, abs_path: &str) -> Option<String> {
+    let work_clipper = StdPath::new(work_dir).join("clipper");
+    let p = StdPath::new(abs_path);
+    p.strip_prefix(&work_clipper)
+        .ok()
+        .map(|rel| format!("/media/clipper/{}", rel.to_string_lossy()))
+}
+
+/// Find and parse the manifest.json next to any rendered variant for a clip.
+/// Returns the entire manifest plus the index of this clip within it.
+fn load_manifest_for_clip(clip: &ClipDetail) -> Option<(Value, usize)> {
+    let render = clip.renders.first()?;
+    let render_path = PathBuf::from(&render.path);
+    let manifest_path = render_path.parent()?.join("manifest.json");
+    let bytes = std::fs::read(&manifest_path).ok()?;
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    let clips_arr = manifest.get("clips")?.as_array()?;
+    let rank = clip.rank?;
+    let idx = clips_arr
+        .iter()
+        .position(|c| c.get("rank").and_then(|v| v.as_i64()) == Some(rank))?;
+    Some((manifest, idx))
+}
+
+/// Enrich a single ClipDetail into a JSON object that includes manifest data
+/// the dashboard needs (variants with media URLs, cover thumbnail URL, social
+/// copy per platform, overlay hook). Falls back gracefully when manifest is
+/// missing — the dashboard still gets all the DB fields.
+fn enrich_clip(clip: &ClipDetail, work_dir: &str) -> Value {
+    // Variants from clip_renders rows. Prefer the DB-stored object-storage URL
+    // (set when R2_* envs are configured and upload succeeded); fall back to
+    // the local `/media/clipper/*` proxy path derived from the absolute path.
+    let variants: Vec<Value> = clip
+        .renders
+        .iter()
+        .map(|r| {
+            let url = r
+                .url
+                .clone()
+                .or_else(|| media_url_from_path(work_dir, &r.path));
+            serde_json::json!({
+                "variant": r.variant,
+                "path": r.path,
+                "url": url,
+                "bytes": r.bytes,
+                "duration_ms": r.duration_ms,
+            })
+        })
+        .collect();
+
+    // Prefer the DB-stored cover URL; fall back to deriving one from the
+    // stored local path. Manifest scan further down can also fill it.
+    let cover_url_initial = clip.cover_url.clone().or_else(|| {
+        clip.cover_path
+            .as_deref()
+            .and_then(|p| media_url_from_path(work_dir, p))
+    });
+
+    let mut extra = serde_json::json!({
+        "variants": variants,
+        "cover_url": cover_url_initial,
+        "social": Value::Null,
+        "overlay_hook": Value::Null,
+        "hook_source": Value::Null,
+    });
+
+    if let Some((manifest, idx)) = load_manifest_for_clip(clip) {
+        if let Some(m_clip) = manifest.get("clips").and_then(|c| c.get(idx)) {
+            // Only fill cover from the manifest if the DB didn't already provide one.
+            if extra["cover_url"].is_null() {
+                if let Some(cover) = m_clip.get("cover_frame") {
+                    if let Some(cover_abs) = cover.get("abs_path").and_then(|v| v.as_str()) {
+                        if let Some(url) = media_url_from_path(work_dir, cover_abs) {
+                            extra["cover_url"] = Value::String(url);
+                        }
+                    }
+                }
+            }
+            // Social copy + overlay hook (per-clip from manifest, not DB)
+            if let Some(social) = m_clip.get("social") {
+                extra["social"] = social.clone();
+            }
+            if let Some(overlay) = m_clip.get("overlay_hook") {
+                extra["overlay_hook"] = overlay.clone();
+            }
+            if let Some(src) = m_clip.get("hook_source") {
+                extra["hook_source"] = src.clone();
+            }
+        }
+    }
+
+    // Base clip JSON + merge extras
+    let mut base = serde_json::to_value(clip).unwrap_or_else(|_| serde_json::json!({}));
+    if let Value::Object(ref mut map) = base {
+        if let Value::Object(extra_map) = extra {
+            for (k, v) in extra_map {
+                map.insert(k, v);
+            }
+        }
+    }
+    base
+}
+
 /// GET /clips
 async fn list_clips(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListClipsQuery>,
 ) -> impl IntoResponse {
     match state.storage.list_clips(query.status.as_deref()).await {
-        Ok(clips) => (StatusCode::OK, Json(serde_json::json!({ "clips": clips }))).into_response(),
+        Ok(clips) => {
+            let work_dir = state.work_dir.clone();
+            let enriched: Vec<Value> = clips.iter().map(|c| enrich_clip(c, &work_dir)).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "clips": enriched })),
+            )
+                .into_response()
+        }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
@@ -67,7 +185,12 @@ async fn get_clip(
 ) -> impl IntoResponse {
     match state.storage.get_clip(&clip_id).await {
         Ok(Some(clip)) => {
-            (StatusCode::OK, Json(serde_json::json!({ "clip": clip }))).into_response()
+            let enriched = enrich_clip(&clip, &state.work_dir);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "clip": enriched })),
+            )
+                .into_response()
         }
         Ok(None) => err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),

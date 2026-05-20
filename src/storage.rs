@@ -75,6 +75,15 @@ pub struct JobRow {
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Path to the source video on the operator's filesystem (set when the
+    /// job was enqueued from the dashboard's New Job UI).
+    pub local_path: Option<String>,
+    /// Original URL the source was fetched from (Drive share link, direct
+    /// HTTPS) — for audit / re-download.
+    pub source_url: Option<String>,
+    /// Per-job JSON config overrides: clip_top_k, render_formats, mode_tag,
+    /// skip_ranges, etc. Parsed by the worker before running the pipeline.
+    pub config_json: Option<String>,
 }
 
 /// A row from the `trends` table.
@@ -187,6 +196,8 @@ pub struct ClipDetail {
     pub score: Option<f64>,
     pub hook: Option<String>,
     pub reasoning_json: Option<String>,
+    pub cover_path: Option<String>,
+    pub cover_url: Option<String>,
     pub trend_match: Option<String>,
     pub status: String,
     pub social_copy_json: Option<String>,
@@ -202,6 +213,10 @@ pub struct ClipRenderRow {
     pub path: String,
     pub bytes: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// Public URL when the render has been uploaded to object storage
+    /// (R2 / S3-compatible). `None` means the file lives only on local disk
+    /// at `path` and must be served via the `/media/clipper/*` proxy.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -258,8 +273,14 @@ impl Storage {
         }
     }
 
-    /// Expose the raw connection for cross-module tests that need to insert
-    /// seed data directly. NOT for production use.
+    /// Expose the raw connection for cross-module access (used by the
+    /// dashboard stub endpoints to run ad-hoc queries that don't have a
+    /// dedicated typed method yet).
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
+    /// Alias preserved for older test code that used the explicit name.
     #[cfg(test)]
     pub fn conn_for_test(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
@@ -439,6 +460,123 @@ impl Storage {
         Ok(())
     }
 
+    /// Enqueue a new job from the dashboard, recording its source (local
+    /// file path and/or URL) and any per-job overrides as JSON. Inserts with
+    /// status='pending' so the background worker picks it up.
+    pub async fn enqueue_job(
+        &self,
+        job_id: &str,
+        show_slug: Option<&str>,
+        media_name: Option<&str>,
+        local_path: Option<&str>,
+        source_url: Option<&str>,
+        config_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let show_slug = show_slug.map(str::to_string);
+        let media_name = media_name.map(str::to_string);
+        let local_path = local_path.map(str::to_string);
+        let source_url = source_url.map(str::to_string);
+        let config_json = config_json.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO jobs \
+                 (id, show_slug, media_name, drive_file_id, status, retry_count, \
+                  created_at, updated_at, local_path, source_url, config_json) \
+                 VALUES (?1, ?2, ?3, NULL, 'pending', 0, ?4, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    job_id,
+                    show_slug,
+                    media_name,
+                    now,
+                    local_path,
+                    source_url,
+                    config_json
+                ],
+            )
+            .context("enqueue_job insert")?;
+            Ok(())
+        })
+        .await
+        .context("join enqueue_job")??;
+        Ok(())
+    }
+
+    /// Update `local_path` on a job — used by the worker after downloading a
+    /// URL-only source so the path is recorded for retries / debugging.
+    pub async fn update_job_local_path(
+        &self,
+        job_id: &str,
+        local_path: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let local_path = local_path.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE jobs SET local_path = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![local_path, unix_now(), job_id],
+            )
+            .context("update_job_local_path")?;
+            Ok(())
+        })
+        .await
+        .context("join update_job_local_path")??;
+        Ok(())
+    }
+
+    /// Atomically claim the oldest pending job and mark it as running.
+    /// Returns `None` when no job is pending. Designed for a single worker;
+    /// runs the SELECT + UPDATE inside the same blocking section so two
+    /// concurrent callers can't pick the same job.
+    pub async fn claim_next_pending_job(&self) -> anyhow::Result<Option<JobRow>> {
+        let conn = self.conn.clone();
+        let row = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<JobRow>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, show_slug, media_name, drive_file_id, status, \
+                 retry_count, cost_cents, error, created_at, updated_at, \
+                 local_path, source_url, config_json \
+                 FROM jobs WHERE status = 'pending' \
+                 ORDER BY created_at ASC LIMIT 1",
+            )?;
+            let row: Option<JobRow> = stmt
+                .query_row([], |r| {
+                    Ok(JobRow {
+                        id: r.get(0)?,
+                        show_slug: r.get(1)?,
+                        media_name: r.get(2)?,
+                        drive_file_id: r.get(3)?,
+                        status: JobStatus::from_str(&r.get::<_, String>(4)?)
+                            .unwrap_or(JobStatus::Pending),
+                        retry_count: r.get(5)?,
+                        cost_cents: r.get(6)?,
+                        error: r.get(7)?,
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
+                        local_path: r.get(10)?,
+                        source_url: r.get(11)?,
+                        config_json: r.get(12)?,
+                    })
+                })
+                .optional()?;
+            if let Some(ref r) = row {
+                conn.execute(
+                    "UPDATE jobs SET status = 'transcribed', updated_at = ?1 WHERE id = ?2 AND status = 'pending'",
+                    rusqlite::params![unix_now(), &r.id],
+                )?;
+            }
+            Ok(row)
+        })
+        .await
+        .context("join claim_next_pending_job")??;
+        Ok(row)
+    }
+
     /// Transition a job to a new status, updating `updated_at`. On failure status,
     /// also stores the error message.
     pub async fn update_job_status(
@@ -475,7 +613,8 @@ impl Storage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, show_slug, media_name, drive_file_id, status, \
-                     retry_count, cost_cents, error, created_at, updated_at \
+                     retry_count, cost_cents, error, created_at, updated_at, \
+                     local_path, source_url, config_json \
                      FROM jobs WHERE id = ?1",
                 )
                 .context("prepare get_job")?;
@@ -493,6 +632,9 @@ impl Storage {
                         error: r.get(7)?,
                         created_at: r.get(8)?,
                         updated_at: r.get(9)?,
+                        local_path: r.get(10)?,
+                        source_url: r.get(11)?,
+                        config_json: r.get(12)?,
                     })
                 })
                 .optional()
@@ -531,7 +673,8 @@ impl Storage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, show_slug, media_name, drive_file_id, status, \
-                     retry_count, cost_cents, error, created_at, updated_at \
+                     retry_count, cost_cents, error, created_at, updated_at, \
+                     local_path, source_url, config_json \
                      FROM jobs WHERE status = 'failed' ORDER BY updated_at DESC",
                 )
                 .context("prepare get_failed_jobs")?;
@@ -548,6 +691,9 @@ impl Storage {
                         error: r.get(7)?,
                         created_at: r.get(8)?,
                         updated_at: r.get(9)?,
+                        local_path: r.get(10)?,
+                        source_url: r.get(11)?,
+                        config_json: r.get(12)?,
                     })
                 })
                 .context("query get_failed_jobs")?
@@ -639,24 +785,51 @@ impl Storage {
         path: &str,
         bytes: Option<i64>,
         duration_ms: Option<i64>,
+        url: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let clip_id = clip_id.to_string();
         let variant = variant.to_string();
         let path = path.to_string();
+        let url = url.map(str::to_string);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.blocking_lock();
             conn.execute(
                 "INSERT OR REPLACE INTO clip_renders \
-                 (clip_id, variant, path, bytes, duration_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![clip_id, variant, path, bytes, duration_ms],
+                 (clip_id, variant, path, bytes, duration_ms, url) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![clip_id, variant, path, bytes, duration_ms, url],
             )
             .context("insert_clip_render")?;
             Ok(())
         })
         .await
         .context("join insert_clip_render")??;
+        Ok(())
+    }
+
+    /// Persist a clip's cover frame path + optional remote URL.
+    pub async fn set_clip_cover(
+        &self,
+        clip_id: &str,
+        local_path: &str,
+        url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        let local_path = local_path.to_string();
+        let url = url.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE clips SET cover_path = ?1, cover_url = ?2 WHERE id = ?3",
+                rusqlite::params![local_path, url, clip_id],
+            )
+            .context("set_clip_cover")?;
+            Ok(())
+        })
+        .await
+        .context("join set_clip_cover")??;
         Ok(())
     }
 
@@ -714,75 +887,60 @@ impl Storage {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ClipDetail>> {
             let conn = conn.blocking_lock();
 
+            // Helper to keep the row-mapping closure single-source.
+            const COLS: &str = "c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
+                 c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
+                 c.cover_path, c.cover_url, \
+                 j.show_slug, j.media_name, j.status as job_status";
+
             let clip_sql = if status_filter.is_some() {
-                "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
-                 c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
-                 j.show_slug, j.media_name, j.status as job_status \
-                 FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
-                 WHERE c.status = ?1 ORDER BY c.rank ASC NULLS LAST"
+                format!(
+                    "SELECT {COLS} FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
+                     WHERE c.status = ?1 ORDER BY c.rank ASC NULLS LAST"
+                )
             } else {
-                "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
-                 c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
-                 j.show_slug, j.media_name, j.status as job_status \
-                 FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
-                 ORDER BY c.rank ASC NULLS LAST"
+                format!(
+                    "SELECT {COLS} FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
+                     ORDER BY c.rank ASC NULLS LAST"
+                )
             };
 
-            let mut stmt = conn.prepare(clip_sql).context("prepare list_clips")?;
+            let mut stmt = conn.prepare(&clip_sql).context("prepare list_clips")?;
+            let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<ClipDetail> {
+                Ok(ClipDetail {
+                    id: r.get(0)?,
+                    job_id: r.get(1)?,
+                    start_ms: r.get(2)?,
+                    end_ms: r.get(3)?,
+                    rank: r.get(4)?,
+                    score: r.get(5)?,
+                    hook: r.get(6)?,
+                    reasoning_json: r.get(7)?,
+                    trend_match: r.get(8)?,
+                    status: r.get(9)?,
+                    social_copy_json: r.get(10)?,
+                    cover_path: r.get(11)?,
+                    cover_url: r.get(12)?,
+                    renders: Vec::new(),
+                    posts: Vec::new(),
+                    job: Some(JobSummary {
+                        id: r.get::<_, String>(1)?,
+                        show_slug: r.get(13)?,
+                        media_name: r.get(14)?,
+                        status: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                    }),
+                })
+            };
             let rows: Vec<ClipDetail> = if let Some(ref sf) = status_filter {
-                stmt.query_map([sf], |r| {
-                    Ok(ClipDetail {
-                        id: r.get(0)?,
-                        job_id: r.get(1)?,
-                        start_ms: r.get(2)?,
-                        end_ms: r.get(3)?,
-                        rank: r.get(4)?,
-                        score: r.get(5)?,
-                        hook: r.get(6)?,
-                        reasoning_json: r.get(7)?,
-                        trend_match: r.get(8)?,
-                        status: r.get(9)?,
-                        social_copy_json: r.get(10)?,
-                        renders: Vec::new(),
-                        posts: Vec::new(),
-                        job: Some(JobSummary {
-                            id: r.get::<_, String>(1)?,
-                            show_slug: r.get(11)?,
-                            media_name: r.get(12)?,
-                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                        }),
-                    })
-                })
-                .context("query list_clips")?
-                .collect::<Result<Vec<_>, _>>()
-                .context("collect list_clips")?
+                stmt.query_map([sf], map_row)
+                    .context("query list_clips")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("collect list_clips")?
             } else {
-                stmt.query_map([], |r| {
-                    Ok(ClipDetail {
-                        id: r.get(0)?,
-                        job_id: r.get(1)?,
-                        start_ms: r.get(2)?,
-                        end_ms: r.get(3)?,
-                        rank: r.get(4)?,
-                        score: r.get(5)?,
-                        hook: r.get(6)?,
-                        reasoning_json: r.get(7)?,
-                        trend_match: r.get(8)?,
-                        status: r.get(9)?,
-                        social_copy_json: r.get(10)?,
-                        renders: Vec::new(),
-                        posts: Vec::new(),
-                        job: Some(JobSummary {
-                            id: r.get::<_, String>(1)?,
-                            show_slug: r.get(11)?,
-                            media_name: r.get(12)?,
-                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                        }),
-                    })
-                })
-                .context("query list_clips")?
-                .collect::<Result<Vec<_>, _>>()
-                .context("collect list_clips")?
+                stmt.query_map([], map_row)
+                    .context("query list_clips")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("collect list_clips")?
             };
 
             // Fetch renders and posts for all clips
@@ -790,7 +948,7 @@ impl Storage {
             for clip in &mut result {
                 let mut render_stmt = conn
                     .prepare(
-                        "SELECT clip_id, variant, path, bytes, duration_ms \
+                        "SELECT clip_id, variant, path, bytes, duration_ms, url \
                          FROM clip_renders WHERE clip_id = ?1",
                     )
                     .context("prepare renders")?;
@@ -802,6 +960,7 @@ impl Storage {
                             path: r.get(2)?,
                             bytes: r.get(3)?,
                             duration_ms: r.get(4)?,
+                            url: r.get(5)?,
                         })
                     })
                     .context("query renders")?
@@ -846,6 +1005,7 @@ impl Storage {
                 .prepare(
                     "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
                      c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
+                     c.cover_path, c.cover_url, \
                      j.show_slug, j.media_name, j.status as job_status \
                      FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
                      WHERE c.id = ?1",
@@ -865,13 +1025,15 @@ impl Storage {
                         trend_match: r.get(8)?,
                         status: r.get(9)?,
                         social_copy_json: r.get(10)?,
+                        cover_path: r.get(11)?,
+                        cover_url: r.get(12)?,
                         renders: Vec::new(),
                         posts: Vec::new(),
                         job: Some(JobSummary {
                             id: r.get::<_, String>(1)?,
-                            show_slug: r.get(11)?,
-                            media_name: r.get(12)?,
-                            status: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                            show_slug: r.get(13)?,
+                            media_name: r.get(14)?,
+                            status: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
                         }),
                     })
                 })
@@ -884,7 +1046,7 @@ impl Storage {
 
             // Fetch renders
             let mut render_stmt = conn
-                .prepare("SELECT clip_id, variant, path, bytes, duration_ms FROM clip_renders WHERE clip_id = ?1")
+                .prepare("SELECT clip_id, variant, path, bytes, duration_ms, url FROM clip_renders WHERE clip_id = ?1")
                 .context("prepare clip renders")?;
             clip.renders = render_stmt
                 .query_map([&clip.id], |r| {
@@ -894,6 +1056,7 @@ impl Storage {
                         path: r.get(2)?,
                         bytes: r.get(3)?,
                         duration_ms: r.get(4)?,
+                        url: r.get(5)?,
                     })
                 })
                 .context("query clip renders")?
@@ -1238,6 +1401,23 @@ ALTER TABLE analytics ADD COLUMN reposts INTEGER;
 ALTER TABLE analytics ADD COLUMN replies INTEGER;
 "#;
 
+/// V6 adds object-storage URL columns so renders + covers can live on R2
+/// (or any S3-compatible bucket) instead of the operator's local disk.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE clip_renders ADD COLUMN url TEXT;
+ALTER TABLE clips ADD COLUMN cover_path TEXT;
+ALTER TABLE clips ADD COLUMN cover_url TEXT;
+"#;
+
+/// V7 extends `jobs` with the inputs needed to drive the pipeline from the
+/// dashboard's New Job UI: a local file path (uploaded mp4) or a source URL
+/// (Drive / direct HTTPS) plus a per-job config-overrides JSON blob.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE jobs ADD COLUMN local_path TEXT;
+ALTER TABLE jobs ADD COLUMN source_url TEXT;
+ALTER TABLE jobs ADD COLUMN config_json TEXT;
+"#;
+
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1269,6 +1449,16 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA_V5).context("apply schema v5")?;
         conn.pragma_update(None, "user_version", 5)
             .context("set user_version=5")?;
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6).context("apply schema v6")?;
+        conn.pragma_update(None, "user_version", 6)
+            .context("set user_version=6")?;
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7).context("apply schema v7")?;
+        conn.pragma_update(None, "user_version", 7)
+            .context("set user_version=7")?;
     }
     Ok(())
 }
@@ -1506,7 +1696,14 @@ mod tests {
 
         // Insert a render variant.
         storage
-            .insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000))
+            .insert_clip_render(
+                "c1",
+                "9x16",
+                "/tmp/clip.mp4",
+                Some(2500000),
+                Some(20000),
+                None,
+            )
             .await?;
 
         // Insert a post.
@@ -1537,7 +1734,14 @@ mod tests {
             )
             .await?;
         storage
-            .insert_clip_render("c1", "9x16", "/tmp/clip.mp4", Some(2500000), Some(20000))
+            .insert_clip_render(
+                "c1",
+                "9x16",
+                "/tmp/clip.mp4",
+                Some(2500000),
+                Some(20000),
+                None,
+            )
             .await?;
         storage
             .insert_post(

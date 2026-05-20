@@ -28,6 +28,7 @@ mod performance_history;
 mod platforms;
 mod posting;
 mod prosody;
+mod r2;
 mod ranker;
 mod rate_limit;
 mod render;
@@ -41,6 +42,7 @@ mod vad;
 mod vlm_ranker;
 #[cfg(feature = "local-stt")]
 mod whisper_local;
+mod worker;
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -61,11 +63,57 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{JobStatus, Storage};
 use tracing_subscriber::EnvFilter;
 
+/// Load `{WORK_DIR}/config.json` (written by the dashboard's `/api/config`
+/// PATCH handler) into the process environment. Only keys with non-empty
+/// string values are imported, and an existing env var always wins so an
+/// explicit `R2_BUCKET=…` in front of `cargo run` overrides the JSON file.
+fn load_config_json_into_env() -> anyhow::Result<()> {
+    let work_dir = std::env::var("WORK_DIR").unwrap_or_else(|_| "./work".to_string());
+    let path = std::path::PathBuf::from(&work_dir).join("config.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&path)?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let obj = json
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("config.json is not an object"))?;
+    let mut imported = 0;
+    for (k, v) in obj {
+        let s = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        if s.is_empty() {
+            continue;
+        }
+        if std::env::var_os(k).is_some() {
+            continue; // env wins
+        }
+        unsafe {
+            std::env::set_var(k, &s);
+        }
+        imported += 1;
+    }
+    tracing::info!(path = %path.display(), imported, "imported config.json values into env");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Ensure we always get useful logs in Docker (even if RUST_LOG is unset/invalid).
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // Load `{WORK_DIR}/config.json` (if present) into the process environment
+    // so values set via the dashboard Setup Wizard / Settings page become
+    // visible to every module that reads `std::env::var(...)`. Existing env
+    // vars win — config.json only fills in what's missing.
+    if let Err(e) = load_config_json_into_env() {
+        tracing::debug!(error = ?e, "skipped config.json env load");
+    }
 
     let cfg = Config::parse();
 
@@ -99,6 +147,16 @@ async fn main() -> anyhow::Result<()> {
         let config_path = std::path::PathBuf::from(&cfg.work_dir).join("config.json");
         let config_store =
             std::sync::Arc::new(api::config_store::ConfigStore::load(config_path).await?);
+
+        // Spawn the background worker that picks up `pending` jobs created by
+        // the dashboard's New Job dialog and runs them through the clipper.
+        // Single-job-at-a-time on purpose — see worker.rs.
+        {
+            let cfg = cfg.clone();
+            let storage = storage.clone();
+            tokio::spawn(async move { worker::run(cfg, storage).await });
+        }
+
         let state = api::AppState {
             storage,
             work_dir: cfg.work_dir.clone(),

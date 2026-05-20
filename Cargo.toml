@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["tokio"] }
+axum = { version = "0.8", features = ["tokio", "multipart"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -31,6 +31,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = "0.26"
 url = "2"
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = "1"
 whisper-rs = { version = "0.13", optional = true }
 indicatif = "0.17"
 ndarray = "0.16"

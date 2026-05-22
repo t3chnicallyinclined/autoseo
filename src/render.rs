@@ -25,7 +25,7 @@ pub enum AspectRatio {
     Landscape16x9,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RenderProfile {
     pub aspect: AspectRatio,
     pub width: u32,
@@ -34,9 +34,24 @@ pub struct RenderProfile {
     /// -14 for YouTube/LinkedIn, -16 for TikTok/IG/Reels.
     pub loudnorm_target_lufs: f64,
     /// Video CRF for libx264. Lower = higher quality (and larger file).
-    /// 23 is the sane default; 18 is visually lossless for most material.
+    /// 18 is the default — visually lossless for most material, treats
+    /// these clips as **masters** that platforms will re-encode further.
+    /// Bump to 23 for "balanced" or 26 for fast preview drafts.
     pub crf: u32,
+    /// libx264 preset. `slow` is the master-grade default — ~1.5× the
+    /// encode time of `medium` for a notable improvement in compression
+    /// efficiency at the same CRF. Use `medium` for the old behavior, or
+    /// `slower`/`veryslow` for the absolute best quality at given CRF.
+    pub preset: String,
+    /// AAC audio bitrate in kbps. 192 is the master-grade default; clips
+    /// are short so the extra bits cost negligible space. Drop to 128 for
+    /// "balanced". Setting 256 buys little for podcast/voice content.
+    pub audio_bitrate_kbps: u32,
 }
+
+const DEFAULT_PRESET: &str = "slow";
+const DEFAULT_CRF: u32 = 18;
+const DEFAULT_AUDIO_KBPS: u32 = 192;
 
 impl RenderProfile {
     pub fn shorts_vertical() -> Self {
@@ -45,7 +60,9 @@ impl RenderProfile {
             width: 1080,
             height: 1920,
             loudnorm_target_lufs: -14.0,
-            crf: 23,
+            crf: DEFAULT_CRF,
+            preset: DEFAULT_PRESET.to_string(),
+            audio_bitrate_kbps: DEFAULT_AUDIO_KBPS,
         }
     }
 
@@ -55,7 +72,9 @@ impl RenderProfile {
             width: 1080,
             height: 1920,
             loudnorm_target_lufs: -16.0,
-            crf: 23,
+            crf: DEFAULT_CRF,
+            preset: DEFAULT_PRESET.to_string(),
+            audio_bitrate_kbps: DEFAULT_AUDIO_KBPS,
         }
     }
 
@@ -69,7 +88,9 @@ impl RenderProfile {
             width: 1080,
             height: 1080,
             loudnorm_target_lufs: -14.0,
-            crf: 23,
+            crf: DEFAULT_CRF,
+            preset: DEFAULT_PRESET.to_string(),
+            audio_bitrate_kbps: DEFAULT_AUDIO_KBPS,
         }
     }
 
@@ -79,13 +100,25 @@ impl RenderProfile {
             width: 1920,
             height: 1080,
             loudnorm_target_lufs: -16.0,
-            crf: 23,
+            crf: DEFAULT_CRF,
+            preset: DEFAULT_PRESET.to_string(),
+            audio_bitrate_kbps: DEFAULT_AUDIO_KBPS,
         }
     }
 
     /// Return a copy of this profile with the loudness target overridden.
     pub fn with_loudness(mut self, lufs: f64) -> Self {
         self.loudnorm_target_lufs = lufs;
+        self
+    }
+
+    /// Apply the per-job/global quality knobs read from [`crate::config::Config`].
+    /// Used to bend the master defaults toward "balanced" or "fast preview"
+    /// without re-implementing the per-aspect profile factories.
+    pub fn with_quality(mut self, crf: u32, preset: &str, audio_kbps: u32) -> Self {
+        self.crf = crf;
+        self.preset = preset.to_string();
+        self.audio_bitrate_kbps = audio_kbps;
         self
     }
 }
@@ -188,18 +221,19 @@ pub async fn render_clip_with_audio(
             .args(["-t", &format!("{duration:.3}")]);
     }
 
+    let audio_bitrate = format!("{}k", profile.audio_bitrate_kbps);
     cmd.args(["-vf", &vf])
         .args(["-af", &af])
         .args([
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            profile.preset.as_str(),
             "-crf",
             &profile.crf.to_string(),
         ])
         .args(["-pix_fmt", "yuv420p"])
-        .args(["-c:a", "aac", "-b:a", "128k"])
+        .args(["-c:a", "aac", "-b:a", &audio_bitrate])
         .args(["-movflags", "+faststart"])
         .arg(output);
 
@@ -522,7 +556,19 @@ mod tests {
         // Other fields should be unchanged.
         assert_eq!(p.width, 1080);
         assert_eq!(p.height, 1920);
-        assert_eq!(p.crf, 23);
+        assert_eq!(p.crf, DEFAULT_CRF);
+        assert_eq!(p.preset, DEFAULT_PRESET);
+        assert_eq!(p.audio_bitrate_kbps, DEFAULT_AUDIO_KBPS);
+    }
+
+    #[test]
+    fn with_quality_overrides_encode_knobs() {
+        let p = RenderProfile::shorts_vertical().with_quality(20, "medium", 128);
+        assert_eq!(p.crf, 20);
+        assert_eq!(p.preset, "medium");
+        assert_eq!(p.audio_bitrate_kbps, 128);
+        // Loudness should still be untouched by quality overrides.
+        assert!((p.loudnorm_target_lufs - -14.0).abs() < 0.01);
     }
 
     #[test]

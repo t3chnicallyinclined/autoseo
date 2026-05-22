@@ -31,16 +31,82 @@ pub struct PatchClipBody {
     pub social_copy_json: Option<String>,
 }
 
+/// A single posting target. `account_id` is required for browser-backed
+/// platforms that have multiple connected accounts; absent for API-backed
+/// platforms (YouTube/Bluesky/IG-Graph/Ayrshare) which are single-account.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct TargetSpec {
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+impl TargetSpec {
+    /// Storage encoding: API-backed → `"youtube"`; browser-backed with account
+    /// → `"x:tris_main"`. The posts table primary-keys on (clip_id, platform)
+    /// so the encoding gives multi-account rows distinct keys without a
+    /// schema migration.
+    pub fn encoded_platform(&self) -> String {
+        match self.account_id.as_deref() {
+            Some(a) if !a.is_empty() => format!("{}:{a}", self.platform),
+            _ => self.platform.clone(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PostClipBody {
+    /// Legacy single-account form: list of platform names. Each becomes a
+    /// `TargetSpec` with `account_id=None`. Use `targets` for the modern form.
+    #[serde(default)]
     pub platforms: Vec<String>,
+    /// Account-aware target list. Takes precedence over `platforms` when present.
+    #[serde(default)]
+    pub targets: Vec<TargetSpec>,
+}
+
+impl PostClipBody {
+    pub fn resolved_targets(&self) -> Vec<TargetSpec> {
+        if !self.targets.is_empty() {
+            return self.targets.clone();
+        }
+        self.platforms
+            .iter()
+            .map(|p| TargetSpec {
+                platform: p.clone(),
+                account_id: None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
 pub struct BulkActionBody {
     pub clip_ids: Vec<String>,
     pub action: String, // "approve" | "veto" | "post"
+    #[serde(default)]
     pub platforms: Option<Vec<String>>,
+    #[serde(default)]
+    pub targets: Option<Vec<TargetSpec>>,
+}
+
+impl BulkActionBody {
+    pub fn resolved_targets(&self) -> Vec<TargetSpec> {
+        if let Some(t) = &self.targets {
+            return t.clone();
+        }
+        self.platforms
+            .as_ref()
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| TargetSpec {
+                        platform: p.clone(),
+                        account_id: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Serialize)]
@@ -120,6 +186,7 @@ fn enrich_clip(clip: &ClipDetail, work_dir: &str) -> Value {
         "social": Value::Null,
         "overlay_hook": Value::Null,
         "hook_source": Value::Null,
+        "scores": Value::Null,
     });
 
     if let Some((manifest, idx)) = load_manifest_for_clip(clip) {
@@ -143,6 +210,12 @@ fn enrich_clip(clip: &ClipDetail, work_dir: &str) -> Value {
             }
             if let Some(src) = m_clip.get("hook_source") {
                 extra["hook_source"] = src.clone();
+            }
+            // A/B score lineage (blended / llm / vlm / vlm_premium) per
+            // manifest v3. DB only persists the blended score; the dashboard
+            // needs the lane-level scores to surface why a clip was ranked.
+            if let Some(scores) = m_clip.get("scores") {
+                extra["scores"] = scores.clone();
             }
         }
     }
@@ -283,23 +356,29 @@ async fn post_clip(
     Path(clip_id): Path<String>,
     Json(body): Json<PostClipBody>,
 ) -> impl IntoResponse {
-    if body.platforms.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "platforms list cannot be empty").into_response();
+    let targets = body.resolved_targets();
+    if targets.is_empty() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "must specify either `platforms` or `targets`",
+        )
+        .into_response();
     }
 
-    // Update clip status to posted
     if let Err(e) = state.storage.update_clip_status(&clip_id, "posted").await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
     }
 
-    // Record pending post entries for each requested platform
-    for platform in &body.platforms {
+    // Record a pending row per target. Encoded platform = `"x:tris_main"` for
+    // browser-backed multi-account, plain `"youtube"` for API-backed.
+    for target in &targets {
+        let encoded = target.encoded_platform();
         if let Err(e) = state
             .storage
-            .insert_post(&clip_id, platform, "pending", None, None, None, None)
+            .insert_post(&clip_id, &encoded, "pending", None, None, None, None)
             .await
         {
-            tracing::warn!(clip_id, platform, error = %e, "failed to insert pending post");
+            tracing::warn!(clip_id, platform = encoded, error = %e, "failed to insert pending post");
         }
     }
 
@@ -337,14 +416,17 @@ async fn bulk_action(
         .await
     {
         Ok(count) => {
-            // If posting, also insert pending post rows
+            // If posting, also insert pending post rows. Honors the modern
+            // `targets` field; falls back to legacy `platforms` for compat.
             if body.action == "post" {
-                if let Some(ref platforms) = body.platforms {
+                let targets = body.resolved_targets();
+                if !targets.is_empty() {
                     for clip_id in &body.clip_ids {
-                        for platform in platforms {
+                        for target in &targets {
+                            let encoded = target.encoded_platform();
                             state
                                 .storage
-                                .insert_post(clip_id, platform, "pending", None, None, None, None)
+                                .insert_post(clip_id, &encoded, "pending", None, None, None, None)
                                 .await
                                 .ok();
                         }

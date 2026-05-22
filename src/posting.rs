@@ -50,23 +50,32 @@ pub async fn post_one_clip(
     for platform in platforms {
         let name = platform.name();
         let r = platform.post_clip(video, social, dry_run).await;
+        let acct = r.account_id.as_deref().unwrap_or("");
         match r.status {
             PostStatus::Posted => tracing::info!(
                 clip = rank,
                 platform = name,
+                account = acct,
                 url = r.external_url.as_deref().unwrap_or(""),
                 "posted"
             ),
-            PostStatus::DryRun => tracing::info!(clip = rank, platform = name, "dry-run"),
+            PostStatus::DryRun => tracing::info!(
+                clip = rank,
+                platform = name,
+                account = acct,
+                "dry-run"
+            ),
             PostStatus::Skipped => tracing::info!(
                 clip = rank,
                 platform = name,
+                account = acct,
                 reason = r.error.as_deref().unwrap_or(""),
                 "skipped"
             ),
             PostStatus::Failed => tracing::warn!(
                 clip = rank,
                 platform = name,
+                account = acct,
                 error = r.error.as_deref().unwrap_or(""),
                 "failed"
             ),

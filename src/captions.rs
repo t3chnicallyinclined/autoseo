@@ -77,6 +77,8 @@ impl CaptionOverrides {
     /// - `CAPTION_FONT_NAME`
     /// - `CAPTION_HIGHLIGHT_BGR` / `CAPTION_PRIMARY_BGR` / `CAPTION_OUTLINE_BGR` (hex)
     /// - `CAPTION_DISABLE_KARAOKE` (`true`/`false`)
+    /// - `CAPTION_FONT_SIZE_VERTICAL` / `_SQUARE` / `_LANDSCAPE` (pt, 0 = leave default)
+    /// - `CAPTION_OVERLAY_FONT_SIZE_VERTICAL` / `_SQUARE` / `_LANDSCAPE` (pt, 0 = leave default)
     pub fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("CAPTION_FONT_NAME") {
             if !v.trim().is_empty() {
@@ -105,6 +107,21 @@ impl CaptionOverrides {
                 _ => {}
             }
         }
+        apply_size_env(
+            &mut self.vertical,
+            "CAPTION_FONT_SIZE_VERTICAL",
+            "CAPTION_OVERLAY_FONT_SIZE_VERTICAL",
+        );
+        apply_size_env(
+            &mut self.square,
+            "CAPTION_FONT_SIZE_SQUARE",
+            "CAPTION_OVERLAY_FONT_SIZE_SQUARE",
+        );
+        apply_size_env(
+            &mut self.landscape,
+            "CAPTION_FONT_SIZE_LANDSCAPE",
+            "CAPTION_OVERLAY_FONT_SIZE_LANDSCAPE",
+        );
     }
 
     /// Load `${shows_dir}/{show_slug}/captions.json` if present and merge into
@@ -188,6 +205,24 @@ fn merge_per_aspect(base: &mut Option<PerAspectOverride>, incoming: Option<PerAs
     }
     if inc.overlay_font_size_pt.is_some() {
         target.overlay_font_size_pt = inc.overlay_font_size_pt;
+    }
+}
+
+/// Apply per-aspect font-size env knobs onto a `PerAspectOverride`. A value
+/// of 0 (or unparsable) is treated as "leave alone" so users can null-out
+/// one knob without resetting the others.
+fn apply_size_env(target: &mut Option<PerAspectOverride>, body_key: &str, overlay_key: &str) {
+    let body = std::env::var(body_key).ok().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0);
+    let overlay = std::env::var(overlay_key).ok().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0);
+    if body.is_none() && overlay.is_none() {
+        return;
+    }
+    let slot = target.get_or_insert_with(PerAspectOverride::default);
+    if let Some(b) = body {
+        slot.font_size_pt = Some(b);
+    }
+    if let Some(o) = overlay {
+        slot.overlay_font_size_pt = Some(o);
     }
 }
 
@@ -687,13 +722,19 @@ fn group_into_phrases(words: &[AlignedWord], max_words: usize, max_chars: usize)
 }
 
 fn header(w: u32, h: u32) -> String {
+    // WrapStyle 0 = smart wrapping, lines balanced. Used to be 2 (no wrap),
+    // but the 1.5s hook overlay at 130pt Bold (9:16) regularly produced
+    // phrases > 1000px usable width and clipped on the sides. Karaoke
+    // captions are pre-chunked by max_chars_per_phrase and fit on one line
+    // either way; the wrap-style change only kicks in for the overlay's
+    // longer LLM-generated hooks.
     format!(
         "[Script Info]\n\
          Title: autoseo-clip\n\
          ScriptType: v4.00+\n\
          PlayResX: {w}\n\
          PlayResY: {h}\n\
-         WrapStyle: 2\n\
+         WrapStyle: 0\n\
          ScaledBorderAndShadow: yes\n\
          \n"
     )

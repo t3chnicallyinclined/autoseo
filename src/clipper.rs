@@ -9,8 +9,11 @@
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::{StreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai_pipeline::{AiPipeline, TranscriptSegment};
@@ -20,7 +23,7 @@ use crate::ast::AstScorer;
 use crate::candidates::{self, CandidateGenerator};
 use crate::captions::{self, CaptionOverrides, CaptionStyle, OverlayStyle};
 use crate::config::Config;
-use crate::face_detect::ScrfdDetector;
+use crate::face_detect;
 use crate::cost::{CostSnapshot, CostTracker};
 use crate::embed::Embedder;
 use crate::enhance;
@@ -40,6 +43,101 @@ use crate::social_copy::{HookSource, SocialCopy, SocialCopyGenerator, resolve_ho
 use crate::storage::{JobStatus, Storage};
 use crate::vad;
 use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
+
+/// Drop-test: is this word's full [start, end] range inside any non-speech
+/// (Silero "silence") window? If yes the word is almost certainly a Whisper
+/// hallucination from music/intro audio. We require *full containment*, not
+/// just overlap — words straddling a speech↔silence boundary are kept so
+/// real speech fading into music doesn't lose its final words.
+fn word_in_silence(w: &AlignedWord, silences: &[vad::SilenceWindow]) -> bool {
+    silences
+        .iter()
+        .any(|s| w.start_secs >= s.start_secs && w.end_secs <= s.end_secs)
+}
+
+/// Best-effort substage progress emit. Drives the small chips under the
+/// pipeline diagram in the dashboard (VAD / Prosody / Scene / Embed / Ling).
+/// No-op when the bus or job_id is absent (CLI / batch paths with no
+/// connected dashboard) so call sites stay clean.
+///
+/// Synthesizes a human-readable default message from `stage_id` + `status`
+/// so silent stage transitions (VAD/prosody/scene/ling/embed) still show
+/// up in the dashboard's Activity Log — the reducer drops events without
+/// a message. Sites that have richer detail should use [`emit_stage_msg`]
+/// directly; this is the catch-all for "X started" / "X complete" flips.
+fn emit_substage(
+    bus: Option<&crate::events::EventBus>,
+    job_id: Option<&str>,
+    stage_id: &str,
+    status: &str,
+) {
+    let msg = format!("{}: {}", stage_label(stage_id), status_label(status));
+    emit_stage(bus, job_id, stage_id, status, Some(msg), None);
+}
+
+/// Human-readable label for a stage id used in the snapshot/activity log.
+/// Falls back to the raw stage_id when unrecognized so new stages still
+/// log usefully without code changes.
+fn stage_label(stage_id: &str) -> &'static str {
+    match stage_id {
+        "audio" => "Audio extract",
+        "transcribe" => "Transcribe",
+        "vad" => "Voice activity",
+        "prosody" => "Prosody analysis",
+        "scene" => "Scene change detection",
+        "ling" => "Linguistic markers",
+        "embed" => "Embedding",
+        "features" => "Feature extraction",
+        "rank" => "Ranking",
+        "render" => "Render",
+        "post" => "Posting",
+        "ingest" => "Ingest",
+        _ => "Stage",
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "active" => "started",
+        "done" => "complete",
+        "failed" => "failed",
+        _ => "update",
+    }
+}
+
+/// Rich variant: emit a stage event with a human-readable detail message
+/// (e.g. "chunk 5/21", "dropped 14 hallucinated words") and/or a 0–100
+/// progress hint. The dashboard surfaces these inline under the main
+/// stage card AND appends them to its scrolling Activity Log so the user
+/// can see what the pipeline is doing right now without tailing stderr.
+fn emit_stage_msg(
+    bus: Option<&crate::events::EventBus>,
+    job_id: Option<&str>,
+    stage_id: &str,
+    status: &str,
+    message: impl Into<String>,
+) {
+    emit_stage(bus, job_id, stage_id, status, Some(message.into()), None);
+}
+
+fn emit_stage(
+    bus: Option<&crate::events::EventBus>,
+    job_id: Option<&str>,
+    stage_id: &str,
+    status: &str,
+    message: Option<String>,
+    progress: Option<u8>,
+) {
+    if let (Some(bus), Some(jid)) = (bus, job_id) {
+        bus.emit(crate::events::PipelineEvent::PipelineStage {
+            job_id: jid.to_string(),
+            stage_id: stage_id.to_string(),
+            status: status.to_string(),
+            progress,
+            message,
+        });
+    }
+}
 
 /// Update job status in storage if both storage and job_id are provided.
 /// Errors from the status update itself are logged but not propagated,
@@ -74,10 +172,15 @@ async fn set_job_status(
     }
 }
 
-/// When `cfg.scrfd_enabled`, load SCRFD once and compute a smoothed crop
-/// trajectory per ranked clip. Returns a Vec aligned with `ranked`: each entry
-/// is the per-clip keyframe list (empty if ASD was unavailable for that clip,
-/// so the render path falls back to static center-crop).
+/// When ASD is enabled, load the configured face detector once and compute a
+/// smoothed crop trajectory per ranked clip. Returns a Vec aligned with
+/// `ranked`: each entry is the per-clip keyframe list (empty if ASD was
+/// unavailable for that clip, so the render path falls back to static
+/// center-crop).
+///
+/// ASD enablement: `ASD_ENABLED=true` (new master switch, default true) OR
+/// the legacy `SCRFD_ENABLED=true` for backwards compatibility. The detector
+/// backend is chosen by `FACE_DETECTOR` (yunet | scrfd).
 ///
 /// Fails soft: any model-load or per-clip error logs a warning and surfaces
 /// empty trajectories, never aborts the whole render.
@@ -89,25 +192,35 @@ async fn compute_clip_trajectories(
     ranked: &[RankedClip],
 ) -> Vec<Vec<CropKeyframe>> {
     let empty = vec![Vec::new(); ranked.len()];
-    if !cfg.scrfd_enabled {
+    if !(cfg.asd_enabled || cfg.scrfd_enabled) {
         return empty;
     }
     let models_dir = PathBuf::from(&cfg.work_dir).join("models");
-    let detector = match ScrfdDetector::load(
+    let detector = match face_detect::load_detector(
+        &cfg.face_detector,
         &models_dir,
         Some(&cfg.scrfd_model_url),
         cfg.scrfd_input_size,
         cfg.scrfd_conf_threshold,
         cfg.scrfd_nms_threshold,
+        Some(&cfg.yunet_model_url),
+        cfg.yunet_input_size,
+        cfg.yunet_conf_threshold,
+        cfg.yunet_nms_threshold,
     )
     .await
     {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!(error = ?e, "asd: SCRFD load failed; static crop fallback");
+            tracing::warn!(
+                error = ?e,
+                detector = %cfg.face_detector,
+                "asd: detector load failed; static crop fallback"
+            );
             return empty;
         }
     };
+    tracing::info!(detector = detector.name(), clips = ranked.len(), "asd: detector ready");
 
     let speech_segments = vad::invert_to_speech(silences, total_duration_secs, 0.1);
     let params = AsdPipelineParams::default();
@@ -119,7 +232,7 @@ async fn compute_clip_trajectories(
             clip.start_secs,
             clip.end_secs,
             &speech_segments,
-            &detector,
+            detector.as_ref(),
             &params,
         )
         .await
@@ -252,7 +365,11 @@ async fn run_clipper_pipeline_inner(
 
     let audio_path = job_dir.join("audio.m4a");
     if !audio_path.exists() {
+        emit_stage_msg(bus, Some(job_id), "audio", "active", "extracting audio (16kHz mono)");
         media::extract_audio_m4a(&cfg.ffmpeg, input_path, &audio_path).await?;
+        emit_stage_msg(bus, Some(job_id), "audio", "done", "audio.m4a written");
+    } else {
+        emit_stage_msg(bus, Some(job_id), "audio", "done", "audio.m4a reused");
     }
 
     // Optional speech enhancement (DeepFilterNet3).
@@ -330,7 +447,21 @@ async fn run_clipper_pipeline_inner(
     pb_features.set_message("scene + vad + prosody");
     pb_features.enable_steady_tick(std::time::Duration::from_millis(120));
 
-    let (transcript, shots, silences, rms) = tokio::try_join!(
+    // Light the 5 sub-stage chips as `active` before the parallel try_join.
+    // Each is flipped to `done` as its lane completes; if the try_join fails
+    // they stay active and the JobFailed event takes precedence in the UI.
+    for sid in ["vad", "prosody", "scene", "embed", "ling"] {
+        emit_substage(bus, Some(job_id), sid, "active");
+    }
+
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "transcribe",
+        "active",
+        format!("transcribing {} chunks", chunks.len()),
+    );
+    let (mut transcript, shots, silences, rms) = tokio::try_join!(
         ai.transcribe_word_chunks(&chunks, Some(pb_transcribe.clone())),
         scene::detect_shots(&cfg.ffmpeg, input_path, 0.4),
         vad::detect_silences(
@@ -344,6 +475,47 @@ async fn run_clipper_pipeline_inner(
         ),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
+    emit_substage(bus, Some(job_id), "vad", "done");
+    emit_substage(bus, Some(job_id), "scene", "done");
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "transcribe",
+        "active",
+        format!("STT done: {} words, {} silence windows", transcript.words.len(), silences.len()),
+    );
+
+    // Drop words that fall inside Silero non-speech windows. The per-chunk
+    // hallucination guard catches chunks that are entirely music/silence,
+    // but a chunk that begins with real speech and transitions to music
+    // mid-way passes that guard — the real-speech prefix scores fine and
+    // the hallucinated suffix sneaks through. VAD knows the timestamp of
+    // every non-speech span; cross-referencing every word against it
+    // catches the partial case.
+    let before = transcript.words.len();
+    transcript.words.retain(|w| !word_in_silence(w, &silences));
+    let dropped = before - transcript.words.len();
+    if dropped > 0 {
+        tracing::info!(
+            dropped,
+            kept = transcript.words.len(),
+            "filtered hallucinated words inside VAD non-speech windows"
+        );
+        emit_stage_msg(
+            bus,
+            Some(job_id),
+            "transcribe",
+            "active",
+            format!("dropped {dropped} hallucinated words via VAD filter"),
+        );
+    }
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "transcribe",
+        "done",
+        format!("{} words ready", transcript.words.len()),
+    );
 
     // Record STT cost for the entire transcription pass.
     cost_tracker.record_stt_call(&ai.stt_model, total_duration_secs);
@@ -353,6 +525,8 @@ async fn run_clipper_pipeline_inner(
     if f0.is_empty() {
         tracing::info!("clipper: F0 features unavailable (aubio not on PATH or failed)");
     }
+    // Prosody lane is RMS + F0; flip to done after both complete.
+    emit_substage(bus, Some(job_id), "prosody", "done");
 
     pb_features.finish_with_message("scene + vad + prosody complete");
 
@@ -390,7 +564,7 @@ async fn run_clipper_pipeline_inner(
         .await
         .ok();
 
-    let cand_gen = CandidateGenerator::new();
+    let cand_gen = CandidateGenerator::from_config(cfg);
     let mut candidates = cand_gen.generate(
         total_duration_secs,
         &transcript.words,
@@ -399,9 +573,20 @@ async fn run_clipper_pipeline_inner(
         &rms,
         &f0,
     );
+    // Linguistic-marker extraction runs inside `cand_gen.generate` (see
+    // candidates::build → linguistic_markers::extract_features). Mark the
+    // chip done once we have candidates.
+    emit_substage(bus, Some(job_id), "ling", "done");
     tracing::info!(
         candidates = candidates.len(),
         "clipper: candidates generated"
+    );
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "rank",
+        "active",
+        format!("{} candidate windows", candidates.len()),
     );
 
     if candidates.is_empty() {
@@ -422,6 +607,9 @@ async fn run_clipper_pipeline_inner(
             tracing::warn!(error = ?e, "embedder init failed; proceeding without novelty");
         }
     }
+    // Embed lane done — irrespective of whether the embedder actually ran;
+    // the chip transitions out of `active` either way.
+    emit_substage(bus, Some(job_id), "embed", "done");
 
     let ranker_system = tokio::fs::read_to_string(&cfg.clip_ranker_system_prompt_path)
         .await
@@ -449,7 +637,8 @@ async fn run_clipper_pipeline_inner(
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
-    );
+    )
+    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs);
 
     // Inject CTR history into ranker prompt when enabled.
     if cfg.ctr_history_enabled {
@@ -485,6 +674,13 @@ async fn run_clipper_pipeline_inner(
     } else {
         final_top_k
     };
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "rank",
+        "active",
+        format!("LLM ranking top {llm_top_k} candidates"),
+    );
     let ranked = ranker
         .rank(
             &candidates,
@@ -495,6 +691,13 @@ async fn run_clipper_pipeline_inner(
         .await
         .context("LLM rank")?;
     tracing::info!(top_k = ranked.len(), "clipper: LLM ranked clips");
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "rank",
+        "active",
+        format!("LLM ranked {} clips", ranked.len()),
+    );
 
     if ranked.is_empty() {
         anyhow::bail!("LLM ranker returned no clips");
@@ -502,6 +705,13 @@ async fn run_clipper_pipeline_inner(
 
     let ranked = match VlmReranker::from_config(cfg, Some(&cost_tracker)) {
         Some(reranker) => {
+            emit_stage_msg(
+                bus,
+                Some(job_id),
+                "rank",
+                "active",
+                format!("VLM re-ranking top {}", cfg.vlm_rerank_top_k),
+            );
             match reranker
                 .rerank(&cfg.ffmpeg, input_path, ranked, cfg.vlm_rerank_top_k)
                 .await
@@ -509,6 +719,7 @@ async fn run_clipper_pipeline_inner(
                 Ok(re) => re,
                 Err(e) => {
                     tracing::warn!(error = ?e, "VLM re-rank failed; falling back to LLM order");
+                    emit_stage_msg(bus, Some(job_id), "rank", "active", "VLM re-rank failed; using LLM order");
                     ranker
                         .rank(
                             &candidates,
@@ -525,6 +736,13 @@ async fn run_clipper_pipeline_inner(
     };
 
     let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "rank",
+        "done",
+        format!("final top {} clips selected", ranked.len()),
+    );
 
     // Gate: ranked
     set_job_status(Some(storage), bus, Some(job_id), JobStatus::Ranked, None).await;
@@ -592,6 +810,21 @@ async fn run_clipper_pipeline_inner(
             cfg.clip_render_formats
         );
     }
+    let total_variants = ranked.len() * formats.len();
+    let rendered_counter = Arc::new(AtomicUsize::new(0));
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "render",
+        "active",
+        format!(
+            "rendering {} clips × {} aspects = {} variants (concurrency={})",
+            ranked.len(),
+            formats.len(),
+            total_variants,
+            cfg.effective_render_concurrency()
+        ),
+    );
 
     let trajectories =
         compute_clip_trajectories(cfg, input_path, &silences, total_duration_secs, &ranked).await;
@@ -622,102 +855,166 @@ async fn run_clipper_pipeline_inner(
             })
             .collect();
 
-        let mut variants: Vec<RenderedVariant> = Vec::with_capacity(formats.len());
-        for spec in &formats {
-            let basename = format!(
-                "clip_{idx:02}_{}-{}_{}.mp4",
-                to_mmss(clip.start_secs),
-                to_mmss(clip.end_secs),
-                spec.label
-            );
-            let out_path = clips_dir.join(&basename);
-            let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
+        // Per-aspect rendering for THIS clip runs in parallel up to
+        // RENDER_CONCURRENCY. Each variant is independent (unique output
+        // path, no shared mutable state), so this is safe. ASS files are
+        // written inside the task too — the per-clip ass path includes the
+        // aspect label so no two tasks ever touch the same file.
+        let render_concurrency = cfg.effective_render_concurrency();
+        let variants: Vec<RenderedVariant> = stream::iter(formats.iter().copied())
+            .map(|spec| {
+                let clip_words = &clip_words;
+                let caption_overrides = &caption_overrides;
+                let clip_trajectory = clip_trajectory;
+                let enhanced_wav = enhanced_wav.as_deref();
+                let ffmpeg = &cfg.ffmpeg;
+                let clips_dir = clips_dir.clone();
+                let clip = clip.clone();
+                let social = social.clone();
+                let rendered_counter = rendered_counter.clone();
+                async move {
+                    let basename = format!(
+                        "clip_{idx:02}_{}-{}_{}.mp4",
+                        to_mmss(clip.start_secs),
+                        to_mmss(clip.end_secs),
+                        spec.label
+                    );
+                    let out_path = clips_dir.join(&basename);
+                    let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
-            let profile = (spec.profile)();
-            let style = spec.aspect.caption_style(&caption_overrides);
+                    let profile = (spec.profile)().with_quality(
+                        cfg.clip_video_crf,
+                        &cfg.clip_video_preset,
+                        cfg.clip_audio_bitrate_kbps,
+                    );
+                    let style = spec.aspect.caption_style(caption_overrides);
 
-            if let Err(e) = captions::write_ass(
-                &ass_path,
-                &clip_words,
-                profile.width,
-                profile.height,
-                &style,
-            )
-            .await
-            {
-                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
-                continue;
-            }
+                    // Karaoke captions are gated by `CAPTION_BURN_ENABLED` —
+                    // skip the .ass write entirely when off so the burn-in
+                    // filter chain doesn't include them.
+                    let captions_written = if cfg.caption_burn_enabled {
+                        match captions::write_ass(
+                            &ass_path, clip_words, profile.width, profile.height, &style,
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
+                                return None;
+                            }
+                        }
+                    } else {
+                        false
+                    };
 
-            let overlay_ass_path =
-                clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
-            let mut overlay_written = false;
-            if let Some(sc) = social {
-                let hook = sc.overlay_hook.trim();
-                if !hook.is_empty() {
-                    let overlay_style = spec.aspect.overlay_style(&caption_overrides);
-                    match captions::write_overlay_ass(
-                        &overlay_ass_path,
-                        hook,
-                        profile.width,
-                        profile.height,
-                        &overlay_style,
+                    let overlay_ass_path =
+                        clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
+                    let mut overlay_written = false;
+                    if cfg.caption_hook_overlay_enabled {
+                        if let Some(sc) = social.as_ref() {
+                            let hook = sc.overlay_hook.trim();
+                            if !hook.is_empty() {
+                                let overlay_style = spec.aspect.overlay_style(caption_overrides);
+                                match captions::write_overlay_ass(
+                                    &overlay_ass_path, hook, profile.width, profile.height, &overlay_style,
+                                )
+                                .await
+                                {
+                                    Ok(()) => overlay_written = true,
+                                    Err(e) => {
+                                        tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut layers: Vec<&std::path::Path> = Vec::new();
+                    if captions_written {
+                        layers.push(ass_path.as_ref());
+                    }
+                    if overlay_written {
+                        layers.push(overlay_ass_path.as_ref());
+                    }
+
+                    let keyframes_for_variant = if spec.label == "9x16" {
+                        clip_trajectory
+                    } else {
+                        None
+                    };
+                    let res = render::render_clip_with_audio(
+                        ffmpeg, input_path, enhanced_wav,
+                        clip.start_secs, clip.end_secs,
+                        &out_path, &profile, &layers, keyframes_for_variant,
                     )
-                    .await
-                    {
-                        Ok(()) => overlay_written = true,
+                    .await;
+
+                    match res {
+                        Ok(()) => {
+                            let bytes = tokio::fs::metadata(&out_path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            // Tick the shared counter + push a per-variant
+                            // detail event so the dashboard's Render card
+                            // updates as each ffmpeg invocation finishes.
+                            let done = rendered_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            let mb = (bytes as f64 / 1_048_576.0).max(0.0);
+                            let pct = ((done as f64 / total_variants as f64) * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0)
+                                as u8;
+                            if let Some(bus) = bus {
+                                bus.emit(crate::events::PipelineEvent::PipelineStage {
+                                    job_id: job_id.to_string(),
+                                    stage_id: "render".into(),
+                                    status: "active".into(),
+                                    progress: Some(pct),
+                                    message: Some(format!(
+                                        "clip {idx} {} done ({mb:.1} MB) — {done}/{total_variants}",
+                                        spec.label
+                                    )),
+                                });
+                            }
+                            Some(RenderedVariant {
+                                label: spec.label.to_string(),
+                                path: out_path,
+                                bytes,
+                                width: profile.width,
+                                height: profile.height,
+                            })
+                        }
                         Err(e) => {
-                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
+                            // Still tick the counter so progress reflects
+                            // attempted variants (not just successful ones).
+                            let done = rendered_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            let pct = ((done as f64 / total_variants as f64) * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0)
+                                as u8;
+                            if let Some(bus) = bus {
+                                bus.emit(crate::events::PipelineEvent::PipelineStage {
+                                    job_id: job_id.to_string(),
+                                    stage_id: "render".into(),
+                                    status: "active".into(),
+                                    progress: Some(pct),
+                                    message: Some(format!(
+                                        "clip {idx} {} FAILED — {done}/{total_variants}",
+                                        spec.label
+                                    )),
+                                });
+                            }
+                            None
                         }
                     }
                 }
-            }
-
-            let mut layers: Vec<&std::path::Path> = vec![ass_path.as_ref()];
-            if overlay_written {
-                layers.push(overlay_ass_path.as_ref());
-            }
-
-            let enh_audio_ref = enhanced_wav.as_deref();
-            // ASD trajectory is only meaningful for 9x16 today; render ignores
-            // it for other aspects and falls back to its existing path.
-            let keyframes_for_variant = if spec.label == "9x16" {
-                clip_trajectory
-            } else {
-                None
-            };
-            let res = render::render_clip_with_audio(
-                &cfg.ffmpeg,
-                input_path,
-                enh_audio_ref,
-                clip.start_secs,
-                clip.end_secs,
-                &out_path,
-                &profile,
-                &layers,
-                keyframes_for_variant,
-            )
+            })
+            .buffer_unordered(render_concurrency)
+            .filter_map(|opt| async move { opt })
+            .collect()
             .await;
-
-            match res {
-                Ok(()) => {
-                    let bytes = tokio::fs::metadata(&out_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    variants.push(RenderedVariant {
-                        label: spec.label.to_string(),
-                        path: out_path,
-                        bytes,
-                        width: profile.width,
-                        height: profile.height,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
-                }
-            }
-        }
 
         if variants.is_empty() {
             tracing::warn!(clip = idx, "no variants rendered for this clip");
@@ -737,6 +1034,14 @@ async fn run_clipper_pipeline_inner(
     if rendered.is_empty() {
         anyhow::bail!("all clip renders failed");
     }
+    let variant_count: usize = rendered.iter().map(|c| c.variants.len()).sum();
+    emit_stage_msg(
+        bus,
+        Some(job_id),
+        "render",
+        "done",
+        format!("{} clips, {variant_count} variants written", rendered.len()),
+    );
 
     // Gate: rendered
     set_job_status(Some(storage), bus, Some(job_id), JobStatus::Rendered, None).await;
@@ -747,6 +1052,17 @@ async fn run_clipper_pipeline_inner(
         tracing::info!(
             platforms = ?platforms.iter().map(|p| p.name()).collect::<Vec<_>>(),
             "clipper: posting starting"
+        );
+        emit_stage_msg(
+            bus,
+            Some(job_id),
+            "post",
+            "active",
+            format!(
+                "posting to {}{}",
+                platforms.iter().map(|p| p.name()).collect::<Vec<_>>().join(", "),
+                if cfg.post_dry_run { " (dry run)" } else { "" }
+            ),
         );
         for r in rendered.iter_mut() {
             let video_9x16 = r
@@ -1029,7 +1345,13 @@ async fn run_clipper_inner(
     pb_features.set_message("scene + vad + prosody");
     pb_features.enable_steady_tick(std::time::Duration::from_millis(120));
 
-    let (transcript, shots, silences, rms) = tokio::try_join!(
+    // Light the 5 sub-stage chips as `active`. See the matching emit in
+    // run_clipper_pipeline_inner; same semantics here.
+    for sid in ["vad", "prosody", "scene", "embed", "ling"] {
+        emit_substage(bus, job_id, sid, "active");
+    }
+
+    let (mut transcript, shots, silences, rms) = tokio::try_join!(
         ai.transcribe_word_chunks(&chunks, Some(pb_transcribe.clone())),
         scene::detect_shots(&cfg.ffmpeg, &input_path, 0.4),
         vad::detect_silences(
@@ -1043,6 +1365,21 @@ async fn run_clipper_inner(
         ),
         prosody::rms_curve(&cfg.ffmpeg, &audio_path, 1.0),
     )?;
+    emit_substage(bus, job_id, "vad", "done");
+    emit_substage(bus, job_id, "scene", "done");
+
+    // Mirror of the post-VAD word filter in run_clipper_pipeline_inner.
+    // See that site for the rationale (partial-chunk hallucinations).
+    let before = transcript.words.len();
+    transcript.words.retain(|w| !word_in_silence(w, &silences));
+    let dropped = before - transcript.words.len();
+    if dropped > 0 {
+        tracing::info!(
+            dropped,
+            kept = transcript.words.len(),
+            "filtered hallucinated words inside VAD non-speech windows"
+        );
+    }
 
     // Record STT cost for the entire transcription pass.
     cost_tracker.record_stt_call(&ai.stt_model, total_duration_secs);
@@ -1052,6 +1389,7 @@ async fn run_clipper_inner(
     if f0.is_empty() {
         tracing::info!("clipper: F0 features unavailable (aubio not on PATH or failed)");
     }
+    emit_substage(bus, job_id, "prosody", "done");
 
     pb_features.finish_with_message("scene + vad + prosody complete");
 
@@ -1126,7 +1464,7 @@ async fn run_clipper_inner(
         None
     };
 
-    let cand_gen = CandidateGenerator::new();
+    let cand_gen = CandidateGenerator::from_config(cfg);
     let mut candidates = cand_gen.generate(
         total_duration_secs,
         &transcript.words,
@@ -1135,6 +1473,7 @@ async fn run_clipper_inner(
         &rms,
         &f0,
     );
+    emit_substage(bus, job_id, "ling", "done");
     tracing::info!(
         candidates = candidates.len(),
         "clipper: candidates generated"
@@ -1170,6 +1509,7 @@ async fn run_clipper_inner(
             tracing::warn!(error = ?e, "embedder init failed; proceeding without novelty");
         }
     }
+    emit_substage(bus, job_id, "embed", "done");
 
     // Optional: AST audio-event scoring. Non-fatal — if the model is unavailable
     // or inference fails, we proceed without the signal.
@@ -1228,7 +1568,8 @@ async fn run_clipper_inner(
         ai.chat_model.clone(),
         ranker_system,
         ranker_user_template,
-    );
+    )
+    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs);
 
     // Inject CTR history into ranker prompt when enabled.
     if cfg.ctr_history_enabled {
@@ -1469,6 +1810,21 @@ async fn run_clipper_inner(
         formats = ?formats.iter().map(|f| f.label).collect::<Vec<_>>(),
         "clipper: render formats"
     );
+    let total_variants = ranked.len() * formats.len();
+    let rendered_counter = Arc::new(AtomicUsize::new(0));
+    emit_stage_msg(
+        bus,
+        job_id,
+        "render",
+        "active",
+        format!(
+            "rendering {} clips × {} aspects = {} variants (concurrency={})",
+            ranked.len(),
+            formats.len(),
+            total_variants,
+            cfg.effective_render_concurrency()
+        ),
+    );
 
     // Construct the optional object-storage uploader once and reuse for
     // every variant + cover frame. When R2_* envs are unset, uploader is None
@@ -1516,114 +1872,172 @@ async fn run_clipper_inner(
             })
             .collect();
 
-        let mut variants: Vec<RenderedVariant> = Vec::with_capacity(formats.len());
-        for spec in &formats {
-            let basename = format!(
-                "clip_{idx:02}_{}-{}_{}.mp4",
-                to_mmss(clip.start_secs),
-                to_mmss(clip.end_secs),
-                spec.label
-            );
-            let out_path = clips_dir.join(&basename);
-            let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
+        // Parallel per-aspect render (mirror of run_clipper_pipeline_inner's
+        // refactored path). RENDER_CONCURRENCY caps concurrent ffmpeg
+        // processes; each task is fully independent. Difference vs site 1:
+        // applies a per-show LUFS override on the render profile.
+        let render_concurrency = cfg.effective_render_concurrency();
+        let variants: Vec<RenderedVariant> = stream::iter(formats.iter().copied())
+            .map(|spec| {
+                let clip_words = &clip_words;
+                let caption_overrides = &caption_overrides;
+                let clip_trajectory = clip_trajectory;
+                let enhanced_wav = enhanced_wav.as_deref();
+                let ffmpeg = &cfg.ffmpeg;
+                let clips_dir = clips_dir.clone();
+                let clip = clip.clone();
+                let social = social.clone();
+                let input_path = &input_path;
+                let rendered_counter = rendered_counter.clone();
+                async move {
+                    let basename = format!(
+                        "clip_{idx:02}_{}-{}_{}.mp4",
+                        to_mmss(clip.start_secs),
+                        to_mmss(clip.end_secs),
+                        spec.label
+                    );
+                    let out_path = clips_dir.join(&basename);
+                    let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
-            let profile = match per_show_lufs {
-                Some(lufs) => (spec.profile)().with_loudness(lufs),
-                None => (spec.profile)(),
-            };
-            let style = spec.aspect.caption_style(&caption_overrides);
+                    let profile = match per_show_lufs {
+                        Some(lufs) => (spec.profile)().with_loudness(lufs),
+                        None => (spec.profile)(),
+                    }
+                    .with_quality(
+                        cfg.clip_video_crf,
+                        &cfg.clip_video_preset,
+                        cfg.clip_audio_bitrate_kbps,
+                    );
+                    let style = spec.aspect.caption_style(caption_overrides);
 
-            if let Err(e) = captions::write_ass(
-                &ass_path,
-                &clip_words,
-                profile.width,
-                profile.height,
-                &style,
-            )
-            .await
-            {
-                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
-                continue;
-            }
+                    // Karaoke captions are gated by `CAPTION_BURN_ENABLED` —
+                    // skip the .ass write entirely when off so the burn-in
+                    // filter chain doesn't include them.
+                    let captions_written = if cfg.caption_burn_enabled {
+                        match captions::write_ass(
+                            &ass_path, clip_words, profile.width, profile.height, &style,
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(clip = idx, format = spec.label, error = ?e, "ass write failed");
+                                return None;
+                            }
+                        }
+                    } else {
+                        false
+                    };
 
-            // Optional overlay hook .ass for the first ~1.5s. Only write if the
-            // social-copy LLM produced a hook. The render filter chain takes both
-            // (captions first, overlay second so it draws on top).
-            let overlay_ass_path =
-                clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
-            let mut overlay_written = false;
-            if let Some(sc) = social {
-                let hook = sc.overlay_hook.trim();
-                if !hook.is_empty() {
-                    let overlay_style = spec.aspect.overlay_style(&caption_overrides);
-                    match captions::write_overlay_ass(
-                        &overlay_ass_path,
-                        hook,
-                        profile.width,
-                        profile.height,
-                        &overlay_style,
+                    let overlay_ass_path =
+                        clips_dir.join(format!("clip_{idx:02}_{}_overlay.ass", spec.label));
+                    let mut overlay_written = false;
+                    if cfg.caption_hook_overlay_enabled {
+                        if let Some(sc) = social.as_ref() {
+                            let hook = sc.overlay_hook.trim();
+                            if !hook.is_empty() {
+                                let overlay_style = spec.aspect.overlay_style(caption_overrides);
+                                match captions::write_overlay_ass(
+                                    &overlay_ass_path, hook, profile.width, profile.height, &overlay_style,
+                                )
+                                .await
+                                {
+                                    Ok(()) => overlay_written = true,
+                                    Err(e) => {
+                                        tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut layers: Vec<&std::path::Path> = Vec::new();
+                    if captions_written {
+                        layers.push(ass_path.as_ref());
+                    }
+                    if overlay_written {
+                        layers.push(overlay_ass_path.as_ref());
+                    }
+
+                    let keyframes_for_variant = if spec.label == "9x16" {
+                        clip_trajectory
+                    } else {
+                        None
+                    };
+                    let res = render::render_clip_with_audio(
+                        ffmpeg, input_path, enhanced_wav,
+                        clip.start_secs, clip.end_secs,
+                        &out_path, &profile, &layers, keyframes_for_variant,
                     )
-                    .await
-                    {
-                        Ok(()) => overlay_written = true,
+                    .await;
+
+                    match res {
+                        Ok(()) => {
+                            let bytes = tokio::fs::metadata(&out_path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            tracing::info!(
+                                clip = idx,
+                                format = spec.label,
+                                path = %out_path.display(),
+                                bytes,
+                                "rendered variant"
+                            );
+                            let done = rendered_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            let mb = (bytes as f64 / 1_048_576.0).max(0.0);
+                            let pct = ((done as f64 / total_variants as f64) * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0)
+                                as u8;
+                            if let (Some(bus), Some(jid)) = (bus, job_id) {
+                                bus.emit(crate::events::PipelineEvent::PipelineStage {
+                                    job_id: jid.to_string(),
+                                    stage_id: "render".into(),
+                                    status: "active".into(),
+                                    progress: Some(pct),
+                                    message: Some(format!(
+                                        "clip {idx} {} done ({mb:.1} MB) — {done}/{total_variants}",
+                                        spec.label
+                                    )),
+                                });
+                            }
+                            Some(RenderedVariant {
+                                label: spec.label.to_string(),
+                                path: out_path,
+                                bytes,
+                                width: profile.width,
+                                height: profile.height,
+                            })
+                        }
                         Err(e) => {
-                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "overlay ass write failed");
+                            tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
+                            let done = rendered_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            let pct = ((done as f64 / total_variants as f64) * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0)
+                                as u8;
+                            if let (Some(bus), Some(jid)) = (bus, job_id) {
+                                bus.emit(crate::events::PipelineEvent::PipelineStage {
+                                    job_id: jid.to_string(),
+                                    stage_id: "render".into(),
+                                    status: "active".into(),
+                                    progress: Some(pct),
+                                    message: Some(format!(
+                                        "clip {idx} {} FAILED — {done}/{total_variants}",
+                                        spec.label
+                                    )),
+                                });
+                            }
+                            None
                         }
                     }
                 }
-            }
-
-            // Build subtitle layer list: captions first, overlay last so it draws on top.
-            let mut layers: Vec<&std::path::Path> = vec![ass_path.as_ref()];
-            if overlay_written {
-                layers.push(overlay_ass_path.as_ref());
-            }
-
-            let enh_audio_ref = enhanced_wav.as_deref();
-            let keyframes_for_variant = if spec.label == "9x16" {
-                clip_trajectory
-            } else {
-                None
-            };
-            let res = render::render_clip_with_audio(
-                &cfg.ffmpeg,
-                &input_path,
-                enh_audio_ref,
-                clip.start_secs,
-                clip.end_secs,
-                &out_path,
-                &profile,
-                &layers,
-                keyframes_for_variant,
-            )
+            })
+            .buffer_unordered(render_concurrency)
+            .filter_map(|opt| async move { opt })
+            .collect()
             .await;
-
-            match res {
-                Ok(()) => {
-                    let bytes = tokio::fs::metadata(&out_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    tracing::info!(
-                        clip = idx,
-                        format = spec.label,
-                        path = %out_path.display(),
-                        bytes,
-                        "rendered variant"
-                    );
-                    variants.push(RenderedVariant {
-                        label: spec.label.to_string(),
-                        path: out_path,
-                        bytes,
-                        width: profile.width,
-                        height: profile.height,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(clip = idx, format = spec.label, error = ?e, "render failed");
-                }
-            }
-        }
 
         if variants.is_empty() {
             tracing::warn!(clip = idx, "no variants rendered for this clip");

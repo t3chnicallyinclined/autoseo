@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-05-22
+
+### Browser-backed posting via CloakBrowser sidecar (Phase 1 + Phase 2)
+Foundation for routing social posts through web automation instead of (or in addition to) the gated/paid platform APIs.
+
+**Worker lives in the [android-agent](https://github.com/t3chnicallyinclined/android-agent) sibling repo.** android-agent already has working Gmail/Outlook signup choreography (`demos/gmail_live.py`, `demos/outlook_live.py`), a Flask dashboard with a CAPTCHA queue, a credential vault, a persona generator, and an RLM browser agent. Rather than re-derive that surface, autoseo's BrowserPoster contract now points at android-agent extended with a FastAPI HTTP layer + CloakBrowser swap.
+
+(An earlier extract `autoclipper-social` was created and archived in this same release. The patterns we built there — multi-tenant `profiles/<tenant>/<platform>/<account>/` layout, master-switch + health probe, account-aware request shape — carry over to android-agent's API layer.)
+
+**Worker scaffolding (developed in `autoclipper-social`, now living in `android-agent`)** — design carried over:
+- HTTP surface: `/healthz`, `/accounts`, `/accounts/{platform}/{account_id}/login{,/complete}`, `/post`, WS `/stream/{session_id}` (Phase-3 screencast lives here).
+- On-disk profile manager in `app/profiles.py` (per-account chromium user-data + daily-cap state with date-rollover).
+- Driver registry in `app/drivers/` with `BrowserDriver` ABC; X driver lands here.
+- Playwright/CDP runtime helper that opens `launch_persistent_context` per call.
+- Dockerfile + docker-compose service wired to `cloakhq/cloakbrowser` sidecar.
+
+**Rust (`src/platforms/browser/`)** — new `Platform::Browser` enum variant:
+- One `BrowserPoster` instance per `(platform, account_id)` pair from `BROWSER_ACCOUNTS`.
+- Multi-account first-class: `is_primary` flag determines which accounts the *automatic* post path uses; manual dashboard posts can pick any.
+- Caption composer routes each platform's `SocialCopy` block to the right text + hashtag concat (X truncates to 280, Threads to 500).
+- HTTP client to the worker; 5-minute timeout per post.
+- `POSTING_BACKEND` switch (`api` | `browser` | `mixed`) defaults to `api` so this ships dark.
+
+**API contract changes (`src/api/clips.rs`)**:
+- `PostClipBody` and `BulkActionBody` accept a `targets: [{platform, account_id?}]` field. Legacy `platforms: [String]` still works.
+- Posts table rows for multi-account use the encoding `platform:account_id` in the `platform` column (no schema migration yet).
+
+**New env (see `.env.example` for full block):**
+- `POSTING_BACKEND`, `BROWSER_WORKER_URL`, `BROWSER_ACCOUNTS`, `BROWSER_PRIMARY_ACCOUNTS`, `BROWSER_POST_DAILY_CAP_DEFAULT`, `BROWSER_POST_DAILY_CAP_<PLATFORM>`, `BROWSER_HUMANIZE`.
+
+**Status:** Phase 2 ships the X driver only and the API contract for account-aware posting. The dashboard connect-account UX + WS screencast proxy land in Phase 3. LinkedIn/Threads/TikTok/IG drivers in Phase 4. Optional YouTube/Bluesky/IG-Graph migration is Phase 5.
+
 ## 2026-05-21
 
 ### Clipper pipeline features (items 8–11 from the dashboard backlog)

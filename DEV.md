@@ -87,6 +87,29 @@ cloudflared tunnel --url http://localhost:8080
 
 That's it. Open the tunnel URL in any browser; you'll see the dashboard. The API is at `<url>/api/*`.
 
+### Optional: browser-backed posting sidecar
+
+The browser worker lives in the **android-agent sibling repo**:
+[`/home/tris/projects/android-agent/`](../android-agent). It was originally an email-signup
+agent (Gmail/Outlook); extended in-place with a FastAPI surface that satisfies autoseo's
+BrowserPoster contract. Clone it next to autoseo before bringing the stack up.
+
+(An earlier extraction `autoclipper-social` was archived on 2026-05-22 in favor of building on top of android-agent's existing signup choreography.)
+
+```bash
+cd ~/projects && gh repo clone t3chnicallyinclined/android-agent
+
+cd ~/projects/autoseo
+docker compose up -d cloakbrowser browser_worker
+# cloakbrowser:    CDP server on 127.0.0.1:9222
+# browser_worker:  FastAPI on  127.0.0.1:8090 (built from ../android-agent/)
+curl localhost:8090/healthz  # { ok: true, cdp_connected: true, drivers: [...], ... }
+```
+
+Profiles persist in the `browser-profiles` docker volume. Wipe a profile to force re-login: `docker compose exec browser_worker rm -rf /profiles/default/x/tris_main`.
+
+The Phase-3 dashboard "Connect X" flow does login interactively. Until that lands, see `android-agent/README.md` for seeding a profile manually via the existing demo scripts.
+
 ### Skip step (faster iteration, no tunnel)
 
 If you're only testing locally:

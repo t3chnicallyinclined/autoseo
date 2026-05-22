@@ -45,6 +45,15 @@ pub struct AiPipeline {
     #[cfg(feature = "local-stt")]
     whisper_local: Option<crate::whisper_local::WhisperLocal>,
     ffmpeg_path: String,
+    /// Bus + job id for emitting fine-grained progress events from inside
+    /// the transcribe loop. Both `None` means the legacy CLI path; the
+    /// dashboard worker sets both via the builder methods below.
+    event_bus: Option<crate::events::EventBus>,
+    event_job_id: Option<String>,
+    /// Strictness profile for the Whisper hallucination guard. Sourced
+    /// from `STT_HALLUCINATION_GUARD` env (via the worker) so different
+    /// jobs can carry different sensitivities.
+    hallucination_guard: crate::openai::HallucinationGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +130,18 @@ impl AiPipeline {
             #[cfg(feature = "local-stt")]
             whisper_local: None,
             ffmpeg_path: "ffmpeg".to_string(),
+            event_bus: None,
+            event_job_id: None,
+            hallucination_guard: crate::openai::HallucinationGuard::Default,
         }
+    }
+
+    /// Set the hallucination-guard strictness profile. Called by the
+    /// worker after reading `STT_HALLUCINATION_GUARD` (and any per-job
+    /// override) from [`crate::config::Config`].
+    pub fn with_hallucination_guard(mut self, guard: crate::openai::HallucinationGuard) -> Self {
+        self.hallucination_guard = guard;
+        self
     }
 
     /// Set the STT backend and (for `Local`) the loaded whisper model.
@@ -133,6 +153,16 @@ impl AiPipeline {
     /// Set the ffmpeg path (needed for local STT to convert audio to 16kHz WAV).
     pub fn with_ffmpeg_path(mut self, path: String) -> Self {
         self.ffmpeg_path = path;
+        self
+    }
+
+    /// Attach an event bus + job id so the transcribe loop can publish
+    /// per-chunk progress events to the dashboard. Optional — when unset
+    /// (CLI / batch paths) no events are emitted and the loop runs as
+    /// before.
+    pub fn with_event_bus(mut self, bus: crate::events::EventBus, job_id: impl Into<String>) -> Self {
+        self.event_bus = Some(bus);
+        self.event_job_id = Some(job_id.into());
         self
     }
 
@@ -264,6 +294,12 @@ impl AiPipeline {
                     let stt_model = self.stt_model.clone();
                     let concurrency = self.stt_concurrency;
                     let stt_rpm_gate = self.stt_rpm_gate.clone();
+                    // Owned snapshots so each per-chunk task can emit progress
+                    // back to the dashboard without sharing a borrow across
+                    // task boundaries. Both None when no bus is attached.
+                    let bus = self.event_bus.clone();
+                    let job_id = self.event_job_id.clone();
+                    let guard = self.hallucination_guard;
                     stream::iter(chunks.iter().cloned().enumerate())
                         .map(|(idx, (chunk_path, offset_secs, chunk_duration_secs))| {
                             let client = client.clone();
@@ -272,6 +308,9 @@ impl AiPipeline {
                             let completed = completed.clone();
                             let total_chunks = total_chunks;
                             let stt_rpm_gate = stt_rpm_gate.clone();
+                            let bus = bus.clone();
+                            let job_id = job_id.clone();
+                            let guard = guard;
                             async move {
                                 let chunk_label = chunk_path.display().to_string();
                                 if let Some(gate) = stt_rpm_gate.as_ref() {
@@ -282,16 +321,64 @@ impl AiPipeline {
                                     .await
                                     .with_context(|| format!("stt-words for {chunk_label}"))?;
 
+                                // Guard against Whisper hallucinating English on non-speech
+                                // chunks (music, silence, applause). If a chunk trips any of
+                                // the heuristic signals, drop its words so the downstream
+                                // ranker doesn't build a clip on top of made-up text.
+                                let hallucinated = crate::openai::detect_stt_hallucination_with(
+                                    &tr.text,
+                                    &tr.words,
+                                    chunk_duration_secs,
+                                    guard,
+                                );
+                                if let Some(reason) = &hallucinated {
+                                    tracing::warn!(
+                                        chunk = %chunk_label,
+                                        offset_secs = offset_secs,
+                                        reason = %reason,
+                                        "dropping hallucinated STT chunk"
+                                    );
+                                }
+
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                progress.set_message(format!("chunk {done}/{total_chunks}"));
+                                progress.inc(1);
+                                // Emit per-chunk bus progress so the dashboard's
+                                // Transcribe card + Activity Log update live.
+                                // Suffix the hallucinated-chunk warning so the
+                                // operator can see drops happening in real time.
+                                if let (Some(bus), Some(jid)) =
+                                    (bus.as_ref(), job_id.as_deref())
+                                {
+                                    let pct = ((done as f64 / total_chunks as f64) * 100.0)
+                                        .round()
+                                        .clamp(0.0, 100.0)
+                                        as u8;
+                                    let msg = match &hallucinated {
+                                        Some(reason) => format!(
+                                            "chunk {done}/{total_chunks} (dropped: {reason})"
+                                        ),
+                                        None => format!("chunk {done}/{total_chunks}"),
+                                    };
+                                    bus.emit(crate::events::PipelineEvent::PipelineStage {
+                                        job_id: jid.to_string(),
+                                        stage_id: "transcribe".into(),
+                                        status: "active".into(),
+                                        progress: Some(pct),
+                                        message: Some(msg),
+                                    });
+                                }
+
+                                if hallucinated.is_some() {
+                                    return Ok::<_, anyhow::Error>((idx, Vec::new(), Vec::new()));
+                                }
+
                                 let segments = map_segments_or_synthesize_words(
                                     &tr,
                                     offset_secs,
                                     chunk_duration_secs,
                                 );
                                 let words = align::shift_words(&tr.words, offset_secs);
-
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                progress.set_message(format!("chunk {done}/{total_chunks}"));
-                                progress.inc(1);
                                 Ok::<_, anyhow::Error>((idx, segments, words))
                             }
                         })

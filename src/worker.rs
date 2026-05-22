@@ -29,6 +29,164 @@ use crate::storage::{JobStatus, Storage};
 
 const POLL_INTERVAL_SECS: u64 = 5;
 
+/// Overlay any dashboard-supplied per-job knobs from `job.config_json` onto
+/// the global `cfg`. Returns an owned Config so the rest of `run_job` can
+/// use it without aliasing the original. Unknown keys are silently ignored;
+/// invalid JSON is logged as a warning and otherwise treated as empty
+/// (better to run with global defaults than to fail the job).
+///
+/// Recognized keys (snake_case from the dashboard's New Job wizard):
+///   Detection:
+///     - `clip_top_k` (usize)
+///     - `vlm_rerank_enabled` (bool)
+///     - `asd_enabled` (bool)
+///     - `enhance_audio` (bool)
+///   Rendering:
+///     - `clip_render_formats` (string, comma-separated aspects)
+///     - `clip_video_crf` (u32, 0-51)
+///     - `clip_video_preset` (string, x264 preset)
+///     - `clip_audio_bitrate_kbps` (u32)
+///   Posting:
+///     - `post_enabled_platforms` (string, comma-separated)
+///     - `post_dry_run` (bool)
+fn apply_per_job_overrides(cfg: &Config, job: &crate::storage::JobRow) -> Config {
+    let mut out = cfg.clone();
+    let Some(raw) = job.config_json.as_deref().filter(|s| !s.is_empty()) else {
+        return out;
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(job_id = %job.id, error = %e, "job config_json invalid; using defaults");
+            return out;
+        }
+    };
+    let mut applied: Vec<String> = Vec::new();
+
+    // Detection knobs
+    if let Some(v) = parsed.get("clip_top_k").and_then(|v| v.as_u64()) {
+        out.clip_top_k = v.max(1) as usize;
+        applied.push(format!("clip_top_k={}", out.clip_top_k));
+    }
+    if let Some(v) = parsed.get("vlm_rerank_enabled").and_then(|v| v.as_bool()) {
+        out.vlm_rerank_enabled = v;
+        applied.push(format!("vlm_rerank_enabled={v}"));
+    }
+    if let Some(v) = parsed.get("asd_enabled").and_then(|v| v.as_bool()) {
+        out.asd_enabled = v;
+        applied.push(format!("asd_enabled={v}"));
+    }
+    if let Some(v) = parsed.get("enhance_audio").and_then(|v| v.as_bool()) {
+        out.enhance_audio = v;
+        applied.push(format!("enhance_audio={v}"));
+    }
+
+    // Rendering knobs
+    if let Some(v) = parsed.get("clip_render_formats").and_then(|v| v.as_str()) {
+        if !v.trim().is_empty() {
+            out.clip_render_formats = v.to_string();
+            applied.push(format!("clip_render_formats={v}"));
+        }
+    }
+    if let Some(v) = parsed.get("clip_video_crf").and_then(|v| v.as_u64()) {
+        out.clip_video_crf = v.min(51) as u32;
+        applied.push(format!("clip_video_crf={}", out.clip_video_crf));
+    }
+    if let Some(v) = parsed.get("clip_video_preset").and_then(|v| v.as_str()) {
+        if !v.trim().is_empty() {
+            out.clip_video_preset = v.to_string();
+            applied.push(format!("clip_video_preset={v}"));
+        }
+    }
+    if let Some(v) = parsed.get("clip_audio_bitrate_kbps").and_then(|v| v.as_u64()) {
+        out.clip_audio_bitrate_kbps = v.clamp(32, 512) as u32;
+        applied.push(format!("clip_audio_bitrate_kbps={}", out.clip_audio_bitrate_kbps));
+    }
+
+    // Posting knobs
+    if let Some(v) = parsed.get("post_enabled_platforms").and_then(|v| v.as_str()) {
+        out.post_enabled_platforms = v.to_string();
+        applied.push(format!("post_enabled_platforms={v}"));
+    }
+    if let Some(v) = parsed.get("post_dry_run").and_then(|v| v.as_bool()) {
+        out.post_dry_run = v;
+        applied.push(format!("post_dry_run={v}"));
+    }
+
+    // Clip duration knobs
+    if let Some(v) = parsed.get("clip_min_secs").and_then(|v| v.as_f64()) {
+        out.clip_min_secs = v.max(5.0);
+        applied.push(format!("clip_min_secs={}", out.clip_min_secs));
+    }
+    if let Some(v) = parsed.get("clip_max_secs").and_then(|v| v.as_f64()) {
+        out.clip_max_secs = v.max(out.clip_min_secs + 1.0);
+        applied.push(format!("clip_max_secs={}", out.clip_max_secs));
+    }
+    if let Some(v) = parsed.get("clip_target_secs").and_then(|v| v.as_f64()) {
+        out.clip_target_secs = v.clamp(out.clip_min_secs, out.clip_max_secs);
+        applied.push(format!("clip_target_secs={}", out.clip_target_secs));
+    }
+    if let Some(v) = parsed.get("clip_stride_secs").and_then(|v| v.as_f64()) {
+        if v > 0.0 {
+            out.clip_stride_secs = v;
+            applied.push(format!("clip_stride_secs={v}"));
+        }
+    }
+    if let Some(v) = parsed.get("clip_min_words").and_then(|v| v.as_u64()) {
+        out.clip_min_words = v as usize;
+        applied.push(format!("clip_min_words={}", out.clip_min_words));
+    }
+
+    // Caption knobs
+    if let Some(v) = parsed.get("caption_burn_enabled").and_then(|v| v.as_bool()) {
+        out.caption_burn_enabled = v;
+        applied.push(format!("caption_burn_enabled={v}"));
+    }
+    if let Some(v) = parsed.get("caption_hook_overlay_enabled").and_then(|v| v.as_bool()) {
+        out.caption_hook_overlay_enabled = v;
+        applied.push(format!("caption_hook_overlay_enabled={v}"));
+    }
+    // Caption sizes are also exposed via env at render time (captions.rs
+    // applies them from `std::env::var`); plumbing them via per-job
+    // overrides means the dashboard can pin a size for a single job
+    // without touching global env. We mirror the value into the process
+    // env so the existing `apply_env` reader picks it up.
+    for (key, env_key) in [
+        ("caption_font_size_vertical", "CAPTION_FONT_SIZE_VERTICAL"),
+        ("caption_font_size_square", "CAPTION_FONT_SIZE_SQUARE"),
+        ("caption_font_size_landscape", "CAPTION_FONT_SIZE_LANDSCAPE"),
+        ("caption_overlay_font_size_vertical", "CAPTION_OVERLAY_FONT_SIZE_VERTICAL"),
+        ("caption_overlay_font_size_square", "CAPTION_OVERLAY_FONT_SIZE_SQUARE"),
+        ("caption_overlay_font_size_landscape", "CAPTION_OVERLAY_FONT_SIZE_LANDSCAPE"),
+    ] {
+        if let Some(v) = parsed.get(key).and_then(|v| v.as_u64()) {
+            // Safety: env writes are process-global but each job already
+            // runs to completion serially in this worker (claim_next_pending_job
+            // returns one row at a time), so there is no concurrency hazard.
+            // SAFETY: see comment above re: serial worker loop.
+            unsafe { std::env::set_var(env_key, v.to_string()) };
+            applied.push(format!("{key}={v}"));
+        }
+    }
+    if let Some(v) = parsed.get("caption_font_name").and_then(|v| v.as_str()) {
+        if !v.trim().is_empty() {
+            unsafe { std::env::set_var("CAPTION_FONT_NAME", v) };
+            applied.push(format!("caption_font_name={v}"));
+        }
+    }
+
+    // STT hallucination strictness
+    if let Some(v) = parsed.get("stt_hallucination_guard").and_then(|v| v.as_str()) {
+        out.stt_hallucination_guard = v.to_string();
+        applied.push(format!("stt_hallucination_guard={v}"));
+    }
+
+    if !applied.is_empty() {
+        tracing::info!(job_id = %job.id, overrides = %applied.join(", "), "applied per-job config overrides");
+    }
+    out
+}
+
 /// Run the worker loop until the host process is cancelled. Designed to be
 /// spawned via `tokio::spawn` alongside the axum server. `bus` is cloned into
 /// each pipeline invocation so per-stage events reach all connected
@@ -36,6 +194,19 @@ const POLL_INTERVAL_SECS: u64 = 5;
 pub async fn run(cfg: Config, storage: Storage, bus: EventBus) {
     let mut tick = interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Log the auto-detected hardware profile + effective render concurrency
+    // once on startup so the user can confirm we're saturating the box.
+    let specs = crate::system_specs::SystemSpecs::detect();
+    let effective_render = cfg.effective_render_concurrency();
+    tracing::info!(
+        cores = specs.logical_cores,
+        ram_mib = ?specs.total_mem_mib,
+        render_concurrency = effective_render,
+        render_concurrency_auto = cfg.render_concurrency == 0,
+        "system specs detected"
+    );
+
     tracing::info!(
         poll_secs = POLL_INTERVAL_SECS,
         "dashboard worker: polling for pending jobs"
@@ -90,6 +261,13 @@ async fn run_job(
 ) -> Result<()> {
     let local_path = ensure_local_source(cfg, storage, job).await?;
 
+    // Apply per-job overrides from the New Job dialog before invoking the
+    // pipeline. `jobs.config_json` carries dashboard-supplied knobs
+    // (clip_top_k for now; render_formats and others can be added the same
+    // way). Without this clone-and-overlay, every job runs against the
+    // global Config and ignores the dialog's settings entirely.
+    let cfg = apply_per_job_overrides(cfg, job);
+
     let openai_api_key = cfg
         .openai_api_key
         .clone()
@@ -127,11 +305,17 @@ async fn run_job(
         thumbnail_user,
     )
     .with_stt_backend(stt_backend)
-    .with_ffmpeg_path(cfg.ffmpeg.clone());
+    .with_ffmpeg_path(cfg.ffmpeg.clone())
+    // Attach the bus so the STT chunk loop can publish per-chunk progress
+    // events to the dashboard's Activity Log + Transcribe card.
+    .with_event_bus(bus.clone(), job.id.clone())
+    .with_hallucination_guard(crate::openai::HallucinationGuard::from_str(
+        &cfg.stt_hallucination_guard,
+    ));
 
     let gmail = GmailClient::new();
     clipper::run_clipper_local_once(
-        cfg,
+        &cfg,
         None, // no Google credentials needed for file-mode digest
         &gmail,
         &ai,

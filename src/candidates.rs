@@ -86,6 +86,30 @@ impl CandidateGenerator {
         Self::default()
     }
 
+    /// Build a generator from the runtime [`crate::config::Config`] so the
+    /// clip-duration knobs (`CLIP_MIN_SECS` / `CLIP_MAX_SECS` /
+    /// `CLIP_TARGET_SECS` / `CLIP_STRIDE_SECS` / `CLIP_MIN_WORDS`) flow
+    /// through to candidate generation without touching this struct's
+    /// internals. Defaults from `Default` apply for unset knobs.
+    ///
+    /// The min/max/target are floored at sane minima (5s / >min / >=min)
+    /// to keep downstream code from receiving nonsense windows; the
+    /// generator already filters by `min_words` so very short candidates
+    /// with too few words drop out anyway.
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let mut g = Self::default();
+        g.min_secs = cfg.clip_min_secs.max(5.0);
+        g.max_secs = cfg.clip_max_secs.max(g.min_secs + 1.0);
+        g.target_secs = cfg.clip_target_secs.clamp(g.min_secs, g.max_secs);
+        if cfg.clip_stride_secs > 0.0 {
+            g.stride_secs = cfg.clip_stride_secs;
+        }
+        if cfg.clip_min_words > 0 {
+            g.min_words = cfg.clip_min_words;
+        }
+        g
+    }
+
     /// Produce candidate windows over `[0, total_duration_secs)`. Pure, sync.
     /// `novelty_score` is left `None` on every window; call [`attach_novelty`] later.
     pub fn generate(

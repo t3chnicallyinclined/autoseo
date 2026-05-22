@@ -48,30 +48,61 @@ pub struct CategoryCost {
 /// configured by default in autoseo. Add new entries as needed.
 ///
 /// Returns `(input_cost_per_1k, output_cost_per_1k)`.
+///
+/// **Match order matters**: more-specific entries must come first because
+/// `m if m.contains("whisper")` would shadow `m == "whisper-large-v3-turbo"`
+/// if put in the wrong order. Groq's turbo whisper is ~3× cheaper than the
+/// non-turbo; collapsing them into one rate overestimates by 3× on turbo.
+///
+/// Source: provider pricing pages as of 2026-05.
 fn model_rate(model: &str) -> (f64, f64) {
-    // Rates in USD per 1K tokens. Source: provider pricing pages as of 2026-05.
     match model {
-        // OpenAI
+        // ── Groq chat models ────────────────────────────────────────────
+        // From console.groq.com/pricing. Convert per-1M → per-1K: ×0.001.
+        "openai/gpt-oss-120b" => (0.00015, 0.00075),
+        "openai/gpt-oss-20b" => (0.000075, 0.0003),
+        "meta-llama/llama-4-scout-17b-16e-instruct" => (0.00011, 0.00034),
+        "llama-3.3-70b-versatile" => (0.00059, 0.00079),
+        "llama-3.1-8b-instant" => (0.00005, 0.00008),
+        "qwen/qwen3-32b" => (0.00029, 0.00059),
+
+        // ── Groq STT — priced per audio-second, not tokens ──────────────
+        // Caller (record_stt_call) converts seconds → "tokens" at 25/sec,
+        // so per-1K-token rates here back out to the real per-second cost.
+        // Groq whisper-large-v3-turbo: $0.04/hr ≈ $0.0000111/sec ≈ $0.000444/1K toks.
+        // Groq whisper-large-v3      : $0.111/hr ≈ $0.0000308/sec ≈ $0.00123/1K toks.
+        "whisper-large-v3-turbo" => (0.000444, 0.0),
+        "whisper-large-v3" => (0.00123, 0.0),
+
+        // ── OpenAI ──────────────────────────────────────────────────────
         m if m.starts_with("gpt-5.2-pro") => (0.002, 0.010),
         m if m.starts_with("gpt-5") => (0.002, 0.010),
         m if m.starts_with("gpt-4o") => (0.0025, 0.010),
         m if m.starts_with("gpt-4") => (0.01, 0.03),
-
-        // Groq STT (whisper) — priced per audio-second, not tokens.
-        // We approximate: 1 audio-second ≈ 25 tokens at $0.111/hr ≈ $0.0000308/sec
-        // → ~$0.00123 per 1K "tokens". Use zero output cost.
+        // OpenAI's older whisper-1 — billed per minute of audio. ~$0.006/min
+        // → $0.0001/sec → 25 tokens/sec → $0.004/1K "tokens".
+        "whisper-1" => (0.004, 0.0),
+        // Whisper fallback for any other variant (defensive).
         m if m.contains("whisper") => (0.00123, 0.0),
 
-        // HuggingFace Inference Providers — embeddings are priced per request
-        // or per token depending on provider. Approximation for bge-large:
+        // ── HuggingFace Inference Providers ─────────────────────────────
         m if m.contains("bge") || m.contains("embed") => (0.0001, 0.0),
-
-        // Qwen VLM models via HF
         m if m.contains("Qwen3-VL-8B") || m.contains("qwen3-vl-8b") => (0.0003, 0.0006),
         m if m.contains("qwen2.5-vl-72b") || m.contains("Qwen2.5-VL-72B") => (0.001, 0.002),
 
-        // OpenRouter VLM pricing varies; reasonable default.
-        _ => (0.001, 0.003),
+        // ── Anthropic via OpenRouter (rough per-1M rates as of 2026-05) ──
+        m if m.contains("claude-opus-4.7") || m.contains("claude-opus-4-7") => (0.015, 0.075),
+        m if m.contains("claude-sonnet-4.6") || m.contains("claude-sonnet-4-6") => (0.003, 0.015),
+        m if m.contains("claude-haiku-4.5") || m.contains("claude-haiku-4-5") => (0.001, 0.005),
+
+        // ── Catch-all ───────────────────────────────────────────────────
+        // Picked to be roughly OpenRouter "mid-tier" so unknown premium VLM
+        // models on OpenRouter aren't wildly under-counted. Logs a warning
+        // so we can spot missing entries in production.
+        _ => {
+            tracing::warn!(model, "unknown model in cost.rs::model_rate — using catch-all rate; add to the match arm");
+            (0.001, 0.003)
+        }
     }
 }
 
@@ -407,6 +438,40 @@ mod tests {
 
         let (i, _) = model_rate("whisper-large-v3-turbo");
         assert!(i > 0.0);
+    }
+
+    #[test]
+    fn groq_rates_are_cheaper_than_fallback() {
+        // Regression guard: the bug we just fixed was Groq models falling
+        // through to the OpenRouter-tier catch-all rate, overcharging ~5×.
+        let (fallback_in, fallback_out) = model_rate("some-unknown-model");
+        let (groq_in, groq_out) = model_rate("openai/gpt-oss-120b");
+        assert!(
+            groq_in < fallback_in,
+            "Groq input rate ({groq_in}) should be < fallback ({fallback_in})"
+        );
+        assert!(
+            groq_out < fallback_out,
+            "Groq output rate ({groq_out}) should be < fallback ({fallback_out})"
+        );
+    }
+
+    #[test]
+    fn turbo_whisper_cheaper_than_non_turbo() {
+        // Specificity check: whisper-large-v3-turbo must NOT collapse into
+        // the generic whisper rate. Turbo is ~3× cheaper on Groq.
+        let (turbo, _) = model_rate("whisper-large-v3-turbo");
+        let (v3, _) = model_rate("whisper-large-v3");
+        assert!(turbo < v3, "turbo ({turbo}) should be cheaper than v3 ({v3})");
+    }
+
+    #[test]
+    fn llama_4_scout_priced_low() {
+        // VLM lane runs on Llama 4 Scout via Groq. Should be ~$0.0001/$0.0003,
+        // not the $0.001/$0.003 catch-all.
+        let (in_rate, out_rate) = model_rate("meta-llama/llama-4-scout-17b-16e-instruct");
+        assert!(in_rate < 0.0005, "Scout input ({in_rate}) too high");
+        assert!(out_rate < 0.001, "Scout output ({out_rate}) too high");
     }
 
     #[test]

@@ -17,6 +17,8 @@
 //! `post_complete`, `stat_update`, `cost_update`, `agent_status`.
 
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 /// Capacity of the broadcast channel. Late/slow readers get `Lagged` and can
@@ -76,6 +78,29 @@ pub enum PipelineEvent {
         /// `posted` or `failed`.
         status: String,
     },
+
+    /// Per-stage progress + free-text detail. Drives both the small sub-
+    /// stage chips (VAD / Prosody / Scene / Embed / Ling) and the inline
+    /// status text under each main stage card (ingest / audio / transcribe
+    /// / rank / render / post). The optional `message` carries the
+    /// human-readable "what's happening right now" ("chunk 5/21", "dropped
+    /// 14 hallucinated words", "rendering clip 3 (9x16)") that the
+    /// dashboard surfaces both inline and in the Activity Log.
+    PipelineStage {
+        #[serde(rename = "jobId")]
+        job_id: String,
+        #[serde(rename = "stageId")]
+        stage_id: String,
+        /// One of `done` | `active` | `idle` | `failed`.
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress: Option<u8>,
+        /// One-line description of the current step within this stage. Free
+        /// text. Optional so existing emit sites that don't need a message
+        /// can keep using None.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 /// Map an internal job status string to the dashboard's (status, stage, progress).
@@ -108,20 +133,60 @@ pub fn dashboard_view(internal_status: &str) -> (&'static str, &'static str, u8)
 }
 
 /// Thin wrapper around `tokio::sync::broadcast` for pipeline events.
+///
+/// Also keeps a **per-stage snapshot** of the most recent `PipelineStage`
+/// event keyed by `stage_id`. Late-joining WS clients (browser tab opens
+/// AFTER a stage's events have already fired) get the snapshot replayed
+/// on connect so they don't see an empty Activity Log for the half of the
+/// pipeline that already ran. Standard 12-factor broadcast otherwise.
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<PipelineEvent>,
+    /// stage_id → most recent PipelineStage event. Bounded by the number of
+    /// distinct stage ids the pipeline ever emits (~12-15 today). std::sync
+    /// RwLock because emit() is a sync API; critical sections are O(1).
+    stage_snapshot: Arc<RwLock<HashMap<String, PipelineEvent>>>,
+}
+
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Broadcast::Sender doesn't impl Debug, so we just print a marker.
+        // Required because AiPipeline (which holds an Option<EventBus>) is
+        // #[derive(Debug)] and tracing macros frequently want it printable.
+        f.debug_struct("EventBus")
+            .field("receivers", &self.tx.receiver_count())
+            .finish()
+    }
 }
 
 impl EventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            stage_snapshot: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     /// Send an event. Returns Ok even if there are no receivers
     /// (fire-and-forget — silent drop is correct when no dashboard is open).
+    /// `PipelineStage` events are also stored in the per-stage snapshot so
+    /// new WS subscribers can replay them on connect.
     pub fn emit(&self, event: PipelineEvent) {
+        if let PipelineEvent::PipelineStage { stage_id, .. } = &event {
+            // Short critical section: clone the key + replace the value.
+            // Poisoned lock means a prior emit panicked mid-write; recover
+            // by clearing — the only consequence is one lost snapshot.
+            let mut guard = match self.stage_snapshot.write() {
+                Ok(g) => g,
+                Err(p) => {
+                    let mut g = p.into_inner();
+                    g.clear();
+                    g
+                }
+            };
+            guard.insert(stage_id.clone(), event.clone());
+        }
         let _ = self.tx.send(event);
     }
 
@@ -129,6 +194,29 @@ impl EventBus {
     /// cursor into the broadcast channel.
     pub fn subscribe(&self) -> broadcast::Receiver<PipelineEvent> {
         self.tx.subscribe()
+    }
+
+    /// Return all currently-snapshotted `PipelineStage` events. Caller (the
+    /// WS handler) sends these to a freshly-connected client BEFORE tailing
+    /// the live broadcast, so the dashboard's Activity Log + stage cards
+    /// reflect the full history of the in-flight job even if the browser
+    /// connected mid-pipeline.
+    pub fn stage_snapshot(&self) -> Vec<PipelineEvent> {
+        match self.stage_snapshot.read() {
+            Ok(guard) => guard.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Clear the snapshot. Called between jobs (or on demand) so a new
+    /// job's connecting clients don't see stale "done" states from the
+    /// previous one. Currently unused — kept here for future job-boundary
+    /// hooks.
+    #[allow(dead_code)]
+    pub fn reset_stage_snapshot(&self) {
+        if let Ok(mut guard) = self.stage_snapshot.write() {
+            guard.clear();
+        }
     }
 }
 

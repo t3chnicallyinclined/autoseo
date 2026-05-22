@@ -40,6 +40,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sink, mut incoming) = socket.split();
     let mut rx = state.event_bus.subscribe();
 
+    // Replay the per-stage snapshot to this fresh client so it sees the
+    // history of stages that already ran. Without this, opening the
+    // dashboard mid-pipeline shows green stages with no inline detail —
+    // the messages already fired and went into the void before this WS
+    // connection existed. The reducer's PIPELINE_STAGE handler merges
+    // these in just like a live event.
+    for ev in state.event_bus.stage_snapshot() {
+        let json = serde_json::to_string(&ev)
+            .unwrap_or_else(|_| r#"{"type":"error","message":"serialization failed"}"#.to_string());
+        if sink.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             // Server → client: forward broadcast events as JSON text frames.

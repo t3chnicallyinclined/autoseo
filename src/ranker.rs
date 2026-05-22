@@ -54,6 +54,12 @@ pub struct Ranker {
     /// Pre-formatted performance history block to inject via `{{performance_history}}`.
     /// Empty string when no history is available (backward-compatible).
     pub performance_history: String,
+    /// Target clip duration injected into the user prompt as `{{target_secs}}`.
+    /// Mirrors the `CandidateGenerator` config so the LLM refines within
+    /// the same range the candidate windows were generated from.
+    pub clip_target_secs: f64,
+    pub clip_min_secs: f64,
+    pub clip_max_secs: f64,
 }
 
 impl Ranker {
@@ -71,7 +77,20 @@ impl Ranker {
             batch_size: 10,
             refine_drift_secs: 5.0,
             performance_history: String::new(),
+            clip_target_secs: 20.0,
+            clip_min_secs: 10.0,
+            clip_max_secs: 30.0,
         }
+    }
+
+    /// Builder-style setter for the duration target placeholders. Called
+    /// from the worker with [`crate::config::Config`] values so the prompt
+    /// reflects the user's chosen min/max/target.
+    pub fn with_durations(mut self, min_secs: f64, max_secs: f64, target_secs: f64) -> Self {
+        self.clip_min_secs = min_secs;
+        self.clip_max_secs = max_secs;
+        self.clip_target_secs = target_secs.clamp(min_secs, max_secs);
+        self
     }
 
     /// Score every candidate via the LLM, batched, then return the top `top_k`
@@ -174,7 +193,10 @@ impl Ranker {
             .replace("{{hosts}}", &hosts)
             .replace("{{guest}}", &guest)
             .replace("{{performance_history}}", &self.performance_history)
-            .replace("{{current_trends}}", &trends_block);
+            .replace("{{current_trends}}", &trends_block)
+            .replace("{{min_secs}}", &format!("{:.0}", self.clip_min_secs))
+            .replace("{{max_secs}}", &format!("{:.0}", self.clip_max_secs))
+            .replace("{{target_secs}}", &format!("{:.0}", self.clip_target_secs));
         out
     }
 

@@ -4,7 +4,43 @@ services:
     env_file: .env
     volumes:
       - autoseo-work:/work
+    environment:
+      BROWSER_WORKER_URL: http://browser_worker:8090
+    depends_on:
+      - browser_worker
+    restart: unless-stopped
+
+  cloakbrowser:
+    image: cloakhq/cloakbrowser:latest
+    command: ["cloakserve"]
+    ports:
+      - "127.0.0.1:9222:9222"
+    restart: unless-stopped
+
+  # Browser worker lives in the android-agent sibling repo
+  # (/home/tris/projects/android-agent/). Originally a standalone email-signup
+  # agent; extended in-place with a FastAPI surface that satisfies autoseo's
+  # BrowserPoster contract. Clone android-agent alongside autoseo for local
+  # dev. (Earlier extraction `autoclipper-social` is archived as of 2026-05-22.)
+  browser_worker:
+    build:
+      context: ../android-agent
+      dockerfile: Dockerfile.api
+    environment:
+      CLOAK_CDP_URL: http://cloakbrowser:9222
+      PROFILES_DIR: /profiles
+      WORK_DIR: /work
+      DAILY_CAP_DEFAULT: "5"
+      LOG_LEVEL: info
+    volumes:
+      - browser-profiles:/profiles
+      - autoseo-work:/work:ro
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - cloakbrowser
     restart: unless-stopped
 
 volumes:
   autoseo-work:
+  browser-profiles:

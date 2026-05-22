@@ -37,14 +37,28 @@ pub struct VlmReranker {
 }
 
 impl VlmReranker {
-    /// Build from config. Returns `None` when not enabled or HF key is missing.
+    /// Build from config. Returns `None` when the lane is disabled or no
+    /// usable API key is configured. Picks `VLM_API_KEY` + `VLM_BASE_URL`
+    /// when set, otherwise falls back to `HF_API_KEY` + `HF_ROUTER_URL` so
+    /// existing HuggingFace setups keep working without changes.
     pub fn from_config(cfg: &Config, cost_tracker: Option<&CostTracker>) -> Option<Self> {
         if !cfg.vlm_rerank_enabled {
             return None;
         }
-        let key = cfg.hf_api_key.as_ref().filter(|k| !k.is_empty())?.clone();
-        // The OpenAI-compatible chat endpoint lives under {router}/v1.
-        let base_url = format!("{}/v1", cfg.hf_router_url.trim_end_matches('/'));
+        let key = cfg
+            .vlm_api_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .or(cfg.hf_api_key.as_ref().filter(|k| !k.is_empty()))?
+            .clone();
+        let raw_base = cfg
+            .vlm_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(cfg.hf_router_url.as_str());
+        // Strip any user-supplied `/v1` so we don't double it. The OpenAI-
+        // compatible chat endpoint lives at {base}/v1/chat/completions.
+        let base_url = format!("{}/v1", crate::openai::normalize_base_url(raw_base));
         Some(Self {
             base_url,
             api_key: key,

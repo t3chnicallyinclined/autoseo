@@ -315,13 +315,8 @@ async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
             let updated_at: i64 = row.get(6).unwrap_or(0);
             let error: Option<String> = row.get(7).ok();
 
-            let clips_generated: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM clips WHERE job_id = ?1",
-                    rusqlite::params![&id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
+            let (clips_generated, posts_success, posts_total) =
+                job_counts_blocking(&conn, &id);
 
             out.push(map_job_json(
                 &id,
@@ -333,6 +328,8 @@ async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
                 updated_at,
                 error.as_deref(),
                 clips_generated,
+                posts_success,
+                posts_total,
             ));
         }
         Ok(out)
@@ -364,8 +361,8 @@ async fn get_job(
 
     let conn = state.storage.conn();
     let job_id = id.clone();
-    let (clips_generated, clips_summary) = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(i64, Vec<Value>)> {
+    let (clips_generated, posts_success, posts_total, clips_summary) = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(i64, i64, i64, Vec<Value>)> {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare(
                 "SELECT id, start_ms, end_ms, rank, score, hook \
@@ -389,13 +386,13 @@ async fn get_job(
                     "hook": hook,
                 }));
             }
-            let count = summary.len() as i64;
-            Ok((count, summary))
+            let (clips, posts_success, posts_total) = job_counts_blocking(&conn, &job_id);
+            Ok((clips, posts_success, posts_total, summary))
         },
     )
     .await
-    .unwrap_or(Ok((0, vec![])))
-    .unwrap_or((0, vec![]));
+    .unwrap_or(Ok((0, 0, 0, vec![])))
+    .unwrap_or((0, 0, 0, vec![]));
 
     let mut body = map_job_json(
         &row.id,
@@ -407,6 +404,8 @@ async fn get_job(
         row.updated_at,
         row.error.as_deref(),
         clips_generated,
+        posts_success,
+        posts_total,
     );
     if let Some(obj) = body.as_object_mut() {
         obj.insert("clips".into(), Value::Array(clips_summary));
@@ -456,11 +455,16 @@ async fn retry_job(
         .ok()
         .flatten()
         .unwrap_or(row);
-    let body = map_job_json_from_row(&refreshed, 0);
+    let body = map_job_json_from_row(&refreshed, 0, 0, 0);
     Ok(Json(body))
 }
 
-fn map_job_json_from_row(row: &JobRow, clips_generated: i64) -> Value {
+fn map_job_json_from_row(
+    row: &JobRow,
+    clips_generated: i64,
+    posts_success: i64,
+    posts_total: i64,
+) -> Value {
     map_job_json(
         &row.id,
         row.show_slug.as_deref(),
@@ -471,7 +475,41 @@ fn map_job_json_from_row(row: &JobRow, clips_generated: i64) -> Value {
         row.updated_at,
         row.error.as_deref(),
         clips_generated,
+        posts_success,
+        posts_total,
     )
+}
+
+/// Count (clips, posts_success, posts_total) for a job in a single blocking
+/// pass. Used by both list_jobs and get_job so the response always reflects
+/// real post-success rates instead of the hardcoded 0/0.
+fn job_counts_blocking(conn: &rusqlite::Connection, job_id: &str) -> (i64, i64, i64) {
+    let clips: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM clips WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let posts_total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM posts p \
+             JOIN clips c ON c.id = p.clip_id \
+             WHERE c.job_id = ?1",
+            rusqlite::params![job_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let posts_success: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM posts p \
+             JOIN clips c ON c.id = p.clip_id \
+             WHERE c.job_id = ?1 AND p.status = 'posted'",
+            rusqlite::params![job_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    (clips, posts_success, posts_total)
 }
 
 /// Shape one job row in the dashboard `Job` interface (camelCase, with
@@ -488,6 +526,8 @@ fn map_job_json(
     updated_at: i64,
     error: Option<&str>,
     clips_generated: i64,
+    posts_success: i64,
+    posts_total: i64,
 ) -> Value {
     let created_iso = chrono::DateTime::from_timestamp(created_at, 0)
         .map(|d| d.to_rfc3339())
@@ -509,8 +549,8 @@ fn map_job_json(
         "stage": stage_label,
         "progress": progress,
         "clipsGenerated": clips_generated,
-        "postsSuccess": 0,
-        "postsTotal": 0,
+        "postsSuccess": posts_success,
+        "postsTotal": posts_total,
         "cost": (cost_cents as f64) / 100.0,
         "duration": duration,
         "created": created_iso,
@@ -634,7 +674,7 @@ async fn cancel_job(
         .ok()
         .flatten()
         .unwrap_or(row);
-    Ok(Json(map_job_json_from_row(&refreshed, 0)))
+    Ok(Json(map_job_json_from_row(&refreshed, 0, 0, 0)))
 }
 
 /// POST /api/jobs/:id/rerun — clones the job to a new id pointing at the same
@@ -660,7 +700,7 @@ async fn rerun_job(
         })?;
     let refreshed = state.storage.get_job(&new_id).await.ok().flatten();
     let body = match refreshed {
-        Some(row) => map_job_json_from_row(&row, 0),
+        Some(row) => map_job_json_from_row(&row, 0, 0, 0),
         // Defensive — the row was just inserted; if it's already gone,
         // surface the new id at least so the dashboard can navigate.
         None => json!({"id": new_id, "status": "pending"}),

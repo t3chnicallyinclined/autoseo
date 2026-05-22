@@ -137,6 +137,111 @@ pub struct Config {
     #[arg(long, env = "CLIP_RENDER_FORMATS", default_value = "9x16,1x1,16x9")]
     pub clip_render_formats: String,
 
+    /// libx264 CRF for clip renders. **Lower = higher quality**. Defaults
+    /// to `18` (visually lossless) — treats every clip as a master that
+    /// the platform will re-encode further. Drop to `16` for absolute
+    /// master grade (~2× file size), or `23` to match the old "balanced"
+    /// output. Valid range: 0 (truly lossless, huge files) — 51 (worst).
+    #[arg(long, env = "CLIP_VIDEO_CRF", default_value_t = 18)]
+    pub clip_video_crf: u32,
+
+    /// libx264 preset. Slower presets compress better at the same CRF.
+    /// `slow` is the master default — ~1.5× the wall time of `medium`
+    /// for a notable bitrate/size win at identical quality. Accepted:
+    /// `ultrafast` / `superfast` / `veryfast` / `faster` / `fast` /
+    /// `medium` / `slow` / `slower` / `veryslow` / `placebo`.
+    #[arg(long, env = "CLIP_VIDEO_PRESET", default_value = "slow")]
+    pub clip_video_preset: String,
+
+    /// AAC audio bitrate in kbps for clip renders. `192` is the master
+    /// default — clips are short so extra bits cost negligible disk.
+    /// Drop to `128` for "balanced" output; `256` buys little for voice.
+    #[arg(long, env = "CLIP_AUDIO_BITRATE_KBPS", default_value_t = 192)]
+    pub clip_audio_bitrate_kbps: u32,
+
+    // ── Clip duration & detection ───────────────────────────────────────
+
+    /// Minimum candidate clip duration in seconds. Defaults to **10s** —
+    /// short-form sweet spot. Bump to 25+ for monologue/explainer formats.
+    /// Floored at 5s by the candidate generator to keep transcription
+    /// + caption work usable.
+    #[arg(long, env = "CLIP_MIN_SECS", default_value_t = 10.0)]
+    pub clip_min_secs: f64,
+
+    /// Maximum candidate clip duration in seconds. Defaults to **30s** —
+    /// keeps clips inside the TikTok/IG Reels native short-form window.
+    /// Raise to 60-90s if you want longer YouTube Shorts-friendly clips.
+    #[arg(long, env = "CLIP_MAX_SECS", default_value_t = 30.0)]
+    pub clip_max_secs: f64,
+
+    /// Target candidate duration the generator aims for. The LLM ranker is
+    /// told to refine windows around this length; if you set it outside
+    /// `[CLIP_MIN_SECS, CLIP_MAX_SECS]` it's clamped. Defaults to **20s**.
+    #[arg(long, env = "CLIP_TARGET_SECS", default_value_t = 20.0)]
+    pub clip_target_secs: f64,
+
+    /// Stride between candidate proposals in seconds. Smaller stride =
+    /// denser candidate grid (more LLM tokens; higher recall). Default 15s
+    /// balances coverage against ranker cost for 10-30s clips.
+    #[arg(long, env = "CLIP_STRIDE_SECS", default_value_t = 15.0)]
+    pub clip_stride_secs: f64,
+
+    /// Minimum word count required for a candidate window to survive
+    /// filtering. Silent or near-silent spans are useless to the ranker.
+    /// Default 15 (lower than the 25s-clip default of 30 because shorter
+    /// clips have fewer words).
+    #[arg(long, env = "CLIP_MIN_WORDS", default_value_t = 15)]
+    pub clip_min_words: usize,
+
+    // ── Caption typography ──────────────────────────────────────────────
+
+    /// Caption font point size for **9:16 vertical** renders. When unset
+    /// (0), uses the per-aspect default baked into [`crate::captions`].
+    /// Per-show captions.json still wins over this env knob.
+    #[arg(long, env = "CAPTION_FONT_SIZE_VERTICAL", default_value_t = 0)]
+    pub caption_font_size_vertical: u32,
+
+    /// Caption font point size for **1:1 square** renders. 0 = default.
+    #[arg(long, env = "CAPTION_FONT_SIZE_SQUARE", default_value_t = 0)]
+    pub caption_font_size_square: u32,
+
+    /// Caption font point size for **16:9 landscape** renders. 0 = default.
+    #[arg(long, env = "CAPTION_FONT_SIZE_LANDSCAPE", default_value_t = 0)]
+    pub caption_font_size_landscape: u32,
+
+    /// Hook-overlay font size for **9:16 vertical** renders. 0 = default.
+    #[arg(long, env = "CAPTION_OVERLAY_FONT_SIZE_VERTICAL", default_value_t = 0)]
+    pub caption_overlay_font_size_vertical: u32,
+
+    /// Hook-overlay font size for **1:1 square** renders. 0 = default.
+    #[arg(long, env = "CAPTION_OVERLAY_FONT_SIZE_SQUARE", default_value_t = 0)]
+    pub caption_overlay_font_size_square: u32,
+
+    /// Hook-overlay font size for **16:9 landscape** renders. 0 = default.
+    #[arg(long, env = "CAPTION_OVERLAY_FONT_SIZE_LANDSCAPE", default_value_t = 0)]
+    pub caption_overlay_font_size_landscape: u32,
+
+    /// Master switch for burning karaoke captions into the rendered video.
+    /// Off = clean speakerphones with no overlay (good for explainers that
+    /// will get manual captions on the platform side).
+    #[arg(long, env = "CAPTION_BURN_ENABLED", default_value_t = true)]
+    pub caption_burn_enabled: bool,
+
+    /// Master switch for the hook overlay (top-of-frame title text).
+    /// Off = pure captions, no hook headline.
+    #[arg(long, env = "CAPTION_HOOK_OVERLAY_ENABLED", default_value_t = true)]
+    pub caption_hook_overlay_enabled: bool,
+
+    // ── STT hallucination guard strictness ──────────────────────────────
+
+    /// Hallucination-guard strictness for whisper transcripts.
+    /// - `lax`: only foreign-script + extreme repetition detected
+    /// - `default`: balanced (recommended)
+    /// - `strict`: aggressive — also drops low-word-density chunks &
+    ///   anything VAD flags as silence-dominant
+    #[arg(long, env = "STT_HALLUCINATION_GUARD", default_value = "default")]
+    pub stt_hallucination_guard: String,
+
     /// Which platforms to post to. Comma-separated, any of: `youtube`, `bluesky`,
     /// `instagram`, `ayrshare`. Default empty (no posting). Posting also requires
     /// `POST_DRY_RUN=false` to actually send — both knobs are opt-in for safety.
@@ -202,6 +307,58 @@ pub struct Config {
     #[arg(long, env = "AYRSHARE_PLATFORMS", default_value = "tiktok,instagram")]
     pub ayrshare_platforms: String,
 
+    // --- Browser-backed posting (android-agent sidecar) ---
+    /// Master switch for talking to the android-agent browser worker at all.
+    /// When false (default), autoseo never constructs `Platform::Browser`
+    /// instances and the dashboard hides browser-posting UI. Flip to true to
+    /// enable the path; `POSTING_BACKEND` below then determines fan-out.
+    #[arg(long, env = "BROWSER_POSTING_ENABLED", default_value_t = false)]
+    pub browser_posting_enabled: bool,
+
+    /// Which posting backend to use when `BROWSER_POSTING_ENABLED=true`.
+    /// `api` (default) uses the existing HTTP API posters
+    /// (YouTube/Bluesky/Instagram-Graph/Ayrshare). `browser` routes all
+    /// enabled platforms through the android-agent worker. `mixed`
+    /// constructs both — useful while migrating one platform at a time.
+    /// Ignored when `BROWSER_POSTING_ENABLED=false`.
+    #[arg(long, env = "POSTING_BACKEND", default_value = "api")]
+    pub posting_backend: String,
+
+    /// HTTP base URL for the browser_worker sidecar. In docker compose this is
+    /// `http://browser_worker:8090`; for local dev override to `http://localhost:8090`.
+    #[arg(
+        long,
+        env = "BROWSER_WORKER_URL",
+        default_value = "http://localhost:8090"
+    )]
+    pub browser_worker_url: String,
+
+    /// All known browser-backed accounts. Comma-separated `platform:account_id`
+    /// pairs. Example: `x:tris_main,x:tris_alt,linkedin:tris_pro`. Each pair
+    /// becomes its own `Platform::Browser` entry; the worker maintains a
+    /// persistent profile per pair on disk.
+    #[arg(long, env = "BROWSER_ACCOUNTS", default_value = "")]
+    pub browser_accounts: String,
+
+    /// Subset of `BROWSER_ACCOUNTS` used by the *automatic* post path
+    /// (one primary per platform). Manual dashboard posts can target any
+    /// account. Example: `x:tris_main,linkedin:tris_pro`. If empty, the first
+    /// account per platform in `BROWSER_ACCOUNTS` is treated as primary.
+    #[arg(long, env = "BROWSER_PRIMARY_ACCOUNTS", default_value = "")]
+    pub browser_primary_accounts: String,
+
+    /// Default daily posts-per-account cap when no per-platform override is set.
+    /// Overrides via `BROWSER_POST_DAILY_CAP_<PLATFORM_UPPER>` (e.g.
+    /// `BROWSER_POST_DAILY_CAP_X=3`).
+    #[arg(long, env = "BROWSER_POST_DAILY_CAP_DEFAULT", default_value_t = 5)]
+    pub browser_post_daily_cap_default: u32,
+
+    /// Enable CloakBrowser's humanize mode (Bézier mouse paths, per-char
+    /// typing, scroll easing). Adds latency in exchange for less mechanical
+    /// behavior. Recommended on.
+    #[arg(long, env = "BROWSER_HUMANIZE", default_value_t = true)]
+    pub browser_humanize: bool,
+
     /// Hugging Face API key (used for HF Inference Providers — embeddings + VLM re-rank).
     /// When set, the clipper routes embeddings through HF instead of the local
     /// `fastembed` ONNX model. Required to enable VLM re-rank.
@@ -237,17 +394,31 @@ pub struct Config {
     #[arg(long, env = "VLM_RERANK_ENABLED", default_value_t = false)]
     pub vlm_rerank_enabled: bool,
 
-    /// Vision-language model id on HF (for re-rank). Qwen3-VL-8B-Instruct is the
-    /// current pick for long-video understanding at this size class. The
-    /// `:novita` suffix routes via the Novita Inference Provider, which actively
-    /// serves this model — bare `Qwen/Qwen3-VL-8B-Instruct` against
-    /// `hf-inference` returns "model_not_available" today.
+    /// Vision-language model id (any OpenAI-compatible chat endpoint that
+    /// accepts `image_url` content blocks). Defaults to Qwen3-VL-8B via HF
+    /// Inference / Novita; users on Groq can point at
+    /// `meta-llama/llama-4-scout-17b-16e-instruct` instead by also setting
+    /// VLM_BASE_URL + VLM_API_KEY.
     #[arg(
         long,
         env = "VLM_MODEL",
         default_value = "Qwen/Qwen3-VL-8B-Instruct:novita"
     )]
     pub vlm_model: String,
+
+    /// Base URL for the standard VLM re-rank lane. When unset, falls back to
+    /// `HF_ROUTER_URL` so existing HuggingFace-keyed setups keep working with
+    /// no migration. Set this (plus `VLM_API_KEY`) to route the VLM lane
+    /// through Groq (`https://api.groq.com/openai`), OpenRouter, or any other
+    /// OpenAI-compatible host.
+    #[arg(long, env = "VLM_BASE_URL")]
+    pub vlm_base_url: Option<String>,
+
+    /// API key for the standard VLM re-rank lane. When unset, falls back to
+    /// `HF_API_KEY`. Pair with `VLM_BASE_URL` to consolidate VLM onto a
+    /// non-HF provider (e.g. the same key you already use for Groq chat/STT).
+    #[arg(long, env = "VLM_API_KEY")]
+    pub vlm_api_key: Option<String>,
 
     /// How many candidates the LLM ranker passes to the VLM re-rank pass.
     /// VLM-re-ranked candidates are then truncated to `CLIP_TOP_K`.
@@ -346,12 +517,17 @@ pub struct Config {
     #[arg(long, env = "AUTO_CHUNK_TARGET_FACTOR", default_value_t = 2)]
     pub auto_chunk_target_factor: usize,
 
-    /// If >0, override the chunk target calculation (e.g., 400 chunks divides duration by 400). Set 0 to disable.
-    #[arg(long, env = "AUTO_CHUNK_TARGET_CHUNKS", default_value_t = 400)]
+    /// If >0, override the chunk target calculation (e.g., 60 chunks divides
+    /// duration by 60). Set 0 to fall back to `concurrency * target_factor`.
+    /// 60 is tuned for Groq's free-tier whisper-large-v3-turbo: a 1hr episode
+    /// becomes 60 × 60-second chunks → ~3.5 min wall time at 18 RPM.
+    #[arg(long, env = "AUTO_CHUNK_TARGET_CHUNKS", default_value_t = 60)]
     pub auto_chunk_target_chunks: usize,
 
-    /// Minimum chunk length enforced by auto chunking (seconds).
-    #[arg(long, env = "AUTO_CHUNK_MIN_SECS", default_value_t = 10)]
+    /// Minimum chunk length enforced by auto chunking (seconds). Going below
+    /// ~30s for word-timestamp STT wastes request budget without improving
+    /// boundary accuracy on a per-RPM-limited provider.
+    #[arg(long, env = "AUTO_CHUNK_MIN_SECS", default_value_t = 30)]
     pub auto_chunk_min_secs: u64,
 
     /// Maximum chunk length enforced by auto chunking (seconds).
@@ -371,12 +547,29 @@ pub struct Config {
     #[arg(long, env = "WHISPER_MODEL_PATH")]
     pub whisper_model_path: Option<String>,
 
-    /// Maximum number of concurrent STT requests (limits Whisper RPM usage).
-    #[arg(long, env = "STT_CONCURRENCY", default_value_t = 500)]
+    /// Maximum number of concurrent STT requests. Tuned for Groq free tier
+    /// (20 RPM cap) — pushing above 8 just queues behind the RPM gate and
+    /// inflates 429s without throughput gain. Users on Dev/Pro tiers should
+    /// raise this (e.g. 32) plus `STT_RPM_LIMIT` together.
+    #[arg(long, env = "STT_CONCURRENCY", default_value_t = 8)]
     pub stt_concurrency: usize,
 
-    /// Optional STT requests-per-minute cap (0 disables). Useful to push near provider RPM without 429s.
-    #[arg(long, env = "STT_RPM_LIMIT", default_value_t = 0)]
+    /// Maximum number of concurrent ffmpeg render processes. **`0` (default) =
+    /// auto** — detect logical cores via `std::thread::available_parallelism()`
+    /// and pick `cores / 4` clamped to `[1, 8]`. Each ffmpeg `-preset medium`
+    /// encode pegs ~3-4 cores, so this scales to the box: 1 on a 4-core
+    /// laptop, 4 on a 16-core workstation, 8 on a 32+-core server.
+    ///
+    /// Set an explicit non-zero value to pin (e.g. `RENDER_CONCURRENCY=1` to
+    /// preserve the old sequential behavior, or `RENDER_CONCURRENCY=12` if
+    /// your disk can sustain more than the auto cap).
+    #[arg(long, env = "RENDER_CONCURRENCY", default_value_t = 0)]
+    pub render_concurrency: usize,
+
+    /// STT requests-per-minute cap (0 disables). 18 leaves headroom under
+    /// Groq free tier's 20 RPM for `whisper-large-v3-turbo`; set 0 if your
+    /// provider is unmetered, raise to ~95 on Groq Dev tier (100 RPM).
+    #[arg(long, env = "STT_RPM_LIMIT", default_value_t = 18)]
     pub stt_rpm_limit: u32,
 
     /// Number of thumbnail timestamps to request from the LLM.
@@ -560,8 +753,52 @@ pub struct Config {
     )]
     pub ast_model_url: String,
 
+    /// Master switch for active-speaker detection (ASD). When true (default),
+    /// the clipper runs face detection + landmark-based speaker selection per
+    /// clip and uses the resulting trajectory to pan the 9:16 crop. When false,
+    /// every clip falls back to a static centered crop. The legacy
+    /// `SCRFD_ENABLED` flag is honored for backwards compat but the new
+    /// recommended path is `ASD_ENABLED=true` + `FACE_DETECTOR=yunet`.
+    #[arg(long, env = "ASD_ENABLED", default_value_t = true)]
+    pub asd_enabled: bool,
+
+    /// Which face detector implementation drives ASD. `yunet` (default) — the
+    /// OpenCV Zoo YuNet ONNX, ~340 KB, no auth gate. `scrfd` — legacy SCRFD
+    /// path; mirrored models often have output-shape drift and are kept
+    /// behind an opt-in for users who source matching weights.
+    #[arg(long, env = "FACE_DETECTOR", default_value = "yunet")]
+    pub face_detector: String,
+
+    /// URL to download the YuNet ONNX model from on first use. Saved to
+    /// `{WORK_DIR}/models/yunet/face_detection_yunet_2023mar.onnx`.
+    #[arg(
+        long,
+        env = "YUNET_MODEL_URL",
+        default_value = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+    )]
+    pub yunet_model_url: String,
+
+    /// YuNet input resolution (square). 320 keeps inference cheap on CPU while
+    /// retaining usable accuracy for podcast-style framing (one or two faces
+    /// roughly center-frame). Bump to 640 for crowd scenes.
+    #[arg(long, env = "YUNET_INPUT_SIZE", default_value_t = 320)]
+    pub yunet_input_size: u32,
+
+    /// YuNet confidence threshold (post sqrt(conf*iou) blending). 0.6 is the
+    /// upstream OpenCV demo default; lower to 0.5 if real faces are being
+    /// dropped, raise to 0.7 if background noise frames are leaking through.
+    #[arg(long, env = "YUNET_CONF_THRESHOLD", default_value_t = 0.6)]
+    pub yunet_conf_threshold: f32,
+
+    /// YuNet NMS IoU threshold. Overlapping boxes above this are suppressed.
+    #[arg(long, env = "YUNET_NMS_THRESHOLD", default_value_t = 0.3)]
+    pub yunet_nms_threshold: f32,
+
     /// Enable SCRFD face detection for active-speaker crop. Requires the ONNX
     /// model file; auto-downloads on first use if `SCRFD_MODEL_URL` is set.
+    ///
+    /// Deprecated: prefer `ASD_ENABLED=true` + `FACE_DETECTOR=scrfd` if you
+    /// need the SCRFD lane. Kept for env-file backwards compat.
     #[arg(long, env = "SCRFD_ENABLED", default_value_t = false)]
     pub scrfd_enabled: bool,
 
@@ -657,4 +894,19 @@ pub struct Config {
     /// persisted to `jobs.cost_cents` in the database.
     #[arg(long, env = "COST_TRACKING_ENABLED", default_value_t = true)]
     pub cost_tracking_enabled: bool,
+}
+
+impl Config {
+    /// Resolve `render_concurrency`, honoring `0` as "auto". When auto, picks
+    /// a value from [`crate::system_specs::auto_render_concurrency`] based on
+    /// the host CPU count; otherwise returns the explicit setting (floored at
+    /// 1 so a misconfigured `RENDER_CONCURRENCY=0` doesn't deadlock).
+    pub fn effective_render_concurrency(&self) -> usize {
+        if self.render_concurrency == 0 {
+            let specs = crate::system_specs::SystemSpecs::detect();
+            crate::system_specs::auto_render_concurrency(&specs)
+        } else {
+            self.render_concurrency.max(1)
+        }
+    }
 }

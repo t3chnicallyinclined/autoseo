@@ -76,14 +76,29 @@ impl ConfigStore {
     }
 
     /// Merge partial updates into the config and persist to disk.
+    ///
+    /// For secret keys, an incoming string that still carries the mask
+    /// sentinel (`•`) is ignored — that's the value the dashboard just got
+    /// from `get_masked()` and is round-tripping back unchanged. Without
+    /// this guard, the round-trip silently overwrites the real secret with
+    /// its own display mask.
     pub async fn patch(&self, updates: HashMap<String, serde_json::Value>) -> Result<()> {
         let mut data = self.data.write().await;
         for (k, v) in updates {
             if v.is_null() {
                 data.values.remove(&k);
-            } else {
-                data.values.insert(k, v);
+                continue;
             }
+            if SECRET_KEYS.contains(&k.as_str()) {
+                if let Some(s) = v.as_str() {
+                    if is_masked(s) {
+                        // Keep the existing real value; the dashboard sent us
+                        // back what we showed it.
+                        continue;
+                    }
+                }
+            }
+            data.values.insert(k, v);
         }
         self.persist(&data).await
     }
@@ -97,15 +112,24 @@ impl ConfigStore {
         })
     }
 
-    /// Check if the config file exists and has any credentials set.
+    /// True when the user hasn't supplied any provider credentials yet.
+    ///
+    /// Checks both `config.json` (set via the wizard / Settings page) AND
+    /// the process environment (set via `.env` sourced at launch). Either
+    /// is sufficient — power users who manage everything in `.env` and
+    /// never touch the dashboard's setup UI shouldn't be prompted to.
     pub async fn needs_setup(&self) -> bool {
         let data = self.data.read().await;
-        // Needs setup if no secret keys have values
         !SECRET_KEYS.iter().any(|k| {
-            data.values
+            let in_config = data
+                .values
                 .get(*k)
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
+                .is_some_and(|s| !s.is_empty());
+            let in_env = std::env::var(k)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            in_config || in_env
         })
     }
 
@@ -138,6 +162,14 @@ fn mask_secret(s: &str) -> String {
     let prefix = &s[..3];
     let suffix = &s[len - 4..];
     format!("{prefix}••••{suffix}")
+}
+
+/// True if the string carries the mask sentinel — i.e. it came out of
+/// `mask_secret()` and shouldn't be persisted back as if it were a real
+/// secret. The `•` character (U+2022) is what we paint with, so its mere
+/// presence is sufficient.
+fn is_masked(s: &str) -> bool {
+    s.contains('•')
 }
 
 #[cfg(test)]
@@ -199,6 +231,67 @@ mod tests {
         assert_eq!(
             raw2.values.get("MODE").unwrap().as_str().unwrap(),
             "clipper"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_ignores_masked_secret_roundtrip() {
+        // Reproduces the bug the user actually hit: the dashboard GETs a
+        // masked secret, then PATCHes it back unchanged. Before the fix this
+        // overwrote the real value with the mask string.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let store = ConfigStore::load(path).await.unwrap();
+
+        // Seed the real secret.
+        let mut updates = HashMap::new();
+        updates.insert(
+            "OPENAI_API_KEY".to_string(),
+            serde_json::Value::String("sk-real1234567890abcd".to_string()),
+        );
+        store.patch(updates).await.unwrap();
+
+        // Simulate the dashboard sending the masked string back.
+        let masked = store.get_masked().await;
+        let masked_val = masked.values.get("OPENAI_API_KEY").unwrap().clone();
+        assert!(masked_val.as_str().unwrap().contains("••••"));
+
+        let mut updates = HashMap::new();
+        updates.insert("OPENAI_API_KEY".to_string(), masked_val);
+        store.patch(updates).await.unwrap();
+
+        // Real value must still be intact.
+        assert_eq!(
+            store.get_value("OPENAI_API_KEY").await.as_deref(),
+            Some("sk-real1234567890abcd"),
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_accepts_new_secret_value() {
+        // The mask guard must not block real updates.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let store = ConfigStore::load(path).await.unwrap();
+        let mut updates = HashMap::new();
+        updates.insert(
+            "OPENAI_API_KEY".to_string(),
+            serde_json::Value::String("sk-aaa".to_string()),
+        );
+        store.patch(updates).await.unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "OPENAI_API_KEY".to_string(),
+            serde_json::Value::String("sk-bbbbbbbbbbbbbbbb".to_string()),
+        );
+        store.patch(updates).await.unwrap();
+
+        assert_eq!(
+            store.get_value("OPENAI_API_KEY").await.as_deref(),
+            Some("sk-bbbbbbbbbbbbbbbb"),
         );
     }
 

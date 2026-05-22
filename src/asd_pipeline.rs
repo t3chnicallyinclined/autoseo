@@ -1,15 +1,15 @@
 //! End-to-end active-speaker → crop trajectory pipeline.
 //!
-//! For a single clip window, samples frames at a configurable rate, runs SCRFD
-//! face detection, elects the active speaker per frame with temporal smoothing,
-//! then applies the One-Euro filter to the elected crop centers. Returns a
-//! sparse list of `(timestamp, x_center, y_center)` keyframes in the
-//! original-frame pixel space — the renderer turns those into a piecewise
-//! crop expression.
+//! For a single clip window, samples frames at a configurable rate, runs the
+//! configured [`FaceDetector`] backend, elects the active speaker per frame
+//! with temporal smoothing, then applies the One-Euro filter to the elected
+//! crop centers. Returns a sparse list of `(timestamp, x_center, y_center)`
+//! keyframes in the original-frame pixel space — the renderer turns those
+//! into a piecewise crop expression.
 //!
-//! All stages fail soft: if SCRFD finds zero faces, or all frames are silence,
-//! or any per-frame extraction fails, the function returns `Ok(Vec::new())` and
-//! the caller falls back to static center-crop.
+//! All stages fail soft: if the detector finds zero faces, or all frames are
+//! silence, or any per-frame extraction fails, the function returns
+//! `Ok(Vec::new())` and the caller falls back to static center-crop.
 
 use anyhow::Result;
 use std::path::Path;
@@ -17,7 +17,7 @@ use std::path::Path;
 use crate::active_speaker::{
     self, ActiveSpeakerFrame, FaceBbox, FrameFaces,
 };
-use crate::face_detect::{self, ScrfdDetector};
+use crate::face_detect::{self, FaceDetector};
 use crate::smooth::{self, CropSample, OneEuroParams};
 use crate::vad::SpeechSegment;
 
@@ -58,16 +58,19 @@ impl Default for AsdPipelineParams {
     }
 }
 
-/// Run SCRFD → ASD-with-smoothing → One-Euro across `[clip_start_secs, clip_end_secs)`
-/// and return a sparse trajectory of crop centers. Empty result means "use the
-/// fallback static crop".
+/// Run face-detect → ASD-with-smoothing → One-Euro across
+/// `[clip_start_secs, clip_end_secs)` and return a sparse trajectory of crop
+/// centers. Empty result means "use the fallback static crop".
+///
+/// `detector` is dispatched dynamically so callers can swap YuNet/SCRFD (or
+/// any future backend) without recompiling the pipeline.
 pub async fn compute_crop_trajectory(
     ffmpeg: &str,
     video_path: &Path,
     clip_start_secs: f64,
     clip_end_secs: f64,
     speech_segments: &[SpeechSegment],
-    detector: &ScrfdDetector,
+    detector: &dyn FaceDetector,
     params: &AsdPipelineParams,
 ) -> Result<Vec<CropKeyframe>> {
     let duration = (clip_end_secs - clip_start_secs).max(0.0);
@@ -95,7 +98,7 @@ pub async fn compute_crop_trajectory(
         let detections = match detector.detect(&rgb, w, h) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(ts, error = ?e, "asd: SCRFD inference failed; skipping");
+                tracing::warn!(ts, detector = detector.name(), error = ?e, "asd: face-detector inference failed; skipping");
                 continue;
             }
         };

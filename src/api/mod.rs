@@ -1,6 +1,9 @@
+mod auth;
 mod clips;
+mod cloudflare;
 pub mod config_store;
 mod jobs;
+mod services;
 mod stubs;
 mod ws;
 
@@ -44,6 +47,250 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+// ── System inspection ─────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct SystemResponse {
+    specs: crate::system_specs::SystemSpecs,
+    /// Effective render concurrency we'll actually use for the next job.
+    /// Reflects either `RENDER_CONCURRENCY` env override or the auto value
+    /// derived from `specs.logical_cores`.
+    render_concurrency: usize,
+    /// `true` if `RENDER_CONCURRENCY` is unset/0 and we picked the auto
+    /// value; `false` if the user explicitly pinned it.
+    render_concurrency_auto: bool,
+}
+
+/// `GET /api/system` — surface CPU / RAM / effective concurrency so the
+/// dashboard can show what we detected and tell the user whether they're
+/// being throttled by an explicit override.
+///
+/// Reads `RENDER_CONCURRENCY` straight from the process env so dashboard
+/// edits land here without a code restart (the env var is reloaded by each
+/// worker run via [`crate::config::Config::parse`]).
+async fn get_system(State(state): State<Arc<AppState>>) -> Json<SystemResponse> {
+    let _ = state;
+    let specs = crate::system_specs::SystemSpecs::detect();
+    let explicit = std::env::var("RENDER_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let (render_concurrency, render_concurrency_auto) = if explicit == 0 {
+        (crate::system_specs::auto_render_concurrency(&specs), true)
+    } else {
+        (explicit, false)
+    };
+    Json(SystemResponse {
+        specs,
+        render_concurrency,
+        render_concurrency_auto,
+    })
+}
+
+// ── Font inventory + installer ───────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct FontsResponse {
+    /// Sorted list of installed font family names. Empty when fontconfig
+    /// (`fc-list`) is unavailable on this host.
+    families: Vec<String>,
+}
+
+/// `GET /api/fonts` — enumerate font families known to the system via
+/// fontconfig. libass picks fonts by family name, so this is the truth
+/// the renderer will see. The dashboard cross-references it against its
+/// curated short-form preview catalog so users know whether their pick
+/// will actually render or fall back to DejaVu.
+async fn get_fonts() -> Json<FontsResponse> {
+    let families = list_installed_fonts().await.unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "fc-list unavailable; returning empty font list");
+        Vec::new()
+    });
+    Json(FontsResponse { families })
+}
+
+async fn list_installed_fonts() -> anyhow::Result<Vec<String>> {
+    let out = tokio::process::Command::new("fc-list")
+        .args([":", "family"])
+        .output()
+        .await?;
+    if !out.status.success() {
+        anyhow::bail!("fc-list exit {}", out.status);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut families: Vec<String> = text
+        .lines()
+        .map(|line| {
+            // fc-list emits "Family1,Family2" for fonts exposed under
+            // multiple names. Take the first — it's what libass tries
+            // first against an `Fontname:` request.
+            line.split(',').next().unwrap_or("").trim().to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    families.sort();
+    families.dedup();
+    Ok(families)
+}
+
+#[derive(serde::Deserialize)]
+struct InstallFontBody {
+    /// Google Fonts family name (e.g. "Montserrat", "Bebas Neue"). The
+    /// server hits the Google Fonts CSS API to discover the actual TTF
+    /// URLs, downloads them into `~/.fonts/autoseo/<family>/`, then runs
+    /// `fc-cache` so libass picks the new font up immediately.
+    family: String,
+    /// Optional weight subset. When omitted, installs weights 400 + 700.
+    /// Caller can pass `["400", "700", "900"]` for heavier hooks.
+    weights: Option<Vec<String>>,
+}
+
+#[derive(serde::Serialize)]
+struct InstallFontResponse {
+    family: String,
+    installed: Vec<String>,
+}
+
+/// `POST /api/fonts/install` — fetch a Google Font into `~/.fonts/autoseo/`
+/// and refresh the fontconfig cache. Idempotent — re-runs overwrite the
+/// existing files. No auth check beyond the existing bearer middleware.
+async fn install_font(Json(body): Json<InstallFontBody>) -> impl IntoResponse {
+    match install_google_font(&body.family, body.weights.as_deref()).await {
+        Ok(installed) => (
+            axum::http::StatusCode::OK,
+            Json(InstallFontResponse {
+                family: body.family,
+                installed,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(family = %body.family, error = ?e, "font install failed");
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn install_google_font(family: &str, _weights: Option<&[String]>) -> anyhow::Result<Vec<String>> {
+    // Pull TTFs straight from github.com/google/fonts via the contents
+    // API. Why not the CSS API? Google's CSS endpoint maps `font-weight:400`
+    // to whatever static TTF instance it chose for the family's default,
+    // which for some families (Montserrat, Inter) is mis-labeled as
+    // "Thin" or "Light" in the embedded font name table. fontconfig
+    // then registers those files under the wrong family name, so libass
+    // can't find them when the user picks "Montserrat".
+    //
+    // The github repo holds canonical TTFs whose `name` table actually
+    // matches the family. We try `ofl/`, `apache/`, then `ufl/` —
+    // Google Fonts splits licenses across those three folders.
+    let slug = family.to_lowercase().replace(' ', "");
+    let licenses = ["ofl", "apache", "ufl"];
+
+    let client = reqwest::Client::builder()
+        // The GitHub API rejects requests without a UA header.
+        .user_agent("autoseo-font-installer")
+        .build()?;
+
+    let mut listing: Option<(String, serde_json::Value)> = None;
+    for lic in licenses {
+        let api_url = format!("https://api.github.com/repos/google/fonts/contents/{lic}/{slug}");
+        let resp = client.get(&api_url).send().await?;
+        if resp.status().is_success() {
+            let json: serde_json::Value = resp.json().await?;
+            listing = Some((lic.to_string(), json));
+            break;
+        }
+    }
+    let (license, listing) =
+        listing.ok_or_else(|| anyhow::anyhow!("family {family:?} not found in google/fonts repo"))?;
+    let entries = listing
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("github API returned non-array contents for {family:?}"))?;
+
+    // Pick TTFs at the family root first (variable fonts ship as
+    // `Family[wght].ttf` / `Family-Italic[wght].ttf` at the top level).
+    // If only static instances exist, dive into the `static/` subdir.
+    let mut ttf_files: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("file")
+                && e.get("name")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".ttf"))
+        })
+        .collect();
+    let mut subdir_listing: Vec<serde_json::Value> = Vec::new();
+    if ttf_files.is_empty() {
+        let static_url = format!(
+            "https://api.github.com/repos/google/fonts/contents/{license}/{slug}/static"
+        );
+        let resp = client.get(&static_url).send().await?;
+        if resp.status().is_success() {
+            let json: serde_json::Value = resp.json().await?;
+            if let Some(arr) = json.as_array() {
+                subdir_listing = arr.clone();
+            }
+        }
+        ttf_files = subdir_listing
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("file")
+                    && e.get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".ttf"))
+            })
+            .collect();
+    }
+    anyhow::ensure!(!ttf_files.is_empty(), "no TTF files for {family:?} in google/fonts");
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dest_dir = std::path::PathBuf::from(home)
+        .join(".fonts")
+        .join("autoseo")
+        .join(family);
+    tokio::fs::create_dir_all(&dest_dir).await?;
+
+    let mut installed = Vec::new();
+    for entry in ttf_files.iter() {
+        let Some(download_url) = entry.get("download_url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let bytes = client
+            .get(download_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let filename = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("font.ttf");
+        let dest = dest_dir.join(filename);
+        tokio::fs::write(&dest, &bytes).await?;
+        installed.push(dest.display().to_string());
+        tracing::info!(path = %dest.display(), bytes = bytes.len(), "font installed");
+    }
+
+    // Refresh fontconfig so libass sees the new files this run.
+    let cache_status = tokio::process::Command::new("fc-cache")
+        .args(["-f"])
+        .arg(&dest_dir)
+        .status()
+        .await;
+    match cache_status {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::warn!(status = ?s, "fc-cache returned non-zero; fonts may not be picked up until next process start"),
+        Err(e) => tracing::warn!(error = ?e, "fc-cache failed to spawn; fonts may not be picked up until next process start"),
+    }
+
+    Ok(installed)
 }
 
 // ── Config endpoints ──────────────────────────────────────────────────
@@ -90,12 +337,111 @@ struct TestResult {
     message: String,
 }
 
+/// Shape an error response the same way the per-module handlers do, so
+/// dashboard error parsing stays consistent. Local-to-mod.rs since the
+/// peer helpers in `clips.rs` / `jobs.rs` aren't pub.
+fn err_json(status: axum::http::StatusCode, msg: impl Into<String>) -> impl IntoResponse {
+    (status, Json(serde_json::json!({ "error": msg.into() })))
+}
+
 async fn test_service(
     State(state): State<Arc<AppState>>,
     Path(service): Path<String>,
 ) -> Json<TestResult> {
     let result = run_service_test(&state.config_store, &service).await;
     Json(result)
+}
+
+/// Body posted by the setup wizard's "Connect Cloudflare" button.
+#[derive(serde::Deserialize)]
+struct CloudflareProvisionBody {
+    /// CF API token with `Account:Read` + `Workers R2 Storage:Edit` scopes.
+    token: String,
+    /// Bucket name to create. Defaults to `autoseo-clips`.
+    #[serde(default)]
+    bucket: Option<String>,
+}
+
+/// POST /api/cloudflare/provision
+///
+/// One-shot R2 bootstrap: creates the bucket, enables the managed
+/// pub-<hash>.r2.dev domain, best-effort mints S3 access keys, PATCHes
+/// the resulting config into ConfigStore so the dashboard sees the new
+/// values immediately. Returns the provisioning report so the wizard can
+/// surface "X created, Y already existed, mint S3 keys manually here" to
+/// the user.
+async fn cloudflare_provision(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CloudflareProvisionBody>,
+) -> impl IntoResponse {
+    let token = body.token.trim().to_string();
+    if token.is_empty() {
+        return err_json(
+            axum::http::StatusCode::BAD_REQUEST,
+            "token is required",
+        )
+        .into_response();
+    }
+    let bucket = body
+        .bucket
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("autoseo-clips")
+        .to_string();
+
+    let client = cloudflare::CloudflareClient::new(token);
+    let result = match client.provision(&bucket).await {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("cloudflare provision failed: {e:#}"),
+            )
+            .into_response();
+        }
+    };
+
+    // PATCH the provisioned values into ConfigStore. Skip access keys if we
+    // didn't get them — the wizard will collect those manually. Skip the
+    // public URL if it wasn't returned (caller can fill it later).
+    let mut updates: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    updates.insert(
+        "R2_ENDPOINT".to_string(),
+        serde_json::Value::String(result.endpoint.clone()),
+    );
+    updates.insert(
+        "R2_BUCKET".to_string(),
+        serde_json::Value::String(result.bucket.clone()),
+    );
+    if let Some(url) = result.public_url.as_deref() {
+        updates.insert(
+            "R2_PUBLIC_BASE_URL".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    }
+    if let Some(id) = result.access_key_id.as_deref() {
+        updates.insert(
+            "R2_ACCESS_KEY_ID".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+    }
+    if let Some(secret) = result.secret_access_key.as_deref() {
+        updates.insert(
+            "R2_SECRET_ACCESS_KEY".to_string(),
+            serde_json::Value::String(secret.to_string()),
+        );
+    }
+    if let Err(e) = state.config_store.patch(updates).await {
+        return err_json(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("config persist failed: {e:#}"),
+        )
+        .into_response();
+    }
+
+    (axum::http::StatusCode::OK, Json(result)).into_response()
 }
 
 async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
@@ -290,8 +636,11 @@ async fn run_service_test(store: &ConfigStore, service: &str) -> TestResult {
 
 async fn test_openai(base_url: &str, api_key: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
+    // Same normalization as the clipper's OpenAiClient — accept either
+    // `https://api.openai.com` or `https://api.groq.com/openai/v1`.
+    let base = crate::openai::normalize_base_url(base_url);
     let resp = client
-        .get(format!("{base_url}/v1/models"))
+        .get(format!("{base}/v1/models"))
         .header("Authorization", format!("Bearer {api_key}"))
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -444,14 +793,25 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
             axum::http::Method::PATCH,
             axum::http::Method::DELETE,
         ])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
 
     let dashboard_dist = state.dashboard_dist.clone();
     let work_dir = PathBuf::from(&state.work_dir);
 
-    // API routes nested under /api — unknown /api/* paths still return 404
-    let api_routes = Router::new()
+    // Routes that stay open even when DASHBOARD_TOKEN is set. /health is
+    // here so external monitoring (and the dashboard bootstrap) can probe
+    // the server before a token is in hand.
+    let public_api = Router::new()
         .route("/health", get(health))
+        .route("/system", get(get_system))
+        .route("/fonts", get(get_fonts));
+
+    // Everything else under /api is gated by the optional bearer middleware
+    // (no-op when DASHBOARD_TOKEN is unset).
+    let protected_api = Router::new()
         // PATCH is the canonical method for partial-update of config keys;
         // PUT is accepted as an alias because the dashboard's existing
         // `useUpdateConfig` mutation hits PUT. Both call the same handler.
@@ -460,9 +820,16 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
             get(get_config).patch(patch_config).put(patch_config),
         )
         .route("/config/test/{service}", post(test_service))
+        .route("/cloudflare/provision", post(cloudflare_provision))
+        .route("/fonts/install", post(install_font))
         .merge(clips::router())
         .merge(jobs::router())
+        .merge(services::router())
         .merge(stubs::router())
+        .layer(axum::middleware::from_fn(auth::require_token));
+
+    let api_routes = public_api
+        .merge(protected_api)
         // Unknown /api/* paths must return JSON 404, not fall through to the
         // SPA index.html fallback below.
         .fallback(api_not_found);
@@ -473,13 +840,25 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
     // path-traversal (`..`) requests by default.
     let media_serve =
         ServeDir::new(work_dir.join("clipper")).append_index_html_on_directories(false);
+    // Wrap the ServeDir in a Router so the auth middleware applies — clip
+    // URLs need to be gated too, otherwise anyone who guesses one leaks the
+    // rendered video. `fallback_service` is the supported way to mount a
+    // Service at the root of a Router; `nest_service("/", …)` is rejected
+    // by current axum.
+    let media_routes = Router::new()
+        .fallback_service(media_serve)
+        .layer(axum::middleware::from_fn(auth::require_token));
+
+    // WS sits behind auth via `?token=...` (browsers can't set headers on
+    // raw WebSocket handshakes); the dashboard appends the query.
+    let ws_routes = ws::router().layer(axum::middleware::from_fn(auth::require_token));
 
     let app = Router::new()
         .nest("/api", api_routes)
         // WS at /ws (not /api/ws) so dashboard's `ws://host/ws` default works
         // and a single cloudflared HTTP tunnel covers both API and WS.
-        .merge(ws::router())
-        .nest_service("/media/clipper", media_serve)
+        .merge(ws_routes)
+        .nest("/media/clipper", media_routes)
         .layer(cors)
         .with_state(Arc::new(state));
 

@@ -1,16 +1,41 @@
-//! SCRFD face detection via ONNX Runtime.
+//! Face detection via ONNX Runtime — pluggable detector backend behind the
+//! [`FaceDetector`] trait so the rest of the active-speaker pipeline doesn't
+//! care which model produces the bounding boxes.
 //!
-//! Loads the `scrfd_10g_bnkps.onnx` model, runs inference on video frames
-//! extracted via ffmpeg, and returns face bounding boxes with landmarks.
-//! Includes a simple IoU-based tracker for frame-to-frame identity persistence.
+//! Two implementations:
+//!   - [`YuNetDetector`] — default. OpenCV Zoo's `face_detection_yunet_2023mar`,
+//!     ~340 KB, Apache 2. Stable multi-stride ONNX schema; works out of the
+//!     box with no model gating.
+//!   - [`ScrfdDetector`] — legacy. The original 10g_bnkps model is gated on
+//!     HuggingFace; mirrors (e.g. cromsc/scrfd-10g) have output tensor
+//!     shapes that don't match the hardcoded decoder here and panic. Kept
+//!     opt-in via `FACE_DETECTOR=scrfd` for users who source a matching ONNX.
 //!
-//! Model auto-downloads to `{WORK_DIR}/models/scrfd/` on first use.
+//! Models auto-download to `{WORK_DIR}/models/{detector}/` on first use.
 
 use anyhow::{Context, Result};
 use ndarray::Array4;
 use ort::session::Session;
 use std::path::Path;
 use tokio::process::Command;
+
+/// Common interface for face detectors. Implementations own their own ORT
+/// session + post-processing logic; the caller just hands in an RGB frame
+/// and gets boxes + 5-point landmarks back. Send+Sync so the detector can
+/// be shared across the per-clip ASD tasks via `Arc<dyn FaceDetector>`.
+pub trait FaceDetector: Send + Sync {
+    /// Detect faces in a single RGB frame. `frame_rgb` is row-major
+    /// `width × height × 3` bytes. Returns one [`FaceDetection`] per face,
+    /// already NMS-filtered and clamped to the frame bounds.
+    ///
+    /// Should not panic on malformed input or unexpected model output —
+    /// log and return `Ok(Vec::new())` instead so the ASD pipeline can
+    /// drop that frame cleanly.
+    fn detect(&self, frame_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>>;
+
+    /// Short name for logs ("yunet" / "scrfd"). Used only for tracing.
+    fn name(&self) -> &'static str;
+}
 
 /// A single detected face in a frame.
 #[derive(Debug, Clone)]
@@ -93,7 +118,7 @@ impl ScrfdDetector {
     /// Detect faces in a single RGB frame.
     ///
     /// `frame_rgb` is raw RGB bytes in row-major order, `width` x `height` pixels.
-    pub fn detect(&self, frame_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>> {
+    pub fn detect_inner(&self, frame_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>> {
         let sz = self.input_size as usize;
         let expected_len = (width * height * 3) as usize;
         anyhow::ensure!(
@@ -216,6 +241,303 @@ impl ScrfdDetector {
         // NMS
         let detections = nms(&mut detections, self.nms_threshold);
         Ok(detections)
+    }
+}
+
+impl FaceDetector for ScrfdDetector {
+    fn detect(&self, frame_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>> {
+        // The decoder hardcodes output tensor shape assumptions (anchors=2,
+        // strides=[8,16,32], named score/bbox/kps per stride). Mirrored
+        // SCRFD ONNXes on HF don't always match, and ndarray indexing panics
+        // on shape mismatch. Catch panics here so a bad model file makes us
+        // skip the frame, not crash the worker.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.detect_inner(frame_rgb, width, height)
+        }));
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    "SCRFD inference panicked (shape mismatch?); returning empty detections"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "scrfd"
+    }
+}
+
+/// YuNet face detector — OpenCV Zoo's `face_detection_yunet_2023mar.onnx`.
+/// Multi-scale FPN-style outputs at strides 8, 16, 32 with one anchor per
+/// cell. Each stride has 4 tensors: `loc_N` (bbox deltas), `conf_N` (face
+/// score), `iou_N` (IoU prediction — multiplied into the score), `kps_N`
+/// (5-point landmarks). Final score per anchor = `conf * iou`.
+///
+/// Decoder is shape-aware: if the loaded model's outputs don't match the
+/// expected schema, we return empty detections instead of panicking.
+pub struct YuNetDetector {
+    session: Session,
+    input_size: u32,
+    conf_threshold: f32,
+    nms_threshold: f32,
+}
+
+impl YuNetDetector {
+    pub async fn load(
+        models_dir: &Path,
+        model_url: Option<&str>,
+        input_size: u32,
+        conf_threshold: f32,
+        nms_threshold: f32,
+    ) -> Result<Self> {
+        let yunet_dir = models_dir.join("yunet");
+        let model_path = yunet_dir.join("face_detection_yunet_2023mar.onnx");
+
+        if !model_path.exists() {
+            if let Some(url) = model_url {
+                tracing::info!(url, path = %model_path.display(), "YuNet model not found; downloading");
+                download_model(url, &model_path).await?;
+            } else {
+                anyhow::bail!(
+                    "YuNet model not found at {} and no download URL configured",
+                    model_path.display()
+                );
+            }
+        }
+
+        let canonical = model_path
+            .canonicalize()
+            .with_context(|| format!("canonicalize YuNet model path: {}", model_path.display()))?;
+        let canonical_str = canonical
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("YuNet model path is not valid UTF-8"))?;
+
+        let session = Session::builder()
+            .context("create ORT session builder")?
+            .with_intra_threads(1)
+            .context("set intra threads")?
+            .commit_from_file(canonical_str)
+            .with_context(|| format!("load YuNet model from {canonical_str}"))?;
+
+        // Log the model's actual output names — useful when debugging schema
+        // mismatches against future YuNet model versions.
+        let out_names: Vec<String> = session.outputs.iter().map(|o| o.name.clone()).collect();
+        tracing::info!(outputs = ?out_names, "YuNet model loaded");
+
+        Ok(Self {
+            session,
+            input_size,
+            conf_threshold,
+            nms_threshold,
+        })
+    }
+
+    fn detect_inner(
+        &self,
+        frame_rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<FaceDetection>> {
+        let sz = self.input_size as usize;
+        let expected_len = (width * height * 3) as usize;
+        anyhow::ensure!(
+            frame_rgb.len() == expected_len,
+            "frame_rgb length {} != expected {} ({}x{}x3)",
+            frame_rgb.len(),
+            expected_len,
+            width,
+            height
+        );
+
+        let rr = resize_rgb(frame_rgb, width, height, sz);
+        let input = normalize_to_nchw(&rr.rgb, sz);
+
+        let outputs = self.session.run(ort::inputs![
+            "input" => input,
+        ]?)?;
+
+        let mut detections: Vec<FaceDetection> = Vec::new();
+
+        // YuNet emits per-stride tensors. Names observed in the 2023mar
+        // model: `loc_8`, `conf_8`, `iou_8`, `kps_8` (and the same for
+        // strides 16, 32). One anchor per cell.
+        for stride in [8u32, 16, 32] {
+            let feat_h = sz / stride as usize;
+            let feat_w = sz / stride as usize;
+
+            let loc = match outputs.get(&*format!("loc_{stride}")) {
+                Some(t) => t.try_extract_tensor::<f32>().ok(),
+                None => None,
+            };
+            let conf = match outputs.get(&*format!("conf_{stride}")) {
+                Some(t) => t.try_extract_tensor::<f32>().ok(),
+                None => None,
+            };
+            let iou = match outputs.get(&*format!("iou_{stride}")) {
+                Some(t) => t.try_extract_tensor::<f32>().ok(),
+                None => None,
+            };
+            let kps_t = match outputs.get(&*format!("kps_{stride}")) {
+                Some(t) => t.try_extract_tensor::<f32>().ok(),
+                None => None,
+            };
+
+            let (Some(loc), Some(conf)) = (loc, conf) else {
+                tracing::debug!(stride, "YuNet output missing loc_/conf_ — skipping stride");
+                continue;
+            };
+
+            // Flatten views so we can index by anchor position regardless
+            // of whether the model output is (1,N,K) or (1,K,N).
+            let loc_flat: Vec<f32> = loc.iter().copied().collect();
+            let conf_flat: Vec<f32> = conf.iter().copied().collect();
+            let iou_flat: Option<Vec<f32>> = iou.as_ref().map(|t| t.iter().copied().collect());
+            let kps_flat: Option<Vec<f32>> = kps_t.as_ref().map(|t| t.iter().copied().collect());
+
+            let n_anchors = feat_h * feat_w;
+            // YuNet 2023 has 1 anchor per cell with bbox=4 + (optional iou) + 1 score + 10 kps.
+            // The flat sizes will be roughly n_anchors * 4 for loc and n_anchors for conf.
+            if conf_flat.len() < n_anchors || loc_flat.len() < n_anchors * 4 {
+                tracing::debug!(
+                    stride,
+                    expected_anchors = n_anchors,
+                    got_conf = conf_flat.len(),
+                    got_loc = loc_flat.len(),
+                    "YuNet output too small for expected anchors — skipping stride"
+                );
+                continue;
+            }
+
+            for row in 0..feat_h {
+                for col in 0..feat_w {
+                    let idx = row * feat_w + col;
+                    let raw_conf = conf_flat[idx];
+                    let score = match &iou_flat {
+                        Some(iou) if idx < iou.len() => (raw_conf * iou[idx]).max(0.0).sqrt(),
+                        _ => raw_conf,
+                    };
+                    if score <= self.conf_threshold {
+                        continue;
+                    }
+                    // bbox deltas at idx*4 .. idx*4+4
+                    let dx = loc_flat[idx * 4];
+                    let dy = loc_flat[idx * 4 + 1];
+                    let dw = loc_flat[idx * 4 + 2];
+                    let dh = loc_flat[idx * 4 + 3];
+                    let anchor_cx = (col as f32 + 0.5) * stride as f32;
+                    let anchor_cy = (row as f32 + 0.5) * stride as f32;
+                    let cx = anchor_cx + dx * stride as f32;
+                    let cy = anchor_cy + dy * stride as f32;
+                    let w_box = (dw.exp()) * stride as f32;
+                    let h_box = (dh.exp()) * stride as f32;
+                    // model-space bbox → original-frame coords
+                    let x1 = ((cx - w_box / 2.0) - rr.pad_x) / rr.scale;
+                    let y1 = ((cy - h_box / 2.0) - rr.pad_y) / rr.scale;
+                    let x2 = ((cx + w_box / 2.0) - rr.pad_x) / rr.scale;
+                    let y2 = ((cy + h_box / 2.0) - rr.pad_y) / rr.scale;
+                    let x1 = x1.clamp(0.0, width as f32);
+                    let y1 = y1.clamp(0.0, height as f32);
+                    let x2 = x2.clamp(0.0, width as f32);
+                    let y2 = y2.clamp(0.0, height as f32);
+                    let mut landmarks = Vec::new();
+                    if let Some(kps) = &kps_flat {
+                        // 5 landmarks × 2 coords = 10 per anchor.
+                        let base = idx * 10;
+                        if base + 10 <= kps.len() {
+                            for k in 0..5 {
+                                let lx = anchor_cx + kps[base + k * 2] * stride as f32;
+                                let ly = anchor_cy + kps[base + k * 2 + 1] * stride as f32;
+                                let lx = (lx - rr.pad_x) / rr.scale;
+                                let ly = (ly - rr.pad_y) / rr.scale;
+                                landmarks.push([
+                                    lx.clamp(0.0, width as f32),
+                                    ly.clamp(0.0, height as f32),
+                                ]);
+                            }
+                        }
+                    }
+                    detections.push(FaceDetection {
+                        bbox: [x1, y1, x2, y2],
+                        confidence: score,
+                        landmarks,
+                    });
+                }
+            }
+        }
+
+        Ok(nms(&mut detections, self.nms_threshold))
+    }
+}
+
+impl FaceDetector for YuNetDetector {
+    fn detect(&self, frame_rgb: &[u8], width: u32, height: u32) -> Result<Vec<FaceDetection>> {
+        // Same panic-safety net as ScrfdDetector: defensive against schema
+        // drift in future YuNet model releases.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.detect_inner(frame_rgb, width, height)
+        }));
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    "YuNet inference panicked (model schema mismatch?); returning empty detections"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "yunet"
+    }
+}
+
+/// Build the configured face detector. Returns Err only when the chosen
+/// model file is unreachable AND no download URL was set — soft failures
+/// (bad weights, schema mismatch) bubble up as per-frame empty detections,
+/// not a load error, so the pipeline degrades to static center-crop
+/// instead of failing the whole job.
+pub async fn load_detector(
+    name: &str,
+    models_dir: &Path,
+    scrfd_url: Option<&str>,
+    scrfd_input_size: u32,
+    scrfd_conf: f32,
+    scrfd_nms: f32,
+    yunet_url: Option<&str>,
+    yunet_input_size: u32,
+    yunet_conf: f32,
+    yunet_nms: f32,
+) -> Result<Box<dyn FaceDetector>> {
+    match name.to_lowercase().as_str() {
+        "yunet" => {
+            let det = YuNetDetector::load(
+                models_dir,
+                yunet_url,
+                yunet_input_size,
+                yunet_conf,
+                yunet_nms,
+            )
+            .await?;
+            Ok(Box::new(det))
+        }
+        "scrfd" => {
+            let det = ScrfdDetector::load(
+                models_dir,
+                scrfd_url,
+                scrfd_input_size,
+                scrfd_conf,
+                scrfd_nms,
+            )
+            .await?;
+            Ok(Box::new(det))
+        }
+        other => anyhow::bail!(
+            "unknown FACE_DETECTOR={other:?} — expected 'yunet' or 'scrfd'"
+        ),
     }
 }
 

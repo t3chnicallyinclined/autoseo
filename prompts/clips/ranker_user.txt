@@ -1,6 +1,11 @@
 Episode show: {{show_name}}
 Hosts: {{hosts}}
 Guest: {{guest}}
+
+TARGET CLIP LENGTH: {{target_secs}}s (acceptable range {{min_secs}}–{{max_secs}}s).
+Refined windows MUST end up within this range. Anything that needs longer to
+land its hook should score under 40 — there isn't time on the platform.
+
 {{performance_history}}
 Below is a JSON array of candidate clip windows from this episode. Each
 candidate has:

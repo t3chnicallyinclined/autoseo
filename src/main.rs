@@ -39,6 +39,7 @@ mod show_config;
 mod smooth;
 mod social_copy;
 mod storage;
+mod system_specs;
 mod thumbs;
 mod vad;
 mod vlm_ranker;

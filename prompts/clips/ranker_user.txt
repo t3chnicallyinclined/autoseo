@@ -7,8 +7,18 @@ candidate has:
 - index, start_secs, end_secs: where in the episode
 - transcript: the words spoken in the window
 - linguistic: marker counts + up to 2 quotable lines
-- prosody: rms_peak_db / rms_mean_db / speaking_rate_wps
+- prosody: rms_peak_db / rms_mean_db / f0_mean_hz / f0_variance_hz2 /
+  f0_peak_hz / speaking_rate_wps
+  · rms_peak_db: peak loudness; less-negative = louder spike
+  · f0_variance_hz2: pitch range; higher = more emotional inflection
 - novelty: 0..1, higher = unusual topic content relative to the episode mean
+- audio_events (optional, omitted when AST is disabled): { laughter,
+  applause, music, speech }, each 0..1
+  · laughter ≳ 0.5: strong organic reaction — bumps short-form CTR
+  · applause ≳ 0.4: a payoff just landed
+  · music ≳ 0.5: likely bumper/transition; deprioritize unless transcript
+    has a clear payoff
+  · speech is informational only — most candidates are speech-dominant
 
 {{current_trends}}
 

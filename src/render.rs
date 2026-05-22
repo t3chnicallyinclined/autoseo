@@ -1,15 +1,19 @@
 //! Per-clip ffmpeg renderer: cut + reframe + loudnorm + encode.
 //!
-//! M1 implementation: center-crop for vertical/square reformats. Smart crop
-//! (active-speaker tracking) is M3 and will plug in here behind the same
-//! [`render_clip`] surface.
+//! Default behavior is static center-crop for vertical/square. When the
+//! `crop_keyframes` parameter is supplied (output of
+//! [`crate::asd_pipeline::compute_crop_trajectory`]), the 9:16 path uses a
+//! piecewise-linear x-expression to pan the crop window with the active
+//! speaker.
 //!
 //! Captions: pass `subtitle_path = Some(path_to_ass)` and ffmpeg will burn
-//! them. The `.ass` file itself is built in `src/captions.rs` (slice 4c).
+//! them. The `.ass` file itself is built in `src/captions.rs`.
 
 use anyhow::Context;
 use std::path::Path;
 use tokio::process::Command;
+
+use crate::asd_pipeline::CropKeyframe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AspectRatio {
@@ -109,6 +113,7 @@ pub async fn render_clip(
         output,
         profile,
         subtitle_paths,
+        None,
     )
     .await
 }
@@ -116,7 +121,8 @@ pub async fn render_clip(
 /// Like [`render_clip`] but optionally replaces the audio track with an
 /// enhanced audio file (e.g. from DeepFilterNet3). When `enhanced_audio` is
 /// `Some`, the video stream comes from `input` and the audio stream from the
-/// enhanced file.
+/// enhanced file. When `crop_keyframes` is `Some` and the profile is 9:16,
+/// the crop x-position pans through the keyframes (clip-local time).
 #[allow(clippy::too_many_arguments)]
 pub async fn render_clip_with_audio(
     ffmpeg: &str,
@@ -127,6 +133,7 @@ pub async fn render_clip_with_audio(
     output: &Path,
     profile: &RenderProfile,
     subtitle_paths: &[&Path],
+    crop_keyframes: Option<&[CropKeyframe]>,
 ) -> anyhow::Result<()> {
     if !matches!(
         end_secs.partial_cmp(&start_secs),
@@ -139,7 +146,25 @@ pub async fn render_clip_with_audio(
     }
 
     let duration = end_secs - start_secs;
-    let vf = build_video_filter(profile, subtitle_paths);
+    // Convert episode-time keyframes to clip-local for ffmpeg's filter clock.
+    let local_keyframes: Option<Vec<CropKeyframe>> = crop_keyframes.map(|kfs| {
+        kfs.iter()
+            .filter_map(|k| {
+                let t = k.timestamp_secs - start_secs;
+                if !t.is_finite() || t < 0.0 || t > duration {
+                    None
+                } else {
+                    Some(CropKeyframe {
+                        timestamp_secs: t,
+                        center_x: k.center_x,
+                        center_y: k.center_y,
+                    })
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let local_keyframes_ref = local_keyframes.as_deref();
+    let vf = build_video_filter(profile, subtitle_paths, local_keyframes_ref);
     let af = build_audio_filter(profile);
 
     let mut cmd = Command::new(ffmpeg);
@@ -189,13 +214,28 @@ pub async fn render_clip_with_audio(
     Ok(())
 }
 
-fn build_video_filter(profile: &RenderProfile, subtitle_paths: &[&Path]) -> String {
+fn build_video_filter(
+    profile: &RenderProfile,
+    subtitle_paths: &[&Path],
+    crop_keyframes: Option<&[CropKeyframe]>,
+) -> String {
     let (w, h) = (profile.width, profile.height);
     let crop_then_scale = match profile.aspect {
-        // For 9:16 from any wider source: crop centered to 9:16 first, then scale.
-        // ih*9/16 gives the target width; we keep full height. Default center origin.
+        // 9:16: crop a portrait window from the source, then scale. When ASD
+        // keyframes are supplied, pan the crop x-position with the speaker;
+        // otherwise center.
         AspectRatio::Vertical9x16 => {
-            format!("crop=ih*9/16:ih,scale={w}:{h}:flags=lanczos")
+            if let Some(kfs) = crop_keyframes.filter(|k| !k.is_empty()) {
+                // Source-pixel x = center_x - crop_width/2 = center_x - ih*9/32.
+                // Clamp to [0, iw - ih*9/16] inside the expression.
+                let expr = build_piecewise_x_expr(kfs);
+                format!(
+                    "crop=w=ih*9/16:h=ih:x='clip({expr}-ih*9/32,0,iw-ih*9/16)':y=0,\
+                     scale={w}:{h}:flags=lanczos"
+                )
+            } else {
+                format!("crop=ih*9/16:ih,scale={w}:{h}:flags=lanczos")
+            }
         }
         // 1:1 square: crop to a square using min(iw,ih) then scale.
         AspectRatio::Square1x1 => {
@@ -229,6 +269,46 @@ fn build_audio_filter(profile: &RenderProfile) -> String {
     )
 }
 
+/// Build an ffmpeg expression that evaluates to the speaker center-x at the
+/// current frame time `t` (clip-local seconds), interpolating linearly between
+/// keyframes and clamping to the first / last value outside the range.
+///
+/// Output shape: `if(lt(t,t1), x0+(x1-x0)*(t-t0)/(t1-t0), if(...))`. Single
+/// keyframe collapses to a constant.
+fn build_piecewise_x_expr(keyframes: &[CropKeyframe]) -> String {
+    if keyframes.is_empty() {
+        // Defensive: caller guards this branch already.
+        return "(iw/2)".to_string();
+    }
+    if keyframes.len() == 1 {
+        return format!("({:.3})", keyframes[0].center_x);
+    }
+    // Build inside-out so the deepest `if` is the tail clamp.
+    let last = &keyframes[keyframes.len() - 1];
+    let mut expr = format!("({:.3})", last.center_x);
+    for pair in keyframes.windows(2).rev() {
+        let a = &pair[0];
+        let b = &pair[1];
+        let dt = (b.timestamp_secs - a.timestamp_secs).max(1e-3);
+        // Linear interp: x0 + (x1-x0) * (t-t0)/dt
+        let lerp = format!(
+            "({x0:.3}+({x1:.3}-{x0:.3})*(t-{t0:.3})/{dt:.3})",
+            x0 = a.center_x,
+            x1 = b.center_x,
+            t0 = a.timestamp_secs,
+            dt = dt,
+        );
+        expr = format!("if(lt(t,{t1:.3}),{lerp},{expr})", t1 = b.timestamp_secs);
+    }
+    // Tail head-clamp: before the first keyframe, hold the first value.
+    let head = &keyframes[0];
+    format!(
+        "if(lt(t,{t0:.3}),({x0:.3}),{expr})",
+        t0 = head.timestamp_secs,
+        x0 = head.center_x,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +327,7 @@ mod tests {
     #[test]
     fn vertical_filter_uses_crop_then_scale() {
         let p = RenderProfile::shorts_vertical();
-        let f = build_video_filter(&p, &[]);
+        let f = build_video_filter(&p, &[], None);
         assert!(f.contains("crop=ih*9/16:ih"), "got: {f}");
         assert!(f.contains("scale=1080:1920"));
         assert!(f.contains("format=yuv420p"));
@@ -257,7 +337,7 @@ mod tests {
     #[test]
     fn subtitles_appended_when_provided() {
         let p = RenderProfile::shorts_vertical();
-        let f = build_video_filter(&p, &[Path::new("/tmp/clip.ass")]);
+        let f = build_video_filter(&p, &[Path::new("/tmp/clip.ass")], None);
         assert!(f.ends_with("subtitles='/tmp/clip.ass'"), "got: {f}");
     }
 
@@ -270,6 +350,7 @@ mod tests {
                 Path::new("/tmp/overlay.ass"),
                 Path::new("/tmp/captions.ass"),
             ],
+            None,
         );
         let overlay_pos = f.find("/tmp/overlay.ass").expect("overlay in filter");
         let captions_pos = f.find("/tmp/captions.ass").expect("captions in filter");
@@ -282,7 +363,7 @@ mod tests {
     #[test]
     fn square_filter_crops_to_min_dimension() {
         let p = RenderProfile::linkedin_square();
-        let f = build_video_filter(&p, &[]);
+        let f = build_video_filter(&p, &[], None);
         assert!(f.contains("min(iw,ih)"));
         assert!(f.contains("scale=1080:1080"));
     }
@@ -290,9 +371,60 @@ mod tests {
     #[test]
     fn landscape_filter_letterboxes_without_crop() {
         let p = RenderProfile::bluesky_landscape();
-        let f = build_video_filter(&p, &[]);
+        let f = build_video_filter(&p, &[], None);
         assert!(f.contains("pad=1920:1080"));
         assert!(!f.contains("crop="));
+    }
+
+    #[test]
+    fn dynamic_crop_emits_piecewise_x() {
+        let p = RenderProfile::shorts_vertical();
+        let kfs = vec![
+            CropKeyframe {
+                timestamp_secs: 0.0,
+                center_x: 800.0,
+                center_y: 540.0,
+            },
+            CropKeyframe {
+                timestamp_secs: 1.0,
+                center_x: 1100.0,
+                center_y: 540.0,
+            },
+            CropKeyframe {
+                timestamp_secs: 2.0,
+                center_x: 960.0,
+                center_y: 540.0,
+            },
+        ];
+        let f = build_video_filter(&p, &[], Some(&kfs));
+        // Speaker-aware crop replaces the static ih*9/16 center crop.
+        assert!(f.contains("crop=w=ih*9/16:h=ih:x="), "got: {f}");
+        assert!(f.contains("clip("), "expected clamp(): {f}");
+        // Lerp between the two ends should appear somewhere in the expr.
+        assert!(f.contains("(800.000+(1100.000-800.000)*"), "got: {f}");
+    }
+
+    #[test]
+    fn dynamic_crop_with_single_keyframe_is_constant() {
+        let p = RenderProfile::shorts_vertical();
+        let kfs = vec![CropKeyframe {
+            timestamp_secs: 0.5,
+            center_x: 720.0,
+            center_y: 540.0,
+        }];
+        let f = build_video_filter(&p, &[], Some(&kfs));
+        // Single keyframe collapses to a constant — no if() needed.
+        assert!(f.contains("(720.000)"), "got: {f}");
+        assert!(!f.contains("if(lt"), "should not chain ifs: {f}");
+    }
+
+    #[test]
+    fn dynamic_crop_empty_keyframes_falls_back_to_static() {
+        let p = RenderProfile::shorts_vertical();
+        let f = build_video_filter(&p, &[], Some(&[]));
+        // Empty keyframes → static center crop, same as None.
+        assert!(f.contains("crop=ih*9/16:ih"), "got: {f}");
+        assert!(!f.contains("clip("), "should not emit clamp(): {f}");
     }
 
     #[test]

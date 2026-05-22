@@ -25,6 +25,13 @@ SCORING HEURISTICS
   in the user message), bump the score by up to +10 and note the matching
   trend in trend_match. Trends are optional context — if none are listed,
   ignore this heuristic.
+- Audio-event boost (when audio_events is present): a candidate whose
+  payoff sentence overlaps high laughter (≳0.5) or applause (≳0.4) is real
+  evidence the joke/insight landed — bump up to +8. High music (≳0.5) with
+  weak transcript is almost always a bumper/transition; cap such candidates
+  at 30 unless the words carry the moment on their own. audio_events
+  cannot rescue a flat transcript — use it to break ties between otherwise
+  comparable candidates.
 - Mid score: interesting content but the payoff is partial or the setup is
   long; topic shift with promise but no resolution yet.
 - Low score: filler, transitional banter, monologue without a punch,

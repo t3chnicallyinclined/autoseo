@@ -118,6 +118,14 @@ impl VlmReranker {
                     );
                     out[i].score = blended.clamp(0, 100);
                     out[i].reasoning = combined_reason;
+                    // A/B lineage: preserve the standard-lane verdict so the
+                    // manifest can show how the score evolved.
+                    out[i].vlm_score = Some(vlm_score.clamp(0, 100));
+                    out[i].vlm_reasoning = if vlm_reason.is_empty() {
+                        None
+                    } else {
+                        Some(vlm_reason)
+                    };
                 }
                 Err(e) => {
                     tracing::warn!(clip = i, error = ?e, "vlm: scoring failed; keeping llm score");
@@ -400,6 +408,12 @@ impl PremiumVlmReranker {
                     };
                     out[i].score = blended;
                     out[i].reasoning = combined_reason;
+                    out[i].vlm_premium_score = Some(premium_score.clamp(0, 100));
+                    out[i].vlm_premium_reasoning = if premium_reason.is_empty() {
+                        None
+                    } else {
+                        Some(premium_reason)
+                    };
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -435,21 +449,44 @@ impl PremiumVlmReranker {
         clip: &RankedClip,
     ) -> Result<(i32, String, Option<TokenUsage>)> {
         let mut content: Vec<ChatContent> = Vec::with_capacity(frames.len() + 1);
+        // Premium VLM prompt: deliberately distinct from the standard-lane
+        // prompt. The cheaper model already evaluated "talking head vs.
+        // reaction" — the premium model is paid to catch what smaller models
+        // miss. Focus on subtle facial/body micro-signals, composition vs.
+        // 9:16 framing, and whether the *peak* moment is on-screen.
         let text = format!(
-            "You are scoring a podcast clip for short-form viral potential.\n\
-             You see {} frames sampled evenly across the clip plus the LLM ranker's \
-             hook + reasoning.\n\n\
-             HOOK: {}\n\
-             LLM REASONING: {}\n\n\
-             Score the clip's visual + textual viral potential 0-100. Consider: do \
-             the frames show recognizable reactions/expressions or static talking \
-             heads? Does the hook land in the visuals? Is the framing usable for \
-             vertical short-form?\n\n\
-             Return JSON only: {{\"score\": int 0-100, \"reasoning\": \"<one short \
-             sentence>\"}}",
-            frames.len(),
-            clip.hook,
-            clip.reasoning,
+            "You are an editorial reviewer scoring a podcast short for premium \
+             distribution. The standard model already flagged this clip as a \
+             candidate — your job is to catch what a smaller model would miss \
+             and apply a discerning eye.\n\n\
+             You see {n} frames sampled evenly across the clip plus the LLM \
+             ranker's hook + reasoning.\n\n\
+             HOOK: {hook}\n\
+             RANKER REASONING: {reason}\n\n\
+             Score 0-100 with these editorial criteria, in priority order:\n\
+             1. Micro-expression payoff: does the peak emotional beat (laugh, \
+                wince, double-take, eye-widen) land on a frame the viewer will \
+                actually see, not just on-screen but cropped to vertical?\n\
+             2. Body/hand language: do the gestures read at thumbnail size, or \
+                are they muted talking-head? Penalize stiff posture.\n\
+             3. Composition stability: across the frames, does the subject \
+                roam wildly (would need aggressive crop tracking), or does \
+                the framing already work for 9:16?\n\
+             4. Lighting/production sufficiency: is there enough contrast on \
+                the face that text overlay would be readable? Heavy backlight \
+                or color-grading issues should drop the score.\n\
+             5. Hook-to-visual alignment: does what's promised by the hook \
+                actually *appear* in the visible frames?\n\n\
+             Calibration: 90+ should be rare. Reserve it for clips where the \
+             frames themselves carry the moment without needing the audio. A \
+             solid talking-head with good content but no visual payoff is a \
+             60-70, not an 85.\n\n\
+             Return JSON only: {{\"score\": int 0-100, \"reasoning\": \"<one \
+             precise sentence naming the specific signal that drove the \
+             score>\"}}",
+            n = frames.len(),
+            hook = clip.hook,
+            reason = clip.reasoning,
         );
         content.push(ChatContent::Text { text });
         for f in frames {
@@ -671,6 +708,11 @@ mod tests {
             hook: "test hook".to_string(),
             reasoning: "test reason".to_string(),
             trend_match: None,
+            llm_score: Some(score),
+            vlm_score: None,
+            vlm_reasoning: None,
+            vlm_premium_score: None,
+            vlm_premium_reasoning: None,
         }
     }
 

@@ -15,10 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ai_pipeline::{AiPipeline, TranscriptSegment};
 use crate::align::AlignedWord;
+use crate::asd_pipeline::{self, AsdPipelineParams, CropKeyframe};
 use crate::ast::AstScorer;
 use crate::candidates::{self, CandidateGenerator};
-use crate::captions::{self, CaptionStyle, OverlayStyle};
+use crate::captions::{self, CaptionOverrides, CaptionStyle, OverlayStyle};
 use crate::config::Config;
+use crate::face_detect::ScrfdDetector;
 use crate::cost::{CostSnapshot, CostTracker};
 use crate::embed::Embedder;
 use crate::enhance;
@@ -42,8 +44,14 @@ use crate::vlm_ranker::{PremiumVlmReranker, VlmReranker};
 /// Update job status in storage if both storage and job_id are provided.
 /// Errors from the status update itself are logged but not propagated,
 /// so a DB hiccup never masks the real pipeline error.
+///
+/// Also publishes a `JobUpdate` event on the bus (if provided) so connected
+/// dashboards see the transition immediately. Terminal events (`JobComplete`
+/// / `JobFailed`) are emitted at the call sites that have the full context
+/// (media name, clips count).
 async fn set_job_status(
     storage: Option<&Storage>,
+    bus: Option<&crate::events::EventBus>,
     job_id: Option<&str>,
     status: JobStatus,
     error: Option<&str>,
@@ -53,6 +61,83 @@ async fn set_job_status(
             tracing::warn!(job_id = jid, status = status.as_str(), error = ?e, "failed to update job status");
         }
     }
+    if let (Some(bus), Some(jid)) = (bus, job_id) {
+        let (dash_status, stage, progress) = crate::events::dashboard_view(status.as_str());
+        bus.emit(crate::events::PipelineEvent::JobUpdate {
+            job_id: jid.to_string(),
+            status: dash_status.to_string(),
+            stage: stage.to_string(),
+            progress,
+            clips_generated: None,
+            media: None,
+        });
+    }
+}
+
+/// When `cfg.scrfd_enabled`, load SCRFD once and compute a smoothed crop
+/// trajectory per ranked clip. Returns a Vec aligned with `ranked`: each entry
+/// is the per-clip keyframe list (empty if ASD was unavailable for that clip,
+/// so the render path falls back to static center-crop).
+///
+/// Fails soft: any model-load or per-clip error logs a warning and surfaces
+/// empty trajectories, never aborts the whole render.
+async fn compute_clip_trajectories(
+    cfg: &Config,
+    input_path: &std::path::Path,
+    silences: &[vad::SilenceWindow],
+    total_duration_secs: f64,
+    ranked: &[RankedClip],
+) -> Vec<Vec<CropKeyframe>> {
+    let empty = vec![Vec::new(); ranked.len()];
+    if !cfg.scrfd_enabled {
+        return empty;
+    }
+    let models_dir = PathBuf::from(&cfg.work_dir).join("models");
+    let detector = match ScrfdDetector::load(
+        &models_dir,
+        Some(&cfg.scrfd_model_url),
+        cfg.scrfd_input_size,
+        cfg.scrfd_conf_threshold,
+        cfg.scrfd_nms_threshold,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = ?e, "asd: SCRFD load failed; static crop fallback");
+            return empty;
+        }
+    };
+
+    let speech_segments = vad::invert_to_speech(silences, total_duration_secs, 0.1);
+    let params = AsdPipelineParams::default();
+    let mut out: Vec<Vec<CropKeyframe>> = Vec::with_capacity(ranked.len());
+    for (i, clip) in ranked.iter().enumerate() {
+        let trajectory = match asd_pipeline::compute_crop_trajectory(
+            &cfg.ffmpeg,
+            input_path,
+            clip.start_secs,
+            clip.end_secs,
+            &speech_segments,
+            &detector,
+            &params,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(clip = i + 1, error = ?e, "asd: trajectory failed; static crop");
+                Vec::new()
+            }
+        };
+        tracing::info!(
+            clip = i + 1,
+            keyframes = trajectory.len(),
+            "asd: trajectory computed"
+        );
+        out.push(trajectory);
+    }
+    out
 }
 
 /// Run the full clipper pipeline for a video that has already been downloaded
@@ -72,6 +157,7 @@ pub async fn run_clipper_from_drive(
     video_path: &std::path::Path,
     media_name: &str,
     digest_mode: DigestMode,
+    bus: Option<&crate::events::EventBus>,
 ) -> Result<()> {
     // The job row must already exist (created by the polling loop).
     // Run the pipeline and update status at each gate. On error, mark the
@@ -86,23 +172,41 @@ pub async fn run_clipper_from_drive(
         digest_mode,
         storage,
         job_id,
+        bus,
     )
     .await;
 
     match &result {
         Ok(()) => {
-            storage
-                .update_job_status(job_id, JobStatus::Done, None)
-                .await?;
+            set_job_status(Some(storage), bus, Some(job_id), JobStatus::Done, None).await;
             tracing::info!(job_id, media_name, "clipper job completed");
+            if let Some(bus) = bus {
+                let clips_count = storage.count_clips_for_job(job_id).await.unwrap_or(0);
+                bus.emit(crate::events::PipelineEvent::JobComplete {
+                    job_id: job_id.to_string(),
+                    media: media_name.to_string(),
+                    clips_generated: clips_count,
+                });
+            }
         }
         Err(e) => {
             let msg = format!("{e:#}");
             tracing::error!(job_id, media_name, error = %msg, "clipper job failed");
-            storage
-                .update_job_status(job_id, JobStatus::Failed, Some(&msg))
-                .await
-                .ok(); // best-effort; don't mask the original error
+            set_job_status(
+                Some(storage),
+                bus,
+                Some(job_id),
+                JobStatus::Failed,
+                Some(&msg),
+            )
+            .await;
+            if let Some(bus) = bus {
+                bus.emit(crate::events::PipelineEvent::JobFailed {
+                    job_id: job_id.to_string(),
+                    media: media_name.to_string(),
+                    error: msg,
+                });
+            }
         }
     }
     result
@@ -122,6 +226,7 @@ async fn run_clipper_pipeline_inner(
     digest_mode: DigestMode,
     storage: &Storage,
     job_id: &str,
+    bus: Option<&crate::events::EventBus>,
 ) -> Result<()> {
     let cost_tracker = CostTracker::new(cfg.cost_tracking_enabled);
 
@@ -268,9 +373,14 @@ async fn run_clipper_pipeline_inner(
     }
 
     // Gate: transcribed
-    storage
-        .update_job_status(job_id, JobStatus::Transcribed, None)
-        .await?;
+    set_job_status(
+        Some(storage),
+        bus,
+        Some(job_id),
+        JobStatus::Transcribed,
+        None,
+    )
+    .await;
 
     // Create a tracked OpenAI client for LLM calls (ranker, social copy, show context).
     let tracked_openai = ai.openai.clone().with_cost_tracker(cost_tracker.clone());
@@ -417,9 +527,7 @@ async fn run_clipper_pipeline_inner(
     let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
 
     // Gate: ranked
-    storage
-        .update_job_status(job_id, JobStatus::Ranked, None)
-        .await?;
+    set_job_status(Some(storage), bus, Some(job_id), JobStatus::Ranked, None).await;
 
     // Generate social copy
     let social_copies: Vec<Option<SocialCopy>> = if cfg.clip_social_copy_disabled {
@@ -485,9 +593,23 @@ async fn run_clipper_pipeline_inner(
         );
     }
 
+    let trajectories =
+        compute_clip_trajectories(cfg, input_path, &silences, total_duration_secs, &ranked).await;
+
+    // Resolve caption overrides once per episode (env + per-show JSON).
+    let caption_overrides = CaptionOverrides::load_for_show(
+        std::path::Path::new(&cfg.shows_dir),
+        show_slug_str.as_deref(),
+    )
+    .await;
+
     let mut rendered: Vec<RenderedClip> = Vec::with_capacity(ranked.len());
     for (i, (clip, social)) in ranked.iter().zip(social_copies.iter()).enumerate() {
         let idx = i + 1;
+        let clip_trajectory: Option<&[CropKeyframe]> = trajectories
+            .get(i)
+            .map(|t| t.as_slice())
+            .filter(|t| !t.is_empty());
 
         let clip_words: Vec<AlignedWord> = transcript
             .words
@@ -512,7 +634,7 @@ async fn run_clipper_pipeline_inner(
             let ass_path = clips_dir.join(format!("clip_{idx:02}_{}.ass", spec.label));
 
             let profile = (spec.profile)();
-            let style = (spec.style)();
+            let style = spec.aspect.caption_style(&caption_overrides);
 
             if let Err(e) = captions::write_ass(
                 &ass_path,
@@ -533,7 +655,7 @@ async fn run_clipper_pipeline_inner(
             if let Some(sc) = social {
                 let hook = sc.overlay_hook.trim();
                 if !hook.is_empty() {
-                    let overlay_style = (spec.overlay_style)();
+                    let overlay_style = spec.aspect.overlay_style(&caption_overrides);
                     match captions::write_overlay_ass(
                         &overlay_ass_path,
                         hook,
@@ -557,6 +679,13 @@ async fn run_clipper_pipeline_inner(
             }
 
             let enh_audio_ref = enhanced_wav.as_deref();
+            // ASD trajectory is only meaningful for 9x16 today; render ignores
+            // it for other aspects and falls back to its existing path.
+            let keyframes_for_variant = if spec.label == "9x16" {
+                clip_trajectory
+            } else {
+                None
+            };
             let res = render::render_clip_with_audio(
                 &cfg.ffmpeg,
                 input_path,
@@ -566,6 +695,7 @@ async fn run_clipper_pipeline_inner(
                 &out_path,
                 &profile,
                 &layers,
+                keyframes_for_variant,
             )
             .await;
 
@@ -609,9 +739,7 @@ async fn run_clipper_pipeline_inner(
     }
 
     // Gate: rendered
-    storage
-        .update_job_status(job_id, JobStatus::Rendered, None)
-        .await?;
+    set_job_status(Some(storage), bus, Some(job_id), JobStatus::Rendered, None).await;
 
     // Post to platforms
     let platforms = platforms::Platform::from_config(cfg, google);
@@ -639,9 +767,7 @@ async fn run_clipper_pipeline_inner(
     }
 
     // Gate: posted
-    storage
-        .update_job_status(job_id, JobStatus::Posted, None)
-        .await?;
+    set_job_status(Some(storage), bus, Some(job_id), JobStatus::Posted, None).await;
 
     // Finalize cost tracking: snapshot and persist.
     let cost_snap = cost_tracker.snapshot();
@@ -714,6 +840,7 @@ async fn run_clipper_pipeline_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_clipper_local_once(
     cfg: &Config,
     google: Option<&GoogleAuth>,
@@ -723,6 +850,7 @@ pub async fn run_clipper_local_once(
     digest_mode: DigestMode,
     storage: Option<&Storage>,
     job_id: Option<&str>,
+    bus: Option<&crate::events::EventBus>,
 ) -> Result<()> {
     let result = run_clipper_inner(
         cfg,
@@ -733,15 +861,44 @@ pub async fn run_clipper_local_once(
         digest_mode,
         storage,
         job_id,
+        bus,
     )
     .await;
     if let Err(ref e) = result {
         let msg = format!("{e:#}");
-        set_job_status(storage, job_id, JobStatus::Failed, Some(&msg)).await;
+        set_job_status(storage, bus, job_id, JobStatus::Failed, Some(&msg)).await;
+        // Terminal JobFailed event for the WS stream (the worker also emits
+        // one as a fallback — duplicates are harmless because the dashboard
+        // last-write-wins).
+        if let (Some(bus), Some(jid)) = (bus, job_id) {
+            let media = std::path::Path::new(local_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(local_path)
+                .to_string();
+            bus.emit(crate::events::PipelineEvent::JobFailed {
+                job_id: jid.to_string(),
+                media,
+                error: msg,
+            });
+        }
+    } else if let (Some(bus), Some(storage), Some(jid)) = (bus, storage, job_id) {
+        let clips_generated = storage.count_clips_for_job(jid).await.unwrap_or(0);
+        let media = std::path::Path::new(local_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(local_path)
+            .to_string();
+        bus.emit(crate::events::PipelineEvent::JobComplete {
+            job_id: jid.to_string(),
+            media,
+            clips_generated,
+        });
     }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_clipper_inner(
     cfg: &Config,
     google: Option<&GoogleAuth>,
@@ -751,6 +908,7 @@ async fn run_clipper_inner(
     digest_mode: DigestMode,
     storage: Option<&Storage>,
     job_id: Option<&str>,
+    bus: Option<&crate::events::EventBus>,
 ) -> Result<()> {
     if digest_mode.sends_email() {
         if google.is_none() {
@@ -915,7 +1073,7 @@ async fn run_clipper_inner(
     }
 
     // ── Status: transcribed ──
-    set_job_status(storage, job_id, JobStatus::Transcribed, None).await;
+    set_job_status(storage, bus, job_id, JobStatus::Transcribed, None).await;
 
     // Create a tracked OpenAI client for LLM calls.
     let tracked_openai = ai.openai.clone().with_cost_tracker(cost_tracker.clone());
@@ -1121,32 +1279,13 @@ async fn run_clipper_inner(
     }
 
     // ── Status: ranked ──
-    set_job_status(storage, job_id, JobStatus::Ranked, None).await;
+    set_job_status(storage, bus, job_id, JobStatus::Ranked, None).await;
 
-    // Write clip rows to DB now that we have ranked clips.
-    if let (Some(st), Some(jid)) = (storage, job_id) {
-        for (i, clip) in ranked.iter().enumerate() {
-            let clip_id = format!("{jid}_clip_{}", i + 1);
-            let start_ms = (clip.start_secs * 1000.0) as i64;
-            let end_ms = (clip.end_secs * 1000.0) as i64;
-            if let Err(e) = st
-                .insert_clip(
-                    &clip_id,
-                    jid,
-                    start_ms,
-                    end_ms,
-                    Some((i + 1) as i64),
-                    Some(clip.score as f64),
-                    Some(&clip.hook),
-                    Some(&clip.reasoning),
-                    clip.trend_match.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(clip = i + 1, error = ?e, "failed to write clip to DB");
-            }
-        }
-    }
+    // NOTE: insert_clip is now deferred to AFTER the post-VLM truncate to
+    // `final_top_k` so the `clips` table only holds the clips that actually
+    // got rendered. Inserting all `llm_top_k` candidates here would write
+    // ~20 rows even when CLIP_TOP_K=5, causing the dashboard's Clips page
+    // to show stale candidate cards that have no rendered variants.
 
     // Optional: VLM re-rank top-N using frames + transcript.
     let ranked = match VlmReranker::from_config(cfg, Some(&cost_tracker)) {
@@ -1219,6 +1358,32 @@ async fn run_clipper_inner(
     };
 
     let ranked: Vec<_> = ranked.into_iter().take(final_top_k).collect();
+
+    // Write the final survivors to the clips table. Doing it here (not before
+    // VLM rerank) means `clips` count matches `CLIP_TOP_K` exactly.
+    if let (Some(st), Some(jid)) = (storage, job_id) {
+        for (i, clip) in ranked.iter().enumerate() {
+            let clip_id = format!("{jid}_clip_{}", i + 1);
+            let start_ms = (clip.start_secs * 1000.0) as i64;
+            let end_ms = (clip.end_secs * 1000.0) as i64;
+            if let Err(e) = st
+                .insert_clip(
+                    &clip_id,
+                    jid,
+                    start_ms,
+                    end_ms,
+                    Some((i + 1) as i64),
+                    Some(clip.score as f64),
+                    Some(&clip.hook),
+                    Some(&clip.reasoning),
+                    clip.trend_match.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(clip = i + 1, error = ?e, "failed to write clip to DB");
+            }
+        }
+    }
 
     // Generate per-platform social-media copy for each top clip. One LLM call
     // per clip; non-fatal — a single failure logs and continues.
@@ -1321,9 +1486,23 @@ async fn run_clipper_inner(
     };
     let uploader = uploader.as_ref();
 
+    let trajectories =
+        compute_clip_trajectories(cfg, &input_path, &silences, total_duration_secs, &ranked).await;
+
+    // Resolve caption overrides once per episode (env + per-show JSON).
+    let caption_overrides = CaptionOverrides::load_for_show(
+        std::path::Path::new(&cfg.shows_dir),
+        show_slug.as_deref(),
+    )
+    .await;
+
     let mut rendered: Vec<RenderedClip> = Vec::with_capacity(ranked.len());
     for (i, (clip, social)) in ranked.iter().zip(social_copies.iter()).enumerate() {
         let idx = i + 1;
+        let clip_trajectory: Option<&[CropKeyframe]> = trajectories
+            .get(i)
+            .map(|t| t.as_slice())
+            .filter(|t| !t.is_empty());
 
         // Shift word timestamps into clip-local time once; reused for every aspect.
         let clip_words: Vec<AlignedWord> = transcript
@@ -1352,7 +1531,7 @@ async fn run_clipper_inner(
                 Some(lufs) => (spec.profile)().with_loudness(lufs),
                 None => (spec.profile)(),
             };
-            let style = (spec.style)();
+            let style = spec.aspect.caption_style(&caption_overrides);
 
             if let Err(e) = captions::write_ass(
                 &ass_path,
@@ -1376,7 +1555,7 @@ async fn run_clipper_inner(
             if let Some(sc) = social {
                 let hook = sc.overlay_hook.trim();
                 if !hook.is_empty() {
-                    let overlay_style = (spec.overlay_style)();
+                    let overlay_style = spec.aspect.overlay_style(&caption_overrides);
                     match captions::write_overlay_ass(
                         &overlay_ass_path,
                         hook,
@@ -1401,6 +1580,11 @@ async fn run_clipper_inner(
             }
 
             let enh_audio_ref = enhanced_wav.as_deref();
+            let keyframes_for_variant = if spec.label == "9x16" {
+                clip_trajectory
+            } else {
+                None
+            };
             let res = render::render_clip_with_audio(
                 &cfg.ffmpeg,
                 &input_path,
@@ -1410,6 +1594,7 @@ async fn run_clipper_inner(
                 &out_path,
                 &profile,
                 &layers,
+                keyframes_for_variant,
             )
             .await;
 
@@ -1510,7 +1695,7 @@ async fn run_clipper_inner(
     }
 
     // ── Status: rendered ──
-    set_job_status(storage, job_id, JobStatus::Rendered, None).await;
+    set_job_status(storage, bus, job_id, JobStatus::Rendered, None).await;
 
     // Write clip_renders rows to DB.
     if let (Some(st), Some(jid)) = (storage, job_id) {
@@ -1614,7 +1799,7 @@ async fn run_clipper_inner(
         tracing::info!(total_posted, "clipper: posting complete");
 
         // ── Status: posted ──
-        set_job_status(storage, job_id, JobStatus::Posted, None).await;
+        set_job_status(storage, bus, job_id, JobStatus::Posted, None).await;
 
         // Write post rows to DB.
         if let (Some(st), Some(jid)) = (storage, job_id) {
@@ -1719,7 +1904,7 @@ async fn run_clipper_inner(
     }
 
     // ── Status: done ──
-    set_job_status(storage, job_id, JobStatus::Done, None).await;
+    set_job_status(storage, bus, job_id, JobStatus::Done, None).await;
 
     Ok(())
 }
@@ -1742,12 +1927,37 @@ struct RenderedVariant {
 }
 
 /// One requested render format: aspect-ratio label + factories for the matching
-/// `RenderProfile`, `CaptionStyle`, and `OverlayStyle`.
+/// `RenderProfile`, plus a discriminator so the caller can build aspect-aware
+/// `CaptionStyle` / `OverlayStyle` with the right override slot.
+#[derive(Clone, Copy)]
 struct FormatSpec {
     label: &'static str,
     profile: fn() -> RenderProfile,
-    style: fn() -> CaptionStyle,
-    overlay_style: fn() -> OverlayStyle,
+    aspect: FormatAspect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatAspect {
+    Vertical,
+    Square,
+    Landscape,
+}
+
+impl FormatAspect {
+    fn caption_style(self, o: &CaptionOverrides) -> CaptionStyle {
+        match self {
+            FormatAspect::Vertical => CaptionStyle::for_vertical_with(o),
+            FormatAspect::Square => CaptionStyle::for_square_with(o),
+            FormatAspect::Landscape => CaptionStyle::for_landscape_with(o),
+        }
+    }
+    fn overlay_style(self, o: &CaptionOverrides) -> OverlayStyle {
+        match self {
+            FormatAspect::Vertical => OverlayStyle::for_vertical_with(o),
+            FormatAspect::Square => OverlayStyle::for_square_with(o),
+            FormatAspect::Landscape => OverlayStyle::for_landscape_with(o),
+        }
+    }
 }
 
 fn parse_render_formats(spec: &str) -> Vec<FormatSpec> {
@@ -1762,20 +1972,17 @@ fn parse_render_formats(spec: &str) -> Vec<FormatSpec> {
             "9x16" | "vertical" | "shorts" => Some(FormatSpec {
                 label: "9x16",
                 profile: RenderProfile::shorts_vertical,
-                style: CaptionStyle::for_vertical,
-                overlay_style: OverlayStyle::for_vertical,
+                aspect: FormatAspect::Vertical,
             }),
             "1x1" | "square" => Some(FormatSpec {
                 label: "1x1",
                 profile: RenderProfile::linkedin_square,
-                style: CaptionStyle::for_square,
-                overlay_style: OverlayStyle::for_square,
+                aspect: FormatAspect::Square,
             }),
             "16x9" | "landscape" | "horizontal" => Some(FormatSpec {
                 label: "16x9",
                 profile: RenderProfile::bluesky_landscape,
-                style: CaptionStyle::for_landscape,
-                overlay_style: OverlayStyle::for_landscape,
+                aspect: FormatAspect::Landscape,
             }),
             other => {
                 tracing::warn!(format = other, "unknown render format; ignoring");
@@ -2041,9 +2248,22 @@ fn build_manifest_json(
                 None => ("", ""),
             };
 
+            // A/B score lineage. Only present when the corresponding stage
+            // actually ran; viewers should treat missing fields as "stage
+            // skipped" rather than "stage failed".
+            let scores = serde_json::json!({
+                "blended": r.ranked.score,
+                "llm": r.ranked.llm_score,
+                "vlm": r.ranked.vlm_score,
+                "vlm_reasoning": r.ranked.vlm_reasoning,
+                "vlm_premium": r.ranked.vlm_premium_score,
+                "vlm_premium_reasoning": r.ranked.vlm_premium_reasoning,
+            });
+
             serde_json::json!({
                 "rank": r.rank,
                 "score": r.ranked.score,
+                "scores": scores,
                 "start_secs": r.ranked.start_secs,
                 "end_secs": r.ranked.end_secs,
                 "duration_secs": (r.ranked.end_secs - r.ranked.start_secs).max(0.0),
@@ -2065,7 +2285,7 @@ fn build_manifest_json(
         .collect();
 
     let mut manifest = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "episode": media_name,
         "total_duration_secs": total_duration_secs,
         "clips_dir": abs_clips_dir.display().to_string(),
@@ -2288,6 +2508,11 @@ mod tests {
                 hook: hook.to_string(),
                 reasoning: "test".to_string(),
                 trend_match: None,
+                llm_score: Some(score),
+                vlm_score: None,
+                vlm_reasoning: None,
+                vlm_premium_score: None,
+                vlm_premium_reasoning: None,
             },
             social: None,
             variants: vec![RenderedVariant {
@@ -2352,6 +2577,39 @@ mod tests {
     }
 
     #[test]
+    fn manifest_emits_ab_score_lineage() {
+        // Compose a clip that went through both VLM stages.
+        let mut clip = dummy_clip(1, 78, 10.0, 70.0, "hook");
+        clip.ranked.llm_score = Some(80);
+        clip.ranked.vlm_score = Some(70);
+        clip.ranked.vlm_reasoning = Some("static framing".into());
+        clip.ranked.vlm_premium_score = Some(85);
+        clip.ranked.vlm_premium_reasoning = Some("micro-expression payoff".into());
+
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
+        let scores = &manifest["clips"][0]["scores"];
+        assert_eq!(scores["blended"].as_i64(), Some(78));
+        assert_eq!(scores["llm"].as_i64(), Some(80));
+        assert_eq!(scores["vlm"].as_i64(), Some(70));
+        assert_eq!(scores["vlm_reasoning"], "static framing");
+        assert_eq!(scores["vlm_premium"].as_i64(), Some(85));
+        assert_eq!(scores["vlm_premium_reasoning"], "micro-expression payoff");
+    }
+
+    #[test]
+    fn manifest_omits_ab_fields_when_stages_skipped() {
+        // A clip that only the LLM scored — VLM fields should be null.
+        let clip = dummy_clip(1, 65, 10.0, 70.0, "hook");
+        let dir = std::path::PathBuf::from("/tmp/clips");
+        let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &empty_cost());
+        let scores = &manifest["clips"][0]["scores"];
+        assert_eq!(scores["llm"].as_i64(), Some(65));
+        assert!(scores["vlm"].is_null());
+        assert!(scores["vlm_premium"].is_null());
+    }
+
+    #[test]
     fn manifest_includes_cover_frame_when_present() {
         let mut clip = dummy_clip(1, 80, 10.0, 70.0, "hook");
         clip.cover_frame_path = Some(PathBuf::from("/tmp/clips/clip_01_cover.jpg"));
@@ -2405,7 +2663,7 @@ mod tests {
         let manifest = build_manifest_json("ep.mp4", 600.0, &dir, &[clip], &snap);
         assert!(manifest["cost"]["total_cost_usd"].as_f64().unwrap() > 0.0);
         assert_eq!(manifest["cost"]["total_calls"].as_u64().unwrap(), 1);
-        assert_eq!(manifest["schema_version"].as_u64().unwrap(), 2);
+        assert_eq!(manifest["schema_version"].as_u64().unwrap(), 3);
     }
 
     #[test]

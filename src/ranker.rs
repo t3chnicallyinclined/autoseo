@@ -16,6 +16,11 @@ use crate::openai::OpenAiClient;
 /// One LLM-ranked clip. `refined_start_secs` / `refined_end_secs` are clamped on
 /// our side to ±5s of the original candidate so an off-the-rails LLM can't make
 /// us cut into adjacent content.
+///
+/// A/B lineage fields (`llm_score`, `vlm_score`, `vlm_premium_score` and their
+/// `*_reasoning` siblings) preserve each stage's verdict so the manifest can
+/// show how the score evolved. Each is set only by its producing stage and
+/// `score` always holds the latest blended value.
 #[derive(Debug, Clone)]
 pub struct RankedClip {
     pub candidate_index: usize,
@@ -25,6 +30,17 @@ pub struct RankedClip {
     pub hook: String,
     pub reasoning: String,
     pub trend_match: Option<String>,
+    /// The transcript-only LLM score before any VLM blending. Set once by the
+    /// ranker.
+    pub llm_score: Option<i32>,
+    /// Standard-lane VLM score (e.g. Qwen3-VL-8B), pre-blend.
+    pub vlm_score: Option<i32>,
+    /// Standard-lane VLM short reasoning.
+    pub vlm_reasoning: Option<String>,
+    /// Premium-lane VLM score (e.g. Qwen2.5-VL-72B via OpenRouter), pre-blend.
+    pub vlm_premium_score: Option<i32>,
+    /// Premium-lane VLM short reasoning.
+    pub vlm_premium_reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,17 +119,23 @@ impl Ranker {
                 let (refined_start, refined_end) =
                     self.clamp_refinement(c, clip.refined_start_secs, clip.refined_end_secs);
 
+                let score = clip.score.clamp(0, 100);
                 all_ranked.push(RankedClip {
                     candidate_index: absolute_idx,
                     start_secs: refined_start,
                     end_secs: refined_end,
-                    score: clip.score.clamp(0, 100),
+                    score,
                     hook: clip.hook.trim().to_string(),
                     reasoning: clip.reasoning.trim().to_string(),
                     trend_match: clip
                         .trend_match
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
+                    llm_score: Some(score),
+                    vlm_score: None,
+                    vlm_reasoning: None,
+                    vlm_premium_score: None,
+                    vlm_premium_reasoning: None,
                 });
             }
         }

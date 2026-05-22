@@ -18,6 +18,10 @@ pub enum JobStatus {
     Posted,
     Done,
     Failed,
+    /// User-cancelled before the worker reached the job. Terminal.
+    /// Mid-flight cancellation is not yet implemented; only `pending` jobs
+    /// can be cancelled today.
+    Cancelled,
 }
 
 impl JobStatus {
@@ -30,6 +34,7 @@ impl JobStatus {
             JobStatus::Posted => "posted",
             JobStatus::Done => "done",
             JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
         }
     }
 
@@ -42,6 +47,7 @@ impl JobStatus {
             "posted" => Some(JobStatus::Posted),
             "done" => Some(JobStatus::Done),
             "failed" => Some(JobStatus::Failed),
+            "cancelled" => Some(JobStatus::Cancelled),
             _ => None,
         }
     }
@@ -647,6 +653,29 @@ impl Storage {
     }
 
     /// Update the accumulated cost_cents for a job.
+    /// Count clips associated with this job. Used by the WS emitter to fill
+    /// `JobComplete.clipsGenerated`. Returns 0 on DB error rather than failing
+    /// so a completed job isn't marked as broken just because the count query
+    /// hiccupped.
+    pub async fn count_clips_for_job(&self, job_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let n = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+            let conn = conn.blocking_lock();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM clips WHERE job_id = ?1",
+                    rusqlite::params![job_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(n)
+        })
+        .await
+        .context("join count_clips_for_job")??;
+        Ok(n)
+    }
+
     pub async fn update_job_cost(&self, job_id: &str, cost_cents: i64) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let job_id = job_id.to_string();
@@ -730,6 +759,110 @@ impl Storage {
         .await
         .context("join retry_job")??;
         Ok(())
+    }
+
+    /// Mark a pending job as cancelled so the worker skips it.
+    ///
+    /// Only `pending` is supported today — once a job has been claimed by the
+    /// worker (any status from `transcribed` onward), cooperative
+    /// cancellation hasn't been wired through the clipper yet. Returns an
+    /// error if the job is not in `pending` status.
+    pub async fn cancel_pending_job(&self, job_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            let now = unix_now();
+            let changed = conn
+                .execute(
+                    "UPDATE jobs SET status = 'cancelled', updated_at = ?1 \
+                     WHERE id = ?2 AND status = 'pending'",
+                    rusqlite::params![now, job_id],
+                )
+                .context("cancel_pending_job update")?;
+            if changed == 0 {
+                anyhow::bail!(
+                    "job {job_id} is not in 'pending' status (mid-flight cancel not yet supported)"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .context("join cancel_pending_job")??;
+        Ok(())
+    }
+
+    /// Delete a job row. The schema has `ON DELETE CASCADE` on `clips`,
+    /// `clip_renders`, and `posts`, so removing the job row removes all
+    /// downstream rows too. Returns the number of rows removed (0 if the job
+    /// didn't exist).
+    pub async fn delete_job(&self, job_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        let n = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.blocking_lock();
+            // SQLite enforces foreign keys per-connection — `PRAGMA
+            // foreign_keys = ON` is set at open time in `Storage::open`. The
+            // CASCADE will fire on this DELETE.
+            let n = conn
+                .execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![job_id])
+                .context("delete_job DELETE")?;
+            Ok(n)
+        })
+        .await
+        .context("join delete_job")??;
+        Ok(n)
+    }
+
+    /// Clone a job for a re-run: copies show_slug, media_name, source_url,
+    /// local_path, and config_json into a brand-new row with a generated id
+    /// and `status = 'pending'`. Returns the new job id.
+    ///
+    /// Use case: you finished a run, tweaked prompts/settings, and want to
+    /// reprocess the same source without losing the original outputs.
+    pub async fn clone_job_for_rerun(&self, original_id: &str) -> anyhow::Result<String> {
+        let conn = self.conn.clone();
+        let original_id = original_id.to_string();
+        let new_id = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let conn = conn.blocking_lock();
+            let row: Option<(
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = conn
+                .query_row(
+                    "SELECT show_slug, media_name, drive_file_id, local_path, source_url, \
+                            config_json FROM jobs WHERE id = ?1",
+                    rusqlite::params![original_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .ok();
+            let row = row.ok_or_else(|| anyhow::anyhow!("job {original_id} not found"))?;
+            // Generate a new id with the same `dashboard_` prefix the
+            // dashboard create-job path uses, so the worker treats it the
+            // same way.
+            let now = unix_now();
+            use rand::Rng;
+            let rand: u32 = rand::thread_rng().r#gen::<u32>() & 0xFFFFFF;
+            let new_id = format!("dashboard_{now}_{rand:06x}");
+            conn.execute(
+                "INSERT INTO jobs (id, show_slug, media_name, drive_file_id, local_path, \
+                                   source_url, config_json, status, retry_count, cost_cents, \
+                                   created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, 0, ?8, ?8)",
+                rusqlite::params![
+                    new_id, row.0, row.1, row.2, row.3, row.4, row.5, now
+                ],
+            )
+            .context("clone_job_for_rerun INSERT")?;
+            Ok(new_id)
+        })
+        .await
+        .context("join clone_job_for_rerun")??;
+        Ok(new_id)
     }
 
     /// Insert a clip row. Idempotent (INSERT OR REPLACE).

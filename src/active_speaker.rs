@@ -240,6 +240,9 @@ fn score_faces(
 
 /// Detect the active speaker per frame using face presence × VAD overlap.
 ///
+/// Without smoothing the per-frame winner can flicker between faces on near-tie
+/// scores; use [`detect_active_speaker_smoothed`] in real pipelines.
+///
 /// # Arguments
 /// * `frames` — Per-frame face detections (sorted by timestamp).
 /// * `speech_segments` — VAD-derived speech intervals.
@@ -320,6 +323,116 @@ pub fn detect_active_speaker(
     }
 
     results
+}
+
+/// Same as [`detect_active_speaker`] but rejects single-frame flicker: a new
+/// candidate must be the per-frame winner for `hold_frames` consecutive frames
+/// before the elected speaker actually switches. Within the hold window the
+/// previous speaker's bbox is reused (looked up by track_id from the per-frame
+/// election so the rendered crop keeps moving with the held face).
+///
+/// `hold_frames = 0` or `1` disables smoothing (equivalent to the raw
+/// per-frame election).
+pub fn detect_active_speaker_smoothed(
+    frames: &[FrameFaces],
+    speech_segments: &[SpeechSegment],
+    fps: f64,
+    max_match_distance: f64,
+    hold_frames: usize,
+) -> Vec<ActiveSpeakerFrame> {
+    let raw = detect_active_speaker(frames, speech_segments, fps, max_match_distance);
+    if hold_frames <= 1 {
+        return raw;
+    }
+
+    // Walk forward, keeping the previously-committed speaker until a different
+    // candidate has won `hold_frames` consecutive frames. While the challenger
+    // hasn't earned the seat yet, emit the held speaker's current-frame bbox if
+    // it's still on screen (looked up by track_id); otherwise leave the
+    // election unchanged and trust the renderer to keep the last-known crop.
+    let mut out = Vec::with_capacity(raw.len());
+    let mut committed_id: Option<usize> = None;
+    let mut committed_bbox: Option<FaceBbox> = None;
+    let mut challenger_id: Option<usize> = None;
+    let mut challenger_streak: usize = 0;
+
+    // Per-frame map of track_id → bbox so we can keep showing the held
+    // speaker's current-frame bbox on frames where someone else was the
+    // per-frame winner. Re-runs the same tracker the raw election used.
+    let tracked_frames = assign_tracks(frames, max_match_distance);
+    let by_frame: Vec<std::collections::HashMap<usize, FaceBbox>> = tracked_frames
+        .iter()
+        .map(|tf| {
+            tf.iter()
+                .map(|t| (t.track_id, t.bbox.clone()))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .collect();
+
+    for (i, asd) in raw.iter().enumerate() {
+        let winner = asd.track_id;
+        let timestamp = asd.timestamp_secs;
+
+        match (committed_id, winner) {
+            // No commitment yet → commit immediately to the first non-None winner.
+            (None, Some(w)) => {
+                committed_id = Some(w);
+                committed_bbox = asd.active_speaker_bbox.clone();
+                challenger_id = None;
+                challenger_streak = 0;
+            }
+            // No winner this frame → keep prior commitment; if held face is
+            // still on screen, surface its current bbox; otherwise reuse
+            // last-known bbox (caller's One-Euro will then drift / reset).
+            (Some(c), None) => {
+                committed_bbox = by_frame
+                    .get(i)
+                    .and_then(|m| m.get(&c).cloned())
+                    .or(committed_bbox.take());
+                challenger_id = None;
+                challenger_streak = 0;
+            }
+            // Same winner as committed → reset challenger, refresh bbox.
+            (Some(c), Some(w)) if c == w => {
+                committed_bbox = asd.active_speaker_bbox.clone();
+                challenger_id = None;
+                challenger_streak = 0;
+            }
+            // Different winner → start / continue challenger streak.
+            (Some(c), Some(w)) => {
+                if challenger_id == Some(w) {
+                    challenger_streak += 1;
+                } else {
+                    challenger_id = Some(w);
+                    challenger_streak = 1;
+                }
+                if challenger_streak >= hold_frames {
+                    // Challenger earned the seat.
+                    committed_id = Some(w);
+                    committed_bbox = asd.active_speaker_bbox.clone();
+                    challenger_id = None;
+                    challenger_streak = 0;
+                } else {
+                    // Still holding — surface the held speaker's bbox at this
+                    // frame if available.
+                    committed_bbox = by_frame
+                        .get(i)
+                        .and_then(|m| m.get(&c).cloned())
+                        .or(committed_bbox.take());
+                }
+            }
+            // No committed and no winner — nothing to emit yet.
+            (None, None) => {}
+        }
+
+        out.push(ActiveSpeakerFrame {
+            timestamp_secs: timestamp,
+            active_speaker_bbox: committed_bbox.clone(),
+            track_id: committed_id,
+        });
+    }
+
+    out
 }
 
 // ── Decision documentation ──────────────────────────────────────────────────
@@ -621,6 +734,108 @@ mod tests {
         let frame0_ids: Vec<usize> = tracked[0].iter().map(|t| t.track_id).collect();
         let frame1_ids: Vec<usize> = tracked[1].iter().map(|t| t.track_id).collect();
         assert_eq!(frame0_ids, frame1_ids);
+    }
+
+    #[test]
+    fn smoothing_rejects_single_frame_flicker() {
+        // Face A dominates; Face B steals the election for one frame in the
+        // middle. With hold_frames=3, B's single-frame win shouldn't switch
+        // the committed speaker.
+        let speech = vec![SpeechSegment {
+            start_secs: 0.0,
+            end_secs: 1.0,
+        }];
+        let mut frames: Vec<FrameFaces> = Vec::new();
+        for i in 0..10 {
+            let t = i as f64 * 0.1;
+            // A always present at (100, 100); B present and louder only at i=5.
+            let mut faces = vec![face(100.0, 100.0, 50.0, 60.0, 0.95)];
+            if i == 5 {
+                // Briefly higher-confidence B at (300, 100). To make B *win*
+                // on this single frame we make B's confidence higher; raw
+                // ASD would tie on overlap_ratio and tie-break by confidence.
+                faces.push(face(300.0, 100.0, 50.0, 60.0, 0.99));
+            }
+            frames.push(FrameFaces {
+                timestamp_secs: t,
+                faces,
+            });
+        }
+
+        let raw = detect_active_speaker(&frames, &speech, 10.0, 150.0);
+        let smoothed = detect_active_speaker_smoothed(&frames, &speech, 10.0, 150.0, 3);
+
+        // Sanity: raw might flicker on the frame where B appears; smoothing
+        // should hold A all the way through.
+        let _ = raw;
+        let all_a = smoothed
+            .iter()
+            .filter_map(|f| f.track_id)
+            .all(|id| id == 0);
+        assert!(
+            all_a,
+            "expected smoothing to hold track 0 through single-frame flicker, got: {:?}",
+            smoothed.iter().map(|f| f.track_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn smoothing_commits_after_streak_meets_threshold() {
+        // A wins for 3 frames, then B wins for 4 frames. With hold_frames=3
+        // the commit should switch to B once its streak reaches 3.
+        let speech = vec![SpeechSegment {
+            start_secs: 0.0,
+            end_secs: 1.0,
+        }];
+        let mut frames: Vec<FrameFaces> = Vec::new();
+        for i in 0..7 {
+            let t = i as f64 * 0.1;
+            // First 3 frames: only A. Next 4 frames: both present, B wins on
+            // confidence.
+            let mut faces = vec![face(100.0, 100.0, 50.0, 60.0, 0.95)];
+            if i >= 3 {
+                faces.push(face(300.0, 100.0, 50.0, 60.0, 0.99));
+            }
+            frames.push(FrameFaces {
+                timestamp_secs: t,
+                faces,
+            });
+        }
+
+        let smoothed = detect_active_speaker_smoothed(&frames, &speech, 10.0, 150.0, 3);
+        let ids: Vec<Option<usize>> = smoothed.iter().map(|f| f.track_id).collect();
+        // Frames 0..3 commit to A (track 0). Frames 3..5 are still held on A
+        // while B streaks. Frame 5 is B's 3rd consecutive win → commit flips.
+        assert_eq!(ids[0], Some(0), "frame 0 should commit A");
+        assert_eq!(ids[2], Some(0), "frame 2 still A");
+        assert_eq!(ids[4], Some(0), "frame 4: B's streak < hold_frames, hold A");
+        assert_eq!(
+            ids[5],
+            Some(1),
+            "frame 5: B's 3rd consecutive win flips commit"
+        );
+    }
+
+    #[test]
+    fn smoothing_with_zero_hold_matches_raw() {
+        let speech = vec![SpeechSegment {
+            start_secs: 0.0,
+            end_secs: 1.0,
+        }];
+        let frames: Vec<FrameFaces> = (0..5)
+            .map(|i| FrameFaces {
+                timestamp_secs: i as f64 * 0.2,
+                faces: vec![face(100.0, 100.0, 50.0, 60.0, 0.9)],
+            })
+            .collect();
+        let raw = detect_active_speaker(&frames, &speech, 5.0, 150.0);
+        let smoothed_0 = detect_active_speaker_smoothed(&frames, &speech, 5.0, 150.0, 0);
+        let smoothed_1 = detect_active_speaker_smoothed(&frames, &speech, 5.0, 150.0, 1);
+        assert_eq!(raw.len(), smoothed_0.len());
+        assert_eq!(raw.len(), smoothed_1.len());
+        for (r, s) in raw.iter().zip(&smoothed_0) {
+            assert_eq!(r.track_id, s.track_id);
+        }
     }
 
     #[test]

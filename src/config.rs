@@ -238,8 +238,15 @@ pub struct Config {
     pub vlm_rerank_enabled: bool,
 
     /// Vision-language model id on HF (for re-rank). Qwen3-VL-8B-Instruct is the
-    /// current pick for long-video understanding at this size class.
-    #[arg(long, env = "VLM_MODEL", default_value = "Qwen/Qwen3-VL-8B-Instruct")]
+    /// current pick for long-video understanding at this size class. The
+    /// `:novita` suffix routes via the Novita Inference Provider, which actively
+    /// serves this model — bare `Qwen/Qwen3-VL-8B-Instruct` against
+    /// `hf-inference` returns "model_not_available" today.
+    #[arg(
+        long,
+        env = "VLM_MODEL",
+        default_value = "Qwen/Qwen3-VL-8B-Instruct:novita"
+    )]
     pub vlm_model: String,
 
     /// How many candidates the LLM ranker passes to the VLM re-rank pass.
@@ -546,7 +553,10 @@ pub struct Config {
     #[arg(
         long,
         env = "AST_MODEL_URL",
-        default_value = "https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593/resolve/main/onnx/model.onnx"
+        // The original MIT/ast-finetuned-audioset repo removed its onnx/
+        // subfolder; this onnx-community export is the actively-maintained
+        // mirror with the same model weights.
+        default_value = "https://huggingface.co/onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX/resolve/main/onnx/model.onnx"
     )]
     pub ast_model_url: String,
 
@@ -557,10 +567,13 @@ pub struct Config {
 
     /// URL to download the SCRFD ONNX model from on first use.
     /// The model is saved to `{WORK_DIR}/models/scrfd/scrfd_10g_bnkps.onnx`.
+    ///
+    /// The original `deepinsight/scrfd_10g_bnkps` repo is gated/restructured;
+    /// `cromsc/scrfd-10g` is a public mirror with the same weights.
     #[arg(
         long,
         env = "SCRFD_MODEL_URL",
-        default_value = "https://huggingface.co/deepinsight/scrfd_10g_bnkps/resolve/main/onnx/model.onnx"
+        default_value = "https://huggingface.co/cromsc/scrfd-10g/resolve/main/scrfd_10g_bnkps.onnx"
     )]
     pub scrfd_model_url: String,
 
@@ -637,10 +650,6 @@ pub struct Config {
     /// Open the browser automatically when the server starts.
     #[arg(long, env = "OPEN_BROWSER", default_value_t = false)]
     pub open_browser: bool,
-    /// Port for the WebSocket server that streams live pipeline events.
-    /// Set to 0 to disable the WebSocket server.
-    #[arg(long, env = "WS_PORT", default_value_t = 9823)]
-    pub ws_port: u16,
 
     /// Enable per-job API cost tracking. When true (default), the pipeline
     /// estimates costs from token usage across STT, chat, embedding, and VLM

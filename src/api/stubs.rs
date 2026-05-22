@@ -32,8 +32,97 @@ async fn analytics() -> Json<Value> {
     Json(json!({ "views": [], "topClips": [] }))
 }
 
-async fn pipeline_status() -> Json<Vec<Value>> {
-    Json(vec![])
+/// Project the most-recent job's status onto the dashboard's 8 pipeline
+/// stages so the Pipeline Architecture card lights up live.
+///
+/// Mapping (internal FSM → which stage is currently "active"):
+///   pending     → ingest
+///   transcribed → features  (audio + transcribe are done; features is what
+///                            runs next inside the pipeline)
+///   ranked      → render
+///   rendered    → post
+///   posted      → post (active until done)
+///   done        → all done
+///   failed      → the active stage of the *previous* status becomes "error"
+///
+/// "Most recent" = highest `updated_at`, regardless of status. If there are
+/// no jobs in the DB yet, every stage is `idle`.
+async fn pipeline_status(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
+    const STAGES: &[(&str, &str, &str)] = &[
+        ("ingest", "Ingest", "Gmail/Drive"),
+        ("download", "Download", "Drive API / yt-dlp"),
+        ("audio", "Audio Extract", "ffmpeg"),
+        ("transcribe", "Transcribe", "Whisper"),
+        ("features", "Feature Extract", "VAD/Prosody/Embed"),
+        ("rank", "Rank", "LLM + VLM"),
+        ("render", "Render", "ffmpeg"),
+        ("post", "Post", "Platforms"),
+    ];
+
+    let conn = state.storage.conn();
+    let (status, error_present): (String, bool) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, bool)> {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT status, COALESCE(error, '') FROM jobs ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |r| {
+                    let s: String = r.get(0)?;
+                    let e: String = r.get(1)?;
+                    Ok((s, !e.is_empty()))
+                },
+            )
+            .or_else(|_| Ok::<_, anyhow::Error>((String::new(), false)))
+        })
+        .await
+        .unwrap_or(Ok((String::new(), false)))
+        .unwrap_or((String::new(), false));
+
+    // Map status string → index of the currently-active stage (0-based).
+    // None = no active stage (every stage idle, or all done).
+    let active_idx: Option<usize> = match status.as_str() {
+        "pending" => Some(0),     // ingest
+        "transcribed" => Some(4), // features (audio+transcribe done)
+        "ranked" => Some(6),      // render
+        "rendered" => Some(7),    // post
+        "posted" => Some(7),      // still post until done
+        "done" => None,           // all stages done
+        "failed" => Some(0),      // best-effort; we don't know which gate failed
+        _ => None,                // no jobs at all
+    };
+
+    let is_failed = status == "failed" || error_present;
+    let all_done = status == "done";
+
+    let stages: Vec<Value> = STAGES
+        .iter()
+        .enumerate()
+        .map(|(i, (id, label, sublabel))| {
+            let status_str = if all_done {
+                "done"
+            } else if is_failed && active_idx == Some(i) {
+                "error"
+            } else if let Some(active) = active_idx {
+                if i < active {
+                    "done"
+                } else if i == active {
+                    "active"
+                } else {
+                    "idle"
+                }
+            } else {
+                "idle"
+            };
+            json!({
+                "id": id,
+                "label": label,
+                "sublabel": sublabel,
+                "status": status_str,
+            })
+        })
+        .collect();
+
+    Json(stages)
 }
 
 /// Aggregate cost across all jobs in the DB.
@@ -58,86 +147,6 @@ async fn cost(State(state): State<Arc<AppState>>) -> Json<Value> {
         "budget": 50.0,
         "dailyBurn": 0.0,
     }))
-}
-
-/// List jobs from the DB in the shape the dashboard's Job type expects.
-async fn jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Value>> {
-    let conn = state.storage.conn();
-    let rows: Vec<Value> = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
-        let conn = conn.blocking_lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, show_slug, media_name, status, cost_cents, created_at, updated_at, error \
-             FROM jobs ORDER BY created_at DESC LIMIT 200",
-        )?;
-        let mut rows = Vec::new();
-        let mut iter = stmt.query([])?;
-        while let Some(row) = iter.next()? {
-            let id: String = row.get(0)?;
-            let show_slug: Option<String> = row.get(1)?;
-            let media_name: Option<String> = row.get(2)?;
-            let status: String = row.get(3)?;
-            let cost_cents: i64 = row.get(4).unwrap_or(0);
-            let created_at: i64 = row.get(5).unwrap_or(0);
-            let updated_at: i64 = row.get(6).unwrap_or(0);
-            let error: Option<String> = row.get(7).ok();
-
-            let created_iso = chrono::DateTime::from_timestamp(created_at, 0)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_default();
-            let duration_secs = (updated_at - created_at).max(0);
-            let duration = format!("{}m {}s", duration_secs / 60, duration_secs % 60);
-
-            // Translate the DB's gate-by-gate status into a friendly
-            // dashboard status + progress %. The clipper writes:
-            //   pending → transcribed → ranked → rendered → posted → done
-            // The dashboard's existing Job UI knows about
-            //   pending / transcribing / rendering / done / failed,
-            // so we collapse closely-related stages and surface a stage
-            // string + percentage that's safe to render either way.
-            let (dash_status, stage_label, progress) = match status.as_str() {
-                "pending" => ("pending", "Queued", 5),
-                "transcribed" => ("transcribing", "Transcribed", 30),
-                "ranked" => ("rendering", "Ranked — generating clips", 55),
-                "rendered" => ("rendering", "Rendered — uploading", 80),
-                "posted" => ("rendering", "Posted to platforms", 95),
-                "done" => ("done", "Complete", 100),
-                "failed" => ("failed", "Failed", 0),
-                other => ("pending", other, 5),
-            };
-
-            // Get clip count for this job (cheap join — small table).
-            let clips_generated: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM clips WHERE job_id = ?1",
-                    rusqlite::params![&id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-
-            rows.push(json!({
-                "id": id,
-                "episodeId": null,
-                "showId": show_slug,
-                "media": media_name,
-                "status": dash_status,
-                "stage": stage_label,
-                "progress": progress,
-                "clipsGenerated": clips_generated,
-                "postsSuccess": 0,
-                "postsTotal": 0,
-                "cost": (cost_cents as f64) / 100.0,
-                "duration": duration,
-                "created": created_iso,
-                "error": error,
-            }));
-        }
-        Ok(rows)
-    })
-    .await
-    .unwrap_or(Ok(vec![]))
-    .unwrap_or_default();
-
-    Json(rows)
 }
 
 /// Inspect env vars to report which platform integrations are configured.
@@ -248,7 +257,6 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/shows", get(shows))
         .route("/episodes", get(episodes))
-        .route("/jobs", get(jobs))
         .route("/platforms", get(platforms))
         .route("/trends", get(trends))
         .route("/agents", get(agents))

@@ -525,21 +525,38 @@ fn parse_frame_dimensions(stderr: &str, raw_bytes: &[u8]) -> Result<(u32, u32)> 
     );
 }
 
-/// Download a file from `url` to `dest`, creating parent directories.
+/// Download a model file from a URL into `dest`, creating parent directories
+/// as needed. Attaches `Authorization: Bearer <HF_API_KEY>` when present so
+/// gated huggingface.co URLs (which SCRFD currently is) work.
+///
+/// Follows redirects (HF serves redirects to the actual blob CDN) and
+/// returns a clear error for the common gated-model failure modes.
 async fn download_model(url: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
+    let mut req = reqwest::Client::new().get(url);
+    if let Ok(token) = std::env::var("HF_API_KEY") {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
 
-    if !resp.status().is_success() {
-        anyhow::bail!("SCRFD model download failed: HTTP {}", resp.status());
+    let status = resp.status();
+    if !status.is_success() {
+        // Specific guidance for the common gated-model 4xx codes.
+        let hint = match status.as_u16() {
+            401 => " — model is gated on HuggingFace; set HF_API_KEY (and accept terms on the model page)",
+            403 => " — HF token rejected the model access; visit the model page and accept terms",
+            404 => " — URL not found; the model repo may have restructured",
+            _ => "",
+        };
+        anyhow::bail!("SCRFD model download failed: HTTP {status}{hint}");
     }
 
     let bytes = resp.bytes().await.context("read SCRFD model bytes")?;

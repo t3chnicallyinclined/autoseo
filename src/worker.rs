@@ -21,6 +21,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::ai_pipeline::{AiPipeline, SttBackend};
 use crate::clipper;
 use crate::config::Config;
+use crate::events::{EventBus, PipelineEvent, dashboard_view};
 use crate::gmail::GmailClient;
 use crate::openai::OpenAiClient;
 use crate::show_config::{DigestMode, GlobalPromptPaths, PromptLoader, PromptName};
@@ -29,8 +30,10 @@ use crate::storage::{JobStatus, Storage};
 const POLL_INTERVAL_SECS: u64 = 5;
 
 /// Run the worker loop until the host process is cancelled. Designed to be
-/// spawned via `tokio::spawn` alongside the axum server.
-pub async fn run(cfg: Config, storage: Storage) {
+/// spawned via `tokio::spawn` alongside the axum server. `bus` is cloned into
+/// each pipeline invocation so per-stage events reach all connected
+/// dashboard WebSocket clients.
+pub async fn run(cfg: Config, storage: Storage, bus: EventBus) {
     let mut tick = interval(Duration::from_secs(POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     tracing::info!(
@@ -43,16 +46,33 @@ pub async fn run(cfg: Config, storage: Storage) {
             Ok(Some(job)) => {
                 let job_id = job.id.clone();
                 tracing::info!(job_id, media = ?job.media_name, "worker: starting job");
-                let result = run_job(&cfg, &storage, &job).await;
+                let result = run_job(&cfg, &storage, &bus, &job).await;
                 match result {
                     Ok(()) => tracing::info!(job_id, "worker: job complete"),
                     Err(e) => {
+                        let err_msg = format!("{e:#}");
                         tracing::error!(job_id, error = ?e, "worker: job failed");
                         // The clipper marks the row failed on its own error
-                        // path; fall through in case it didn't.
+                        // path; fall through in case it didn't. Either way
+                        // we publish a final event so the dashboard's stuck
+                        // job indicator clears.
                         let _ = storage
-                            .update_job_status(&job_id, JobStatus::Failed, Some(&format!("{e:#}")))
+                            .update_job_status(&job_id, JobStatus::Failed, Some(&err_msg))
                             .await;
+                        let (status, stage, progress) = dashboard_view("failed");
+                        bus.emit(PipelineEvent::JobUpdate {
+                            job_id: job_id.clone(),
+                            status: status.to_string(),
+                            stage: stage.to_string(),
+                            progress,
+                            clips_generated: None,
+                            media: job.media_name.clone(),
+                        });
+                        bus.emit(PipelineEvent::JobFailed {
+                            job_id,
+                            media: job.media_name.clone().unwrap_or_default(),
+                            error: err_msg,
+                        });
                     }
                 }
             }
@@ -62,7 +82,12 @@ pub async fn run(cfg: Config, storage: Storage) {
     }
 }
 
-async fn run_job(cfg: &Config, storage: &Storage, job: &crate::storage::JobRow) -> Result<()> {
+async fn run_job(
+    cfg: &Config,
+    storage: &Storage,
+    bus: &EventBus,
+    job: &crate::storage::JobRow,
+) -> Result<()> {
     let local_path = ensure_local_source(cfg, storage, job).await?;
 
     let openai_api_key = cfg
@@ -114,6 +139,7 @@ async fn run_job(cfg: &Config, storage: &Storage, job: &crate::storage::JobRow) 
         DigestMode::File,
         Some(storage),
         Some(&job.id),
+        Some(bus),
     )
     .await
 }

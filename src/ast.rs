@@ -407,15 +407,26 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
+    let mut req = reqwest::Client::new().get(url);
+    if let Ok(token) = std::env::var("HF_API_KEY") {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
 
-    if !resp.status().is_success() {
-        anyhow::bail!("AST model download failed: HTTP {}", resp.status());
+    let status = resp.status();
+    if !status.is_success() {
+        let hint = match status.as_u16() {
+            401 => " — model is gated; set HF_API_KEY (and accept terms on the model page)",
+            403 => " — HF token rejected; visit the model page and accept terms",
+            404 => " — URL not found; the model repo may have restructured. Try AST_MODEL_URL=https://huggingface.co/onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX/resolve/main/onnx/model.onnx",
+            _ => "",
+        };
+        anyhow::bail!("AST model download failed: HTTP {status}{hint}");
     }
 
     let bytes = resp.bytes().await.context("read AST model bytes")?;

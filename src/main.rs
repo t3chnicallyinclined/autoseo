@@ -5,6 +5,7 @@ mod ai_pipeline;
 mod align;
 mod analytics;
 mod api;
+mod asd_pipeline;
 mod ast;
 mod candidates;
 mod captions;
@@ -15,6 +16,7 @@ mod cost;
 mod drive;
 mod embed;
 mod enhance;
+mod events;
 mod face_detect;
 mod gmail;
 mod google_auth;
@@ -148,13 +150,18 @@ async fn main() -> anyhow::Result<()> {
         let config_store =
             std::sync::Arc::new(api::config_store::ConfigStore::load(config_path).await?);
 
+        // Single broadcast bus shared by the worker (publisher) and every
+        // `/ws` connection (subscribers).
+        let event_bus = events::EventBus::new();
+
         // Spawn the background worker that picks up `pending` jobs created by
         // the dashboard's New Job dialog and runs them through the clipper.
         // Single-job-at-a-time on purpose — see worker.rs.
         {
             let cfg = cfg.clone();
             let storage = storage.clone();
-            tokio::spawn(async move { worker::run(cfg, storage).await });
+            let bus = event_bus.clone();
+            tokio::spawn(async move { worker::run(cfg, storage, bus).await });
         }
 
         let state = api::AppState {
@@ -162,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             work_dir: cfg.work_dir.clone(),
             dashboard_dist,
             config_store,
+            event_bus,
         };
         return api::serve(state, cfg.api_port, &cfg.api_cors_origins, cfg.open_browser).await;
     }
@@ -282,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
                 digest_mode,
                 Some(&storage),
                 Some(&job_id),
+                None, // CLI path: no dashboard listening, so no event bus
             )
             .await?;
         }
@@ -1055,6 +1064,7 @@ async fn run_clipper_once(
             &video_path,
             &meta.name,
             digest_mode,
+            None, // polling path: no dashboard listening, so no event bus
         )
         .await
         {

@@ -2,19 +2,21 @@ mod clips;
 pub mod config_store;
 mod jobs;
 mod stubs;
+mod ws;
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
+use crate::events::EventBus;
 use crate::storage::Storage;
 use config_store::ConfigStore;
 
@@ -25,6 +27,10 @@ pub struct AppState {
     pub work_dir: String,
     pub dashboard_dist: Option<PathBuf>,
     pub config_store: Arc<ConfigStore>,
+    /// Broadcast channel for pipeline events. Cloned into the worker so it
+    /// can publish job status transitions; subscribed from the `/ws` route
+    /// on every dashboard connection.
+    pub event_bus: EventBus,
 }
 
 #[derive(serde::Serialize)]
@@ -446,7 +452,13 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
     // API routes nested under /api — unknown /api/* paths still return 404
     let api_routes = Router::new()
         .route("/health", get(health))
-        .route("/config", get(get_config).patch(patch_config))
+        // PATCH is the canonical method for partial-update of config keys;
+        // PUT is accepted as an alias because the dashboard's existing
+        // `useUpdateConfig` mutation hits PUT. Both call the same handler.
+        .route(
+            "/config",
+            get(get_config).patch(patch_config).put(patch_config),
+        )
         .route("/config/test/{service}", post(test_service))
         .merge(clips::router())
         .merge(jobs::router())
@@ -464,19 +476,69 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
 
     let app = Router::new()
         .nest("/api", api_routes)
+        // WS at /ws (not /api/ws) so dashboard's `ws://host/ws` default works
+        // and a single cloudflared HTTP tunnel covers both API and WS.
+        .merge(ws::router())
         .nest_service("/media/clipper", media_serve)
         .layer(cors)
         .with_state(Arc::new(state));
 
-    // Serve the dashboard frontend from dist/ as a fallback for non-API paths
+    // Serve the dashboard frontend from dist/. The dashboard's WebSocket hook
+    // looks at `window.__AUTOSEO_WS_URL` first; we patch the served index.html
+    // with a tiny inline script that derives the WS URL from the page's own
+    // origin, so it works for both `localhost:8080` and a cloudflared tunnel
+    // without rebuilding the dashboard.
     match dashboard_dist {
         Some(dist_path) if dist_path.is_dir() => {
-            let index_file = dist_path.join("index.html");
-            // SPA fallback: serve index.html for any path not matched by a static file
-            let serve_dir = ServeDir::new(&dist_path).not_found_service(ServeFile::new(index_file));
-            app.fallback_service(serve_dir)
+            let index_route = {
+                let index_file = dist_path.join("index.html");
+                get(move || serve_index_with_ws_inject(index_file.clone()))
+            };
+            // ServeDir handles assets (js/css/img). Unknown paths fall through
+            // to the SPA index route (also patched) for client-side routing.
+            let fallback_index = dist_path.join("index.html");
+            let serve_dir = ServeDir::new(&dist_path).not_found_service(get(move || {
+                serve_index_with_ws_inject(fallback_index.clone())
+            }));
+            app.route("/", index_route).fallback_service(serve_dir)
         }
         _ => app.fallback(dist_not_found),
+    }
+}
+
+/// Serve the dashboard's index.html with a `window.__AUTOSEO_WS_URL` inject
+/// so the WebSocket hook in the dashboard auto-picks the right ws/wss origin
+/// (same as the page itself). The dashboard hook checks
+/// `window.__AUTOSEO_WS_URL` before falling back to `ws://<host>:9090/ws`, so
+/// this lets local and cloudflared deployments both work without rebuilding.
+async fn serve_index_with_ws_inject(path: PathBuf) -> impl IntoResponse {
+    use axum::http::{StatusCode, header};
+    match tokio::fs::read_to_string(&path).await {
+        Ok(body) => {
+            // Inline script — minimal, defensive (lower-cased protocol match,
+            // works whether `</head>` is upper or lowercase).
+            const INJECT: &str = "<script>(function(){try{var p=location.protocol==='https:'?'wss://':'ws://';window.__AUTOSEO_WS_URL=p+location.host+'/ws';}catch(e){}})();</script>";
+            let patched = if let Some(idx) = body.to_lowercase().find("</head>") {
+                let mut s = String::with_capacity(body.len() + INJECT.len());
+                s.push_str(&body[..idx]);
+                s.push_str(INJECT);
+                s.push_str(&body[idx..]);
+                s
+            } else {
+                // Fall back to prepending — uncommon but keep the page usable.
+                format!("{INJECT}{body}")
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                patched,
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "failed to read dashboard index.html");
+            (StatusCode::INTERNAL_SERVER_ERROR, "dashboard index.html unavailable").into_response()
+        }
     }
 }
 
@@ -578,6 +640,7 @@ mod tests {
             work_dir: "/tmp/test_work".to_string(),
             dashboard_dist: None,
             config_store,
+            event_bus: EventBus::new(),
         }
     }
 
@@ -619,6 +682,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_jobs_returns_empty_when_db_empty() {
+        let app = router(test_state().await, "http://localhost:5173");
+        let req = Request::builder()
+            .uri("/api/jobs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_dashboard_shape() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-1", Some("the-show"), Some("ep.mp4"), None)
+            .await
+            .unwrap();
+
+        let app = router(state, "http://localhost:5173");
+        let req = Request::builder()
+            .uri("/api/jobs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let j = &arr[0];
+        assert_eq!(j["id"], "job-1");
+        assert_eq!(j["showId"], "the-show");
+        assert_eq!(j["media"], "ep.mp4");
+        assert_eq!(j["status"], "pending");
+        assert_eq!(j["stage"], "Queued");
+        assert!(j["progress"].is_number());
+        assert!(j["created"].is_string());
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_404_when_missing() {
+        let app = router(test_state().await, "http://localhost:5173");
+        let req = Request::builder()
+            .uri("/api/jobs/no-such")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_clip_summary() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-2", Some("show"), Some("ep.mp4"), None)
+            .await
+            .unwrap();
+        // Insert a clip so the summary is exercised.
+        state
+            .storage
+            .insert_clip(
+                "clip-1",
+                "job-2",
+                1000,
+                61000,
+                Some(1),
+                Some(82.0),
+                Some("hook"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = router(state, "http://localhost:5173");
+        let req = Request::builder()
+            .uri("/api/jobs/job-2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], "job-2");
+        assert_eq!(json["clipsGenerated"], 1);
+        let clips = json["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0]["id"], "clip-1");
+        assert_eq!(clips[0]["hook"], "hook");
+    }
+
+    #[tokio::test]
+    async fn retry_job_404_when_missing() {
+        let app = router(test_state().await, "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/no-such/retry")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retry_job_409_when_not_failed() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-3", None, Some("ep.mp4"), None)
+            .await
+            .unwrap();
+
+        let app = router(state, "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job-3/retry")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_job_via_api() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-5", None, Some("ep.mp4"), None)
+            .await
+            .unwrap();
+        let app = router(state.clone(), "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job-5/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = state.storage.get_job("job-5").await.unwrap().unwrap();
+        assert_eq!(row.status.as_str(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_rejects_non_pending_job() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-6", None, Some("ep.mp4"), None)
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_job_status("job-6", crate::storage::JobStatus::Done, None)
+            .await
+            .unwrap();
+        let app = router(state, "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job-6/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_job_removes_row_and_cascades_clips() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-7", None, Some("ep.mp4"), None)
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_clip("clip-z", "job-7", 0, 30_000, Some(1), Some(80.0), Some("h"), None, None)
+            .await
+            .unwrap();
+        let app = router(state.clone(), "http://localhost:5173");
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/jobs/job-7")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Job and its clip should both be gone.
+        assert!(state.storage.get_job("job-7").await.unwrap().is_none());
+        assert!(state.storage.get_clip("clip-z").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_job_returns_404_when_missing() {
+        let app = router(test_state().await, "http://localhost:5173");
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/jobs/nope")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rerun_clones_source_into_new_pending_job() {
+        let state = test_state().await;
+        state
+            .storage
+            .enqueue_job(
+                "job-8",
+                Some("the-show"),
+                Some("ep.mp4"),
+                Some("/tmp/source.mp4"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_job_status("job-8", crate::storage::JobStatus::Done, None)
+            .await
+            .unwrap();
+
+        let app = router(state.clone(), "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job-8/rerun")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let new_id = json["id"].as_str().unwrap().to_string();
+        assert_ne!(new_id, "job-8");
+        // Original unchanged
+        let orig = state.storage.get_job("job-8").await.unwrap().unwrap();
+        assert_eq!(orig.status.as_str(), "done");
+        // Clone is pending + carries source fields
+        let clone = state.storage.get_job(&new_id).await.unwrap().unwrap();
+        assert_eq!(clone.status.as_str(), "pending");
+        assert_eq!(clone.show_slug.as_deref(), Some("the-show"));
+        assert_eq!(clone.media_name.as_deref(), Some("ep.mp4"));
+        assert_eq!(clone.local_path.as_deref(), Some("/tmp/source.mp4"));
+    }
+
+    #[tokio::test]
+    async fn rerun_404_when_source_missing() {
+        let app = router(test_state().await, "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/nope/rerun")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retry_job_flips_failed_back_to_pending() {
+        let state = test_state().await;
+        state
+            .storage
+            .create_job("job-4", None, Some("ep.mp4"), None)
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_job_status(
+                "job-4",
+                crate::storage::JobStatus::Failed,
+                Some("ffmpeg died"),
+            )
+            .await
+            .unwrap();
+
+        let app = router(state.clone(), "http://localhost:5173");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs/job-4/retry")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "pending");
+
+        // Verify the DB matches.
+        let row = state.storage.get_job("job-4").await.unwrap().unwrap();
+        assert_eq!(row.status.as_str(), "pending");
+        assert!(row.error.is_none());
+    }
+
+    #[tokio::test]
     async fn unknown_route_returns_404() {
         let app = router(test_state().await, "http://localhost:5173");
 
@@ -646,6 +1011,30 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["needs_setup"], true);
+    }
+
+    #[tokio::test]
+    async fn put_config_works_as_patch_alias() {
+        // The dashboard's useUpdateConfig sends PUT; we accept both methods
+        // so old built dist works without rebuild.
+        let state = test_state().await;
+        let app = router(state, "http://localhost:5173");
+        let body = serde_json::json!({"CLIP_TOP_K": "5"});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT should be accepted as a PATCH alias"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["config"]["CLIP_TOP_K"], "5");
     }
 
     #[tokio::test]

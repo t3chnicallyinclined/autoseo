@@ -67,16 +67,16 @@ cargo run -- --serve-api
 # config.json under WORK_DIR is hot-imported into env on startup
 ```
 
-The dashboard frontend lives in its own repo: [t3chnicallyinclined/autoseo-dashboard](https://github.com/t3chnicallyinclined/autoseo-dashboard) — React 19 + Vite + shadcn/ui + Tailwind v4 + Recharts. To wire it in:
+The dashboard frontend lives in its own repo: [t3chnicallyinclined/autoseo-dashboard](https://github.com/t3chnicallyinclined/autoseo-dashboard) — React 19 + Vite + shadcn/ui + Tailwind v4 + Recharts. Quick wire-up:
 
 ```bash
-git clone https://github.com/t3chnicallyinclined/autoseo-dashboard ../autoseo-dashboard
-cd ../autoseo-dashboard
-npm install
-npm run build              # outputs dist/
-ln -s ../autoseo-dashboard/dist ../autoseo/dashboard/dist
-# or copy: cp -r dist ../autoseo/dashboard/dist
+# Clone alongside autoseo, build, symlink dist into autoseo/dashboard/dist
+git clone https://github.com/t3chnicallyinclined/autoseo-dashboard.git ../autoseo-dashboard
+( cd ../autoseo-dashboard && npm install && npm run build )
+mkdir -p dashboard && ln -snf ../../autoseo-dashboard/dist dashboard/dist
 ```
+
+Full instructions (alternative layouts, sanity checks, what to do if you don't have the dashboard repo at all) live in [DEV.md § Dashboard wiring](DEV.md#dashboard-wiring-one-time-per-machine). The symlink path is gitignored.
 
 Then `cargo run -- --serve-api` from this repo serves the API at `:8080` and the built dashboard at `/`. Override the location via `DASHBOARD_DIST=/abs/path/to/dist`. The Rust API is the source of truth — the dashboard repo also ships a Node/Express dev server (`npm run dev:api`), but it's a convenience for frontend-only iteration; production should always go through the Rust binary.
 

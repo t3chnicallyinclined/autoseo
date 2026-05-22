@@ -9,17 +9,42 @@ This is the standard loop for testing pipeline features (ASD, AST, captions, VLM
 - `~/projects/autoseo` — the Rust backend (this repo). Pipeline + API + WS + worker.
 - `~/projects/autoseo-dashboard` — React 19 + Vite frontend. Builds to `dist/`.
 
-Both repos are pre-cloned side-by-side and have working `.env` files committed locally (not in git).
+Standard layout is the two repos side-by-side under `~/projects/`. The autoseo binary expects the built dashboard at `${DASHBOARD_DIST:-./dashboard/dist}` (a path *inside* the autoseo repo); since the dashboard's own `dist/` lives in the dashboard repo, we bridge that gap with a symlink. The symlink path is **gitignored** (per `.gitignore`'s `/dashboard/dist` line) so it stays per-machine.
 
-## One-time setup
+## Dashboard wiring (one-time, per machine)
 
 ```bash
-# Symlink so the autoseo binary's default DASHBOARD_DIST resolves correctly.
-mkdir -p ~/projects/autoseo/dashboard
-ln -snf ~/projects/autoseo-dashboard/dist ~/projects/autoseo/dashboard/dist
+# 1. Clone the dashboard repo as a sibling of autoseo (if it isn't already).
+cd ~/projects
+git clone https://github.com/t3chnicallyinclined/autoseo-dashboard.git
 
-# Install cloudflared (already installed at ~/.local/bin/cloudflared).
+# 2. Install deps and build dist/.
+cd autoseo-dashboard
+npm install
+npm run build            # outputs to autoseo-dashboard/dist/
+
+# 3. Bridge: symlink from autoseo/dashboard/dist → autoseo-dashboard/dist.
+#    Re-runnable; -snf overwrites any stale link.
+cd ~/projects/autoseo
+mkdir -p dashboard
+ln -snf ../../autoseo-dashboard/dist dashboard/dist
+#                ^^^^^^^^^^^^^^^^^^^ relative target — works across machines
+#                                    as long as the sibling layout is the same.
+
+# 4. Sanity check (no autoseo running needed):
+ls dashboard/dist/index.html && echo "OK: dashboard dist is reachable via the symlink"
+```
+
+**Different sibling layout?** Two options instead of the symlink:
+- Export `DASHBOARD_DIST=/abs/path/to/autoseo-dashboard/dist` before launching autoseo, OR
+- `cp -r ~/projects/autoseo-dashboard/dist ~/projects/autoseo/dashboard/dist` (no symlink, but you'll need to re-copy after every dashboard rebuild).
+
+**No autoseo-dashboard repo at all?** The autoseo binary falls back to a help page at `/` that points to these instructions; the API still works. Only `cargo run -- --serve-api` cares about the dashboard build.
+
+```bash
+# Install cloudflared if not already on PATH.
 # https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+which cloudflared || echo "install cloudflared from the link above"
 ```
 
 ## Rebuild after Rust changes

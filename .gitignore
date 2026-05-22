@@ -3,4 +3,8 @@
 /work
 *.log
 *.onnx
-.env
+
+# Local convenience symlink to the autoseo-dashboard repo's dist/ folder.
+# Set up per-machine — see DEV.md. Don't commit; absolute paths differ
+# across boxes.
+/dashboard/dist

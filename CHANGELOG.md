@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-05-21
+
+### Clipper pipeline features (items 8–11 from the dashboard backlog)
+- **#8 Active-speaker smart-crop**: new `src/asd_pipeline.rs` orchestrator (SCRFD → temporal-smoothed active-speaker election → One-Euro smoothed trajectory), wired into `src/render.rs` via a piecewise-linear x-expression in the ffmpeg crop filter for 9:16. Falls back to static center-crop when SCRFD is disabled or fails. New env: `SCRFD_ENABLED` (default false). Note: the current `cromsc/scrfd-10g` ONNX output shape doesn't match the inference assumptions in `src/face_detect.rs` and panics at runtime; tracked separately.
+- **#9 AST audio events into ranker**: `audio_events` field now documented in `prompts/clips/ranker_user.txt` + scoring heuristic added to `ranker_system.txt`. The LLM ranker can use laughter / applause / music / speech signals to break ties and bump strong reactions.
+- **#10 Caption overrides**: new `CaptionOverrides` struct in `src/captions.rs` with env vars (`CAPTION_FONT_NAME`, `CAPTION_HIGHLIGHT_BGR`, `CAPTION_PRIMARY_BGR`, `CAPTION_OUTLINE_BGR`, `CAPTION_DISABLE_KARAOKE`) and optional per-show JSON at `prompts/shows/{slug}/captions.json`. `FormatSpec` refactored to a `FormatAspect` enum.
+- **#11 Premium VLM lane differentiation + A/B manifest**: rewrote the premium VLM prompt with 5 distinct editorial criteria (micro-expressions, body language, composition stability, lighting, hook-to-visual alignment) so it earns its cost over the standard lane. Added `llm_score` / `vlm_score` / `vlm_reasoning` / `vlm_premium_score` / `vlm_premium_reasoning` to `RankedClip`; manifest schema bumped to v3 with a `scores` block per clip.
+
+### WebSocket multiplexed on main HTTP port
+- New axum WS extractor at `/ws` (same port as `/api/*`), replacing the standalone `tokio-tungstenite` server. One `cloudflared tunnel --url http://localhost:8080` now covers both API and WS.
+- `EventBus` added to `AppState` and threaded through `main.rs → worker → clipper`, publishing `job_update` / `job_complete` / `job_failed` events at every status transition. Wire schema in `src/events.rs` matches the dashboard's `WSMessage` union (flat camelCase, no nested `data`).
+- Served `index.html` is patched with a `window.__AUTOSEO_WS_URL` inject so the dashboard auto-picks ws:// vs wss:// from the page origin without rebuilding.
+- Deleted `src/ws.rs` (dead from an earlier incomplete wiring attempt). Removed `WS_PORT` config field.
+
+### Job management API (`src/api/jobs.rs`)
+- `GET /api/jobs` (list, dashboard-shape mapping) — moved out of stubs.
+- `GET /api/jobs/{id}` — detail with `clips` summary.
+- `POST /api/jobs/{id}/retry` — flip `failed → pending`.
+- `POST /api/jobs/{id}/cancel` — flip `pending → cancelled` (mid-flight cancel deferred; needs cooperative cancellation tokens).
+- `POST /api/jobs/{id}/rerun` — clone the source row into a new pending job; original artifacts untouched.
+- `DELETE /api/jobs/{id}[?purge=true]` — remove row (CASCADE removes clips / renders / posts via FK); optional disk purge of `work/clipper/<media>/` and `work/uploads/<id>/`.
+- New `JobStatus::Cancelled` variant.
+
+### Dashboard plumbing fixes
+- Single `events::dashboard_view()` is the source of truth for the FSM → (status, stage, progress) collapse used by both the `/api/jobs` Job mapper and `/api/pipeline/status`. Fixes the previous Pipeline-card-vs-Jobs-card label mismatch where internal status `transcribed` was rendered as "Transcribing" (it actually means STT *done* and feature extraction is running).
+- `GET /api/pipeline/status` (was a stub returning `[]`) now projects the most-recent job's status onto the 8 dashboard pipeline stages — the Pipeline Architecture card lights up live.
+- `PUT /api/config` aliased to `PATCH` so the dashboard's `useUpdateConfig` mutation actually persists (previous behavior 405'd silently).
+- `clipsGenerated` count now matches `CLIP_TOP_K` exactly: `insert_clip` moved to AFTER the post-VLM truncate so the `clips` table only holds clips that actually got rendered (was inserting `vlm_rerank_top_k` candidates and leaving ghost rows).
+
+### Model defaults + HF auth fixes
+- AST default URL → `onnx-community/ast-finetuned-audioset-…-ONNX` (the original MIT repo restructured its ONNX exports → 404).
+- SCRFD default URL → `cromsc/scrfd-10g` (the original `deepinsight/scrfd_10g_bnkps` is now gated → 401).
+- `VLM_MODEL` default → `Qwen/Qwen3-VL-8B-Instruct:novita` (the `:novita` suffix routes via Novita Inference Provider; the bare model returns `model_not_available` against `hf-inference`).
+- Both `face_detect.rs` and `ast.rs` `download_model()` now send `Authorization: Bearer $HF_API_KEY` so future-gated models keep working.
+
+### Docs
+- New `docs/dashboard-mock-data-workstream.md` — full audit of all 15 dashboard pages with prioritized batched backlog for replacing mock data with live data.
+- New `DEV.md` — runbook for the local dev stack (autoseo + dashboard + cloudflared tunnel) plus dashboard-as-test-harness rule.
+- README rewrite — covers the four `MODE` values, dashboard wiring, full env reference (clipper render knobs, caption overrides, VLM re-rank, audio/video stages, posting, context/trends, R2/S3, yt-dlp ingest, cost tracking), full `/api/*` endpoint list.
+
+### Tests
+- 323 passing, 0 failing, 2 ignored. Up from 285.
+
 ## 2026-05-18
 - Added DeepFilterNet3 speech enhancement pre-stage (`src/enhance.rs`). New envs: `ENHANCE_AUDIO` (default false), `ENHANCE_MODEL_PATH` (default `./models/DeepFilterNet3.tar.gz`). New cargo feature: `enhance`. When enabled, extracted audio is denoised at 48 kHz via DeepFilterNet3 before chunking/STT and clip rendering. Model is auto-downloaded from GitHub releases on first use. Graceful fallback: if the model fails to load or enhancement errors, the pipeline continues with the original audio unchanged. Enhanced audio is also passed to `render_clip_with_audio` so final clips use the denoised track. 4 tests covering disabled path, missing model fallback, 48kHz extraction, and file reuse.
 

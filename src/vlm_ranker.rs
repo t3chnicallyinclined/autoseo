@@ -722,6 +722,7 @@ mod tests {
             hook: "test hook".to_string(),
             reasoning: "test reason".to_string(),
             trend_match: None,
+            hook_type: None,
             llm_score: Some(score),
             vlm_score: None,
             vlm_reasoning: None,

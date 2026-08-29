@@ -205,6 +205,12 @@ pub struct ClipDetail {
     pub cover_path: Option<String>,
     pub cover_url: Option<String>,
     pub trend_match: Option<String>,
+    /// Agency-style hook formula classification set by the ranker LLM.
+    /// One of: `contrarian`, `open_loop`, `specific_number`, `pov`,
+    /// `confession`, `pattern_interrupt`, `list_teaser`, `question`,
+    /// `literal_reaction`, `story`, `other`. `None` for older rows
+    /// written before SCHEMA_V8 or by an LLM that omitted the field.
+    pub hook_type: Option<String>,
     pub status: String,
     pub social_copy_json: Option<String>,
     pub renders: Vec<ClipRenderRow>,
@@ -866,6 +872,11 @@ impl Storage {
     }
 
     /// Insert a clip row. Idempotent (INSERT OR REPLACE).
+    ///
+    /// `hook_type` is the agency-style classification produced by the
+    /// ranker LLM (contrarian / open_loop / etc.). Pass `None` when the
+    /// LLM omitted the field — the column is nullable.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_clip(
         &self,
         clip_id: &str,
@@ -877,6 +888,7 @@ impl Storage {
         hook: Option<&str>,
         reasoning_json: Option<&str>,
         trend_match: Option<&str>,
+        hook_type: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let clip_id = clip_id.to_string();
@@ -884,12 +896,13 @@ impl Storage {
         let hook = hook.map(str::to_string);
         let reasoning_json = reasoning_json.map(str::to_string);
         let trend_match = trend_match.map(str::to_string);
+        let hook_type = hook_type.map(str::to_string);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.blocking_lock();
             conn.execute(
                 "INSERT OR REPLACE INTO clips \
-                 (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, job_id, start_ms, end_ms, rank, score, hook, reasoning_json, trend_match, hook_type) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     clip_id,
                     job_id,
@@ -899,7 +912,8 @@ impl Storage {
                     score,
                     hook,
                     reasoning_json,
-                    trend_match
+                    trend_match,
+                    hook_type
                 ],
             )
             .context("insert_clip")?;
@@ -907,6 +921,33 @@ impl Storage {
         })
         .await
         .context("join insert_clip")??;
+        Ok(())
+    }
+
+    /// Update a clip's time bounds. Used by the dashboard's recut/trim
+    /// flow when the operator nudges start/end by a few seconds and
+    /// re-renders the variant. The corresponding `clip_renders` row(s)
+    /// must be replaced separately via [`insert_clip_render`] — this
+    /// only touches the `clips` table.
+    pub async fn update_clip_bounds(
+        &self,
+        clip_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let clip_id = clip_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE clips SET start_ms = ?1, end_ms = ?2 WHERE id = ?3",
+                rusqlite::params![start_ms, end_ms, clip_id],
+            )
+            .context("update_clip_bounds")?;
+            Ok(())
+        })
+        .await
+        .context("join update_clip_bounds")??;
         Ok(())
     }
 
@@ -1023,7 +1064,7 @@ impl Storage {
             // Helper to keep the row-mapping closure single-source.
             const COLS: &str = "c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
                  c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
-                 c.cover_path, c.cover_url, \
+                 c.cover_path, c.cover_url, c.hook_type, \
                  j.show_slug, j.media_name, j.status as job_status";
 
             let clip_sql = if status_filter.is_some() {
@@ -1054,13 +1095,14 @@ impl Storage {
                     social_copy_json: r.get(10)?,
                     cover_path: r.get(11)?,
                     cover_url: r.get(12)?,
+                    hook_type: r.get(13)?,
                     renders: Vec::new(),
                     posts: Vec::new(),
                     job: Some(JobSummary {
                         id: r.get::<_, String>(1)?,
-                        show_slug: r.get(13)?,
-                        media_name: r.get(14)?,
-                        status: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                        show_slug: r.get(14)?,
+                        media_name: r.get(15)?,
+                        status: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
                     }),
                 })
             };
@@ -1138,7 +1180,7 @@ impl Storage {
                 .prepare(
                     "SELECT c.id, c.job_id, c.start_ms, c.end_ms, c.rank, c.score, c.hook, \
                      c.reasoning_json, c.trend_match, c.status, c.social_copy_json, \
-                     c.cover_path, c.cover_url, \
+                     c.cover_path, c.cover_url, c.hook_type, \
                      j.show_slug, j.media_name, j.status as job_status \
                      FROM clips c LEFT JOIN jobs j ON c.job_id = j.id \
                      WHERE c.id = ?1",
@@ -1160,13 +1202,14 @@ impl Storage {
                         social_copy_json: r.get(10)?,
                         cover_path: r.get(11)?,
                         cover_url: r.get(12)?,
+                        hook_type: r.get(13)?,
                         renders: Vec::new(),
                         posts: Vec::new(),
                         job: Some(JobSummary {
                             id: r.get::<_, String>(1)?,
-                            show_slug: r.get(13)?,
-                            media_name: r.get(14)?,
-                            status: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                            show_slug: r.get(14)?,
+                            media_name: r.get(15)?,
+                            status: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
                         }),
                     })
                 })
@@ -1551,6 +1594,13 @@ ALTER TABLE jobs ADD COLUMN source_url TEXT;
 ALTER TABLE jobs ADD COLUMN config_json TEXT;
 "#;
 
+/// V8 captures the ranker LLM's hook-formula classification per clip
+/// (contrarian / open_loop / specific_number / pov / confession / ...).
+/// Used by the dashboard to show which hook types are landing for a show.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE clips ADD COLUMN hook_type TEXT;
+"#;
+
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1592,6 +1642,11 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(SCHEMA_V7).context("apply schema v7")?;
         conn.pragma_update(None, "user_version", 7)
             .context("set user_version=7")?;
+    }
+    if version < 8 {
+        conn.execute_batch(SCHEMA_V8).context("apply schema v8")?;
+        conn.pragma_update(None, "user_version", 8)
+            .context("set user_version=8")?;
     }
     Ok(())
 }
@@ -1824,6 +1879,7 @@ mod tests {
                 Some("hook"),
                 Some("{}"),
                 None,
+                None,
             )
             .await?;
 
@@ -1863,6 +1919,7 @@ mod tests {
                 Some(85.0),
                 Some("hook"),
                 Some("{}"),
+                None,
                 None,
             )
             .await?;
@@ -2028,6 +2085,7 @@ mod tests {
                 Some("hook"),
                 Some("{}"),
                 Some("AI Safety"),
+                Some("contrarian"),
             )
             .await?;
 

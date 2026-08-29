@@ -6,6 +6,16 @@ TARGET CLIP LENGTH: {{target_secs}}s (acceptable range {{min_secs}}–{{max_secs
 Refined windows MUST end up within this range. Anything that needs longer to
 land its hook should score under 40 — there isn't time on the platform.
 
+AUDIENCE TARGET: {{audience}}
+  · broad  — pulling new viewers who've never heard the show. Penalize
+             inside-baseball, guest-specific references, callbacks to
+             prior episodes. Reward universally accessible hooks.
+  · core   — rewarding existing fans. Inside jokes are GOOD here. Deep
+             cuts and host-quirk callbacks score higher than broad takes.
+             Stranger-test (self-contained axis) penalty is relaxed.
+  · growth — middle ground. Hook must be broadly accessible but payoff
+             can reward the niche. Best for accounts trying to grow.
+
 {{performance_history}}
 Below is a JSON array of candidate clip windows from this episode. Each
 candidate has:
@@ -19,17 +29,12 @@ candidate has:
 - novelty: 0..1, higher = unusual topic content relative to the episode mean
 - audio_events (optional, omitted when AST is disabled): { laughter,
   applause, music, speech }, each 0..1
-  · laughter ≳ 0.5: strong organic reaction — bumps short-form CTR
-  · applause ≳ 0.4: a payoff just landed
-  · music ≳ 0.5: likely bumper/transition; deprioritize unless transcript
-    has a clear payoff
-  · speech is informational only — most candidates are speech-dominant
 
 {{current_trends}}
 
-Score each candidate. Return JSON exactly matching the schema in the system
-prompt — one clip entry per input candidate, indices preserved. If a candidate
-aligns with a current trend, note that in the trend_match field.
+Score each candidate per the rubric in the system prompt. Return JSON
+exactly matching the schema in the system prompt — one clip entry per
+input candidate, indices preserved. Pick hook_type for each.
 
 CANDIDATES:
 {{candidates_json}}

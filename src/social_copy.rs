@@ -30,11 +30,26 @@ pub struct SocialCopy {
     pub x: XCopy,
     #[serde(default)]
     pub bluesky: BlueskyCopy,
-    #[serde(default)]
+    /// On-screen text burned into the first 1.5s. Empty string means "no
+    /// overlay" — the rewritten social_system prompt allows the LLM to
+    /// emit `null` when the visual already carries the hook; the custom
+    /// deserializer below coerces null → "" so the rest of the pipeline
+    /// (which checks `.is_empty()` and `.trim()`) treats the two cases
+    /// identically.
+    #[serde(default, deserialize_with = "deser_overlay_hook")]
     pub overlay_hook: String,
     /// Where the final overlay_hook text came from: "llm", "ranker", or "fallback".
     #[serde(default)]
     pub hook_source: String,
+}
+
+fn deser_overlay_hook<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt = Option::<String>::deserialize(de)?;
+    Ok(opt.unwrap_or_default())
 }
 
 /// Which source to use for the on-screen overlay hook text.
@@ -283,6 +298,7 @@ mod tests {
             hook: "He says the old defense is hopeless.".to_string(),
             reasoning: "Big reaction; clean payoff.".to_string(),
             trend_match: None,
+            hook_type: None,
             llm_score: Some(78),
             vlm_score: None,
             vlm_reasoning: None,

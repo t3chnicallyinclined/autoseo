@@ -11,8 +11,25 @@ pub async fn extract_audio_m4a(
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    // Extract a low-bitrate mono track; good enough for STT and cheap to upload.
-    let status = Command::new(ffmpeg)
+    // Sanity-check the source. The single most common "ffmpeg exit 1" cause
+    // in practice is that the downloader handed us a Google Drive
+    // "Quota exceeded" HTML page or a YouTube auth wall instead of the
+    // actual video. Catch that before invoking ffmpeg so the error is
+    // actionable. Also catches zero-byte downloads (canceled / disk-full).
+    if let Some(reason) = inspect_video_source(video_path).await {
+        anyhow::bail!(
+            "source video looks broken before ffmpeg ran: {reason} \
+             (path: {})",
+            video_path.display()
+        );
+    }
+
+    // Extract a low-bitrate mono track; good enough for STT and cheap to
+    // upload. Use `.output()` so we can include ffmpeg's stderr in the
+    // returned error — `.status()` lets stderr leak to the terminal but
+    // strips it from the Result, leaving the dashboard with a useless
+    // "exit 1" message.
+    let output = Command::new(ffmpeg)
         .arg("-y")
         .args(["-hide_banner", "-loglevel", "error", "-nostats"])
         .arg("-i")
@@ -20,15 +37,94 @@ pub async fn extract_audio_m4a(
         .args(["-vn", "-ac", "1", "-ar", "16000"])
         .args(["-c:a", "aac", "-b:a", "32k"])
         .arg(audio_path)
-        .status()
+        .output()
         .await
         .with_context(|| format!("run ffmpeg extract audio from {}", video_path.display()))?;
 
-    if !status.success() {
-        anyhow::bail!("ffmpeg audio extract failed (exit {status})");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Tail to one short line — full ffmpeg stderr is often a noise wall.
+        let last_line = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("(no stderr)")
+            .trim();
+        let hint = guess_ffmpeg_error_cause(&stderr);
+        anyhow::bail!(
+            "ffmpeg audio extract failed: {last_line}{}",
+            hint.map(|h| format!(" — {h}")).unwrap_or_default()
+        );
     }
 
     Ok(())
+}
+
+/// Look at the file the downloader produced and surface common "bad input"
+/// states before ffmpeg gets a chance to mangle the error. Returns `None`
+/// when the file looks plausible (we hand control to ffmpeg either way).
+async fn inspect_video_source(path: &std::path::Path) -> Option<String> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let size = meta.len();
+    if size == 0 {
+        return Some("file is empty (0 bytes) — download may have been canceled or disk is full".into());
+    }
+    // Drive quota pages are ~1-3 KB of HTML. Any "video" smaller than 64 KB
+    // is almost always an error response — even a 1-second WhatsApp voice
+    // note is bigger than that.
+    if size < 64 * 1024 {
+        if let Ok(head) = tokio::fs::read(path).await {
+            let head_str = String::from_utf8_lossy(&head[..head.len().min(2048)]).to_string();
+            let lower = head_str.to_ascii_lowercase();
+            if lower.starts_with("<!doctype") || lower.starts_with("<html") || lower.contains("<head>") {
+                if lower.contains("quota exceeded") {
+                    return Some(
+                        "Google Drive returned a 'Quota exceeded' HTML page instead of the video. \
+                         Try uploading the file directly via the New Job dialog, copy it to a fresh \
+                         Drive folder for a new file ID, or wait ~24h for the public-link quota to reset"
+                            .into(),
+                    );
+                }
+                if lower.contains("sign in") || lower.contains("login") {
+                    return Some(
+                        "The downloader got an HTML sign-in page, not a video. The source URL \
+                         requires authentication that yt-dlp didn't have. For Drive: make the \
+                         link 'anyone with link' or upload directly. For YouTube: set \
+                         YTDLP_COOKIES_BROWSER or YTDLP_COOKIES_FILE."
+                            .into(),
+                    );
+                }
+                return Some(format!(
+                    "downloaded file is HTML ({size} bytes), not video — the host returned an \
+                     error page. First bytes: {:?}",
+                    head_str.lines().next().unwrap_or("").trim()
+                ));
+            }
+        }
+        return Some(format!(
+            "file is suspiciously small ({size} bytes) — likely a truncated download"
+        ));
+    }
+    None
+}
+
+/// Heuristic hints for the most common ffmpeg error lines we surface to the
+/// dashboard. Returns a short follow-up sentence to append to the raw
+/// stderr tail when we can recognize a pattern.
+fn guess_ffmpeg_error_cause(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("moov atom not found") {
+        Some(
+            "input file has no MP4 index — almost always a truncated or HTML download \
+             (re-download or upload directly)",
+        )
+    } else if lower.contains("invalid data found when processing input") {
+        Some("input is not a valid media file — verify the download")
+    } else if lower.contains("no space left on device") {
+        Some("disk is full")
+    } else {
+        None
+    }
 }
 
 pub async fn transcode_audio_to_m4a(

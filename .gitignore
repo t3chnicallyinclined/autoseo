@@ -8,3 +8,5 @@
 # Set up per-machine — see DEV.md. Don't commit; absolute paths differ
 # across boxes.
 /dashboard/dist
+.env.bak.*
+.env.bak

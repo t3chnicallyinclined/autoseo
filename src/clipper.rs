@@ -638,7 +638,8 @@ async fn run_clipper_pipeline_inner(
         ranker_system,
         ranker_user_template,
     )
-    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs);
+    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs)
+    .with_audience(&cfg.clip_audience_mode);
 
     // Inject CTR history into ranker prompt when enabled.
     if cfg.ctr_history_enabled {
@@ -1028,6 +1029,7 @@ async fn run_clipper_pipeline_inner(
             variants,
             cover_frame_path: None,
             posts: Vec::new(),
+            clip_words: clip_words.clone(),
         });
     }
 
@@ -1569,7 +1571,8 @@ async fn run_clipper_inner(
         ranker_system,
         ranker_user_template,
     )
-    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs);
+    .with_durations(cfg.clip_min_secs, cfg.clip_max_secs, cfg.clip_target_secs)
+    .with_audience(&cfg.clip_audience_mode);
 
     // Inject CTR history into ranker prompt when enabled.
     if cfg.ctr_history_enabled {
@@ -1718,6 +1721,7 @@ async fn run_clipper_inner(
                     Some(&clip.hook),
                     Some(&clip.reasoning),
                     clip.trend_match.as_deref(),
+                    clip.hook_type.as_deref(),
                 )
                 .await
             {
@@ -2101,6 +2105,7 @@ async fn run_clipper_inner(
             variants,
             cover_frame_path,
             posts: Vec::new(),
+            clip_words: clip_words.clone(),
         });
     }
 
@@ -2330,6 +2335,11 @@ struct RenderedClip {
     variants: Vec<RenderedVariant>,
     cover_frame_path: Option<PathBuf>,
     posts: Vec<PostResult>,
+    /// Per-word transcript for this clip, with **clip-relative** timestamps
+    /// (the first word starts near 0.0, the last ends near `clip.duration`).
+    /// Persisted into the manifest so the dashboard's per-clip caption
+    /// editor can regenerate ASS files with new styles without re-STTing.
+    clip_words: Vec<AlignedWord>,
 }
 
 struct RenderedVariant {
@@ -2694,12 +2704,21 @@ fn build_manifest_json(
                 "cover_frame": cover_frame,
                 "social": social,
                 "posts": posts,
+                "hook_type": r.ranked.hook_type,
+                // Per-word transcript with clip-relative timestamps. Lets
+                // the dashboard's caption editor regenerate ASS files
+                // with new styles without re-STTing the clip's audio.
+                "words": r.clip_words.iter().map(|w| serde_json::json!({
+                    "text": w.text,
+                    "start_secs": w.start_secs,
+                    "end_secs": w.end_secs,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
 
     let mut manifest = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "episode": media_name,
         "total_duration_secs": total_duration_secs,
         "clips_dir": abs_clips_dir.display().to_string(),
@@ -2922,6 +2941,7 @@ mod tests {
                 hook: hook.to_string(),
                 reasoning: "test".to_string(),
                 trend_match: None,
+                hook_type: None,
                 llm_score: Some(score),
                 vlm_score: None,
                 vlm_reasoning: None,
@@ -2938,6 +2958,7 @@ mod tests {
             }],
             cover_frame_path: None,
             posts: Vec::new(),
+            clip_words: Vec::new(),
         }
     }
 

@@ -232,6 +232,20 @@ pub struct Config {
     #[arg(long, env = "CAPTION_HOOK_OVERLAY_ENABLED", default_value_t = true)]
     pub caption_hook_overlay_enabled: bool,
 
+    // ── Ranker audience targeting ────────────────────────────────────────
+
+    /// Audience target injected into the ranker prompt — drives whether the
+    /// LLM optimizes for new-viewer accessibility or existing-fan reward.
+    /// Accepted: `broad` / `core` / `growth`. Default `broad`.
+    ///   - `broad`  — pulling new viewers; penalizes inside-baseball and
+    ///                guest-specific references.
+    ///   - `core`   — rewarding existing fans; relaxes the self-contained
+    ///                axis so inside jokes + deep cuts score higher.
+    ///   - `growth` — middle ground; hook broadly accessible, payoff can
+    ///                reward the niche. Best for accounts trying to grow.
+    #[arg(long, env = "CLIP_AUDIENCE_MODE", default_value = "broad")]
+    pub clip_audience_mode: String,
+
     // ── STT hallucination guard strictness ──────────────────────────────
 
     /// Hallucination-guard strictness for whisper transcripts.

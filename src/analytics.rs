@@ -403,7 +403,7 @@ mod tests {
         // Create job + clip + post.
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), Some(90.0), None, None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), Some(90.0), None, None, None, None)
             .await
             .unwrap();
 
@@ -464,7 +464,7 @@ mod tests {
         let storage = Storage::open_in_memory_sync();
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None, None)
             .await
             .unwrap();
 
@@ -495,7 +495,7 @@ mod tests {
         let storage = Storage::open_in_memory_sync();
         storage.create_job("j1", None, None, None).await.unwrap();
         storage
-            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None)
+            .insert_clip("c1", "j1", 0, 30000, Some(1), None, None, None, None, None)
             .await
             .unwrap();
 

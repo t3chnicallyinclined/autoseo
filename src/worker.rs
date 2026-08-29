@@ -181,6 +181,12 @@ fn apply_per_job_overrides(cfg: &Config, job: &crate::storage::JobRow) -> Config
         applied.push(format!("stt_hallucination_guard={v}"));
     }
 
+    // Ranker audience mode (broad / core / growth)
+    if let Some(v) = parsed.get("clip_audience_mode").and_then(|v| v.as_str()) {
+        out.clip_audience_mode = v.to_string();
+        applied.push(format!("clip_audience_mode={v}"));
+    }
+
     if !applied.is_empty() {
         tracing::info!(job_id = %job.id, overrides = %applied.join(", "), "applied per-job config overrides");
     }

@@ -187,10 +187,22 @@ fn enrich_clip(clip: &ClipDetail, work_dir: &str) -> Value {
         "overlay_hook": Value::Null,
         "hook_source": Value::Null,
         "scores": Value::Null,
+        // Whether the per-clip manifest has the word-level transcript
+        // needed by the dashboard's caption editor. False for clips
+        // rendered before SCHEMA_VERSION 4 — the editor disables its
+        // caption controls so the producer doesn't waste a click.
+        "has_captionable_words": false,
     });
 
     if let Some((manifest, idx)) = load_manifest_for_clip(clip) {
         if let Some(m_clip) = manifest.get("clips").and_then(|c| c.get(idx)) {
+            // Pre-flight signal: do we have words[] for this clip in the
+            // manifest? Drives the dashboard's caption-editor enable state.
+            let has_words = m_clip
+                .get("words")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+            extra["has_captionable_words"] = Value::Bool(has_words);
             // Only fill cover from the manifest if the DB didn't already provide one.
             if extra["cover_url"].is_null() {
                 if let Some(cover) = m_clip.get("cover_frame") {
@@ -443,6 +455,540 @@ async fn bulk_action(
     }
 }
 
+/// Body for `POST /api/clips/{id}/recut` — operator-driven trim + optional
+/// caption restyle.
+///
+/// Re-renders **every** variant that already exists for this clip so the
+/// 9x16 / 1x1 / 16x9 renders stay consistent. Captions are re-generated
+/// from the per-clip word timestamps stored in `manifest.json` (added by
+/// SCHEMA_VERSION 4); when the manifest predates that or `burn_captions`
+/// is false, the recut renders without subtitles.
+#[derive(Deserialize, Default)]
+pub struct RecutBody {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    /// Burn karaoke captions into the re-render. Defaults to `true` when
+    /// the manifest has per-clip words available, `false` otherwise. The
+    /// dashboard sends `false` only when the producer toggles captions
+    /// off explicitly.
+    #[serde(default)]
+    pub burn_captions: Option<bool>,
+    /// Per-clip caption style overrides. Layers on top of the global
+    /// env-driven [`crate::captions::CaptionOverrides`] so the producer
+    /// can pick a font / size / color for this one clip without changing
+    /// global settings.
+    #[serde(default)]
+    pub caption_overrides: Option<crate::captions::CaptionOverrides>,
+}
+
+/// `POST /api/clips/{id}/recut` — re-render every existing variant of a
+/// clip with new time bounds. Skips the LLM + ranker + social copy
+/// stages; just runs ffmpeg against the original source video with the
+/// new in/out points. All variants render in parallel up to
+/// `RENDER_CONCURRENCY` so the operator's wait is dominated by the
+/// slowest single variant, not the sum.
+///
+/// Captions are intentionally dropped on recut — the per-word ASS
+/// timings were authored against the original window and can't be
+/// shifted faithfully without re-deriving from the transcript. Operator
+/// can re-run the full pipeline if they need captions to match the
+/// trimmed boundaries.
+async fn recut_clip(
+    State(state): State<Arc<AppState>>,
+    Path(clip_id): Path<String>,
+    Json(body): Json<RecutBody>,
+) -> impl IntoResponse {
+    // ── Validate bounds ────────────────────────────────────────────
+    if !body.start_secs.is_finite() || !body.end_secs.is_finite() {
+        return err_json(StatusCode::BAD_REQUEST, "start/end must be finite")
+            .into_response();
+    }
+    let new_start = body.start_secs.max(0.0);
+    let new_end = body.end_secs;
+    let duration = new_end - new_start;
+    if duration < 3.0 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("duration {duration:.1}s below 3s minimum"),
+        )
+        .into_response();
+    }
+    if duration > 300.0 {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("duration {duration:.1}s above 300s maximum"),
+        )
+        .into_response();
+    }
+
+    // ── Resolve clip + job + source video ──────────────────────────
+    let clip = match state.storage.get_clip(&clip_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "clip not found").into_response(),
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+        }
+    };
+    let job = match state.storage.get_job(&clip.job_id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return err_json(StatusCode::NOT_FOUND, "owning job not found").into_response();
+        }
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+        }
+    };
+
+    if clip.renders.is_empty() {
+        return err_json(
+            StatusCode::PRECONDITION_FAILED,
+            "clip has no rendered variants to recut — re-run the full pipeline",
+        )
+        .into_response();
+    }
+
+    let source_path = match resolve_source_video(&job, &state.work_dir).await {
+        Some(p) => p,
+        None => {
+            return err_json(
+                StatusCode::PRECONDITION_FAILED,
+                "original source video is no longer on disk \
+                 (work/uploads/ cleanup or remote-only ingestion). \
+                 Re-run the full pipeline instead of trimming.",
+            )
+            .into_response();
+        }
+    };
+
+    // ── Build a render profile from current env (CRF/preset/audio) ──
+    let cfg = {
+        use clap::Parser as _;
+        match crate::config::Config::try_parse_from(["autoseo"]) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("config snapshot failed: {e}"),
+                )
+                .into_response();
+            }
+        }
+    };
+
+    // ── Pull per-clip words from the manifest for caption regen ────
+    // SCHEMA_VERSION 4 added a `words` array per clip with clip-relative
+    // timestamps. Older manifests omit it; in that case captions are
+    // silently dropped on recut (logged to stderr for debug). The
+    // dashboard's caption editor surfaces this state via the
+    // `has_captionable_words` flag in the response.
+    let manifest_words: Vec<crate::align::AlignedWord> = load_manifest_for_clip(&clip)
+        .as_ref()
+        .and_then(|(m, idx)| {
+            let arr = m.get("clips")?.get(*idx)?.get("words")?.as_array()?;
+            Some(
+                arr.iter()
+                    .filter_map(|w| {
+                        let text = w.get("text")?.as_str()?.to_string();
+                        let start_secs = w.get("start_secs")?.as_f64()?;
+                        let end_secs = w.get("end_secs")?.as_f64()?;
+                        Some(crate::align::AlignedWord {
+                            text,
+                            start_secs,
+                            end_secs,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+
+    // Filter to the new bounds and re-anchor to the NEW clip start so the
+    // ASS karaoke times line up with the trimmed video.
+    let clip_orig_start_secs = clip.start_ms as f64 / 1000.0;
+    let new_start_offset = (new_start - clip_orig_start_secs).max(0.0);
+    let filtered_words: Vec<crate::align::AlignedWord> = manifest_words
+        .iter()
+        .filter(|w| {
+            w.start_secs >= new_start_offset - 0.001
+                && w.end_secs <= new_start_offset + duration + 0.5
+        })
+        .map(|w| crate::align::AlignedWord {
+            text: w.text.clone(),
+            start_secs: (w.start_secs - new_start_offset).max(0.0),
+            end_secs: (w.end_secs - new_start_offset).max(0.0),
+        })
+        .collect();
+
+    let burn = match body.burn_captions {
+        Some(b) => b && !filtered_words.is_empty(),
+        None => !filtered_words.is_empty(),
+    };
+
+    // ── Build per-clip caption overrides ────────────────────────────
+    // Layer order: env defaults first, request overrides on top. The
+    // per-show JSON path (used by the full pipeline) is skipped here —
+    // dashboard edits are explicit operator overrides, not show-level.
+    let mut caption_overrides = crate::captions::CaptionOverrides::default();
+    caption_overrides.apply_env();
+    if let Some(req) = body.caption_overrides {
+        caption_overrides.merge_from(req);
+    }
+
+    // Emit a recut-start event so the dashboard's Activity Log + the
+    // trim panel's in-place progress indicator both light up. We piggy-
+    // back on the clip's owning job_id so the existing event subscriber
+    // routes it correctly.
+    let total_variants = clip.renders.len();
+    let captions_will_apply = burn && !filtered_words.is_empty();
+    let recut_msg = if captions_will_apply {
+        format!(
+            "recut: rendering {} variant(s) with captions ({} words)",
+            total_variants,
+            filtered_words.len()
+        )
+    } else if burn {
+        format!(
+            "recut: rendering {} variant(s) — manifest has no transcript words, captions skipped",
+            total_variants
+        )
+    } else {
+        format!(
+            "recut: rendering {} variant(s) — captions off",
+            total_variants
+        )
+    };
+    state
+        .event_bus
+        .emit(crate::events::PipelineEvent::PipelineStage {
+            job_id: clip.job_id.clone(),
+            stage_id: "recut".into(),
+            status: "active".into(),
+            progress: Some(0),
+            message: Some(recut_msg.clone()),
+        });
+
+    // ── Render every variant in parallel ───────────────────────────
+    // `clip.renders` is the source of truth for which aspects already
+    // exist for this clip. We don't add variants the original pipeline
+    // didn't render — that would change the manifest's variant set.
+    use futures_util::{StreamExt, stream};
+    let concurrency = cfg.effective_render_concurrency();
+    let ffmpeg = cfg.ffmpeg.clone();
+    let crf = cfg.clip_video_crf;
+    let preset = cfg.clip_video_preset.clone();
+    let audio_kbps = cfg.clip_audio_bitrate_kbps;
+    // Shared counter so each variant's task can announce its completion
+    // back to the dashboard with `done/total` progress.
+    let done_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let bus = state.event_bus.clone();
+    let job_id_for_events = clip.job_id.clone();
+    let results: Vec<(String, PathBuf, Result<(), anyhow::Error>)> =
+        stream::iter(clip.renders.iter().cloned())
+            .map(|render| {
+                let ffmpeg = ffmpeg.clone();
+                let source_path = source_path.clone();
+                let preset = preset.clone();
+                let words = filtered_words.clone();
+                let overrides = caption_overrides.clone();
+                let bus = bus.clone();
+                let job_id_for_events = job_id_for_events.clone();
+                let done_counter = done_counter.clone();
+                async move {
+                    let out_path = PathBuf::from(&render.path);
+                    let (profile, aspect) = match render.variant.as_str() {
+                        "9x16" | "vertical" | "shorts" => (
+                            Some(crate::render::RenderProfile::shorts_vertical()),
+                            Some("vertical"),
+                        ),
+                        "1x1" | "square" => (
+                            Some(crate::render::RenderProfile::linkedin_square()),
+                            Some("square"),
+                        ),
+                        "16x9" | "landscape" | "horizontal" => (
+                            Some(crate::render::RenderProfile::bluesky_landscape()),
+                            Some("landscape"),
+                        ),
+                        _ => (None, None),
+                    };
+                    let (Some(profile), Some(aspect)) = (profile, aspect) else {
+                        return (
+                            render.variant.clone(),
+                            out_path,
+                            Err(anyhow::anyhow!(
+                                "unknown variant {:?} on existing render row",
+                                render.variant
+                            )),
+                        );
+                    };
+                    let profile = profile.with_quality(crf, &preset, audio_kbps);
+
+                    // Write a fresh ASS file per variant when captions are
+                    // wanted AND we have words for this clip. Drops in
+                    // alongside the existing render, distinct name so we
+                    // don't clobber the original.
+                    let ass_path = if burn && !words.is_empty() {
+                        let parent = out_path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        let stem = out_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("clip");
+                        let p = parent.join(format!("{stem}_recut.ass"));
+                        let style = match aspect {
+                            "vertical" => {
+                                crate::captions::CaptionStyle::for_vertical_with(&overrides)
+                            }
+                            "square" => {
+                                crate::captions::CaptionStyle::for_square_with(&overrides)
+                            }
+                            _ => crate::captions::CaptionStyle::for_landscape_with(&overrides),
+                        };
+                        match crate::captions::write_ass(
+                            &p,
+                            &words,
+                            profile.width,
+                            profile.height,
+                            &style,
+                        )
+                        .await
+                        {
+                            Ok(()) => Some(p),
+                            Err(e) => {
+                                tracing::warn!(
+                                    variant = %render.variant,
+                                    error = ?e,
+                                    "recut: ASS write failed; rendering without captions"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let subtitle_paths: Vec<&std::path::Path> = ass_path
+                        .as_ref()
+                        .map(|p| vec![p.as_path()])
+                        .unwrap_or_default();
+
+                    let res = crate::render::render_clip(
+                        &ffmpeg,
+                        &source_path,
+                        new_start,
+                        new_end,
+                        &out_path,
+                        &profile,
+                        &subtitle_paths,
+                    )
+                    .await;
+
+                    // Announce this variant's completion so the dashboard
+                    // can update the progress bar incrementally instead of
+                    // waiting for ALL variants to finish.
+                    let done = done_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let progress = ((done as f64 / total_variants as f64) * 100.0).round() as u8;
+                    let status_label = if res.is_ok() { "done" } else { "failed" };
+                    let msg = if res.is_ok() {
+                        format!("recut: {} {} ({}/{})", render.variant, status_label, done, total_variants)
+                    } else {
+                        format!(
+                            "recut: {} FAILED ({}/{}): {}",
+                            render.variant,
+                            done,
+                            total_variants,
+                            res.as_ref()
+                                .err()
+                                .map(|e| format!("{e:#}"))
+                                .unwrap_or_default()
+                        )
+                    };
+                    bus.emit(crate::events::PipelineEvent::PipelineStage {
+                        job_id: job_id_for_events.clone(),
+                        stage_id: "recut".into(),
+                        status: "active".into(),
+                        progress: Some(progress),
+                        message: Some(msg),
+                    });
+
+                    (render.variant.clone(), out_path, res)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut succeeded: Vec<(String, PathBuf)> = Vec::new();
+    for (variant, out_path, res) in results {
+        match res {
+            Ok(()) => succeeded.push((variant, out_path)),
+            Err(e) => errors.push(format!("{variant}: {e:#}")),
+        }
+    }
+    if succeeded.is_empty() {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("all variants failed to re-render: {}", errors.join(" | ")),
+        )
+        .into_response();
+    }
+
+    // ── Update DB ──────────────────────────────────────────────────
+    let new_start_ms = (new_start * 1000.0) as i64;
+    let new_end_ms = (new_end * 1000.0) as i64;
+    if let Err(e) = state
+        .storage
+        .update_clip_bounds(&clip.id, new_start_ms, new_end_ms)
+        .await
+    {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB bounds update failed: {e:#}"),
+        )
+        .into_response();
+    }
+    // Replace each successful variant's render row. URL=None clears any
+    // stale R2 URL — the /media/clipper/* proxy serves the freshly-rendered
+    // local file. Variants that failed keep their existing row (the user
+    // sees them as stale until they trim again or re-run the pipeline).
+    for (variant, out_path) in &succeeded {
+        let bytes = tokio::fs::metadata(out_path)
+            .await
+            .map(|m| m.len() as i64)
+            .ok();
+        if let Err(e) = state
+            .storage
+            .insert_clip_render(
+                &clip.id,
+                variant,
+                &out_path.to_string_lossy(),
+                bytes,
+                Some((duration * 1000.0) as i64),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                clip_id = %clip.id,
+                variant = %variant,
+                error = ?e,
+                "DB render row update failed; render file is on disk but metadata is stale"
+            );
+        }
+    }
+
+    tracing::info!(
+        clip_id = %clip.id,
+        variants_succeeded = succeeded.len(),
+        variants_failed = errors.len(),
+        new_start_secs = new_start,
+        new_end_secs = new_end,
+        captions_applied = captions_will_apply,
+        "clip recut complete"
+    );
+    if !errors.is_empty() {
+        tracing::warn!(
+            clip_id = %clip.id,
+            errors = %errors.join(" | "),
+            "some variants failed to re-render"
+        );
+    }
+
+    // Final "done" event so the dashboard's progress strip clears + the
+    // Activity Log gets a clean closing line.
+    let final_msg = match (errors.is_empty(), captions_will_apply) {
+        (true, true) => format!(
+            "recut complete: {} variants re-rendered with captions",
+            succeeded.len()
+        ),
+        (true, false) if burn => format!(
+            "recut complete: {} variants re-rendered (captions skipped — no transcript words in manifest; re-run pipeline to enable caption regen)",
+            succeeded.len()
+        ),
+        (true, false) => format!(
+            "recut complete: {} variants re-rendered (captions off)",
+            succeeded.len()
+        ),
+        (false, _) => format!(
+            "recut complete: {} succeeded, {} failed",
+            succeeded.len(),
+            errors.len()
+        ),
+    };
+    state
+        .event_bus
+        .emit(crate::events::PipelineEvent::PipelineStage {
+            job_id: clip.job_id.clone(),
+            stage_id: "recut".into(),
+            status: if errors.is_empty() { "done".into() } else { "failed".into() },
+            progress: Some(100),
+            message: Some(final_msg),
+        });
+
+    // Return the freshly-loaded clip wrapped with status flags so the
+    // dashboard can give honest feedback: "captions applied" vs "skipped
+    // because no words" vs "off by choice".
+    match state.storage.get_clip(&clip.id).await {
+        Ok(Some(c)) => {
+            let mut payload = enrich_clip(&c, &state.work_dir);
+            if let Value::Object(ref mut map) = payload {
+                map.insert(
+                    "captions_applied".into(),
+                    Value::Bool(captions_will_apply),
+                );
+                map.insert(
+                    "captions_requested".into(),
+                    Value::Bool(burn),
+                );
+                map.insert(
+                    "has_captionable_words".into(),
+                    Value::Bool(!filtered_words.is_empty()),
+                );
+                map.insert(
+                    "variants_failed".into(),
+                    Value::Number(serde_json::Number::from(errors.len())),
+                );
+            }
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Ok(None) => err_json(StatusCode::NOT_FOUND, "clip vanished post-update")
+            .into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Locate the original source video for a job. Prefers `jobs.local_path`
+/// (set on file-upload jobs) and falls back to scanning the upload dir
+/// for any `.mp4` (URL-ingest jobs land there via yt-dlp). Returns
+/// `None` when nothing usable remains on disk.
+async fn resolve_source_video(
+    job: &crate::storage::JobRow,
+    work_dir: &str,
+) -> Option<PathBuf> {
+    if let Some(p) = job.local_path.as_deref() {
+        let path = PathBuf::from(p);
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return Some(path);
+        }
+    }
+    let dir = PathBuf::from(work_dir).join("uploads").join(&job.id);
+    let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("mp4"))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Build the clips sub-router.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -452,4 +998,5 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/clips/{id}/approve", post(approve_clip))
         .route("/clips/{id}/veto", post(veto_clip))
         .route("/clips/{id}/post", post(post_clip))
+        .route("/clips/{id}/recut", post(recut_clip))
 }

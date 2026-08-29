@@ -3,6 +3,7 @@ mod clips;
 mod cloudflare;
 pub mod config_store;
 mod jobs;
+mod prompts;
 mod services;
 mod stubs;
 mod ws;
@@ -824,6 +825,7 @@ pub fn router(state: AppState, cors_origins: &str) -> Router {
         .route("/fonts/install", post(install_font))
         .merge(clips::router())
         .merge(jobs::router())
+        .merge(prompts::router())
         .merge(services::router())
         .merge(stubs::router())
         .layer(axum::middleware::from_fn(auth::require_token));
@@ -1137,6 +1139,7 @@ mod tests {
                 Some("hook"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1242,7 +1245,7 @@ mod tests {
             .unwrap();
         state
             .storage
-            .insert_clip("clip-z", "job-7", 0, 30_000, Some(1), Some(80.0), Some("h"), None, None)
+            .insert_clip("clip-z", "job-7", 0, 30_000, Some(1), Some(80.0), Some("h"), None, None, None)
             .await
             .unwrap();
         let app = router(state.clone(), "http://localhost:5173");

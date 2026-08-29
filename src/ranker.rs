@@ -30,6 +30,11 @@ pub struct RankedClip {
     pub hook: String,
     pub reasoning: String,
     pub trend_match: Option<String>,
+    /// Agency-style hook formula classification — set by the ranker LLM
+    /// per the rubric in `prompts/clips/ranker_system.txt`. Used by
+    /// downstream analytics to track which hook patterns perform.
+    /// `None` when the LLM omitted the field (old prompt + new code).
+    pub hook_type: Option<String>,
     /// The transcript-only LLM score before any VLM blending. Set once by the
     /// ranker.
     pub llm_score: Option<i32>,
@@ -60,6 +65,9 @@ pub struct Ranker {
     pub clip_target_secs: f64,
     pub clip_min_secs: f64,
     pub clip_max_secs: f64,
+    /// Audience target injected as `{{audience}}` into the user prompt.
+    /// `broad` / `core` / `growth`. See [`crate::config::Config::clip_audience_mode`].
+    pub audience_mode: String,
 }
 
 impl Ranker {
@@ -80,6 +88,7 @@ impl Ranker {
             clip_target_secs: 20.0,
             clip_min_secs: 10.0,
             clip_max_secs: 30.0,
+            audience_mode: "broad".to_string(),
         }
     }
 
@@ -90,6 +99,21 @@ impl Ranker {
         self.clip_min_secs = min_secs;
         self.clip_max_secs = max_secs;
         self.clip_target_secs = target_secs.clamp(min_secs, max_secs);
+        self
+    }
+
+    /// Set the audience-mode placeholder (`broad` / `core` / `growth`).
+    /// Unknown values default to `broad` with a warning.
+    pub fn with_audience(mut self, mode: &str) -> Self {
+        let normalized = mode.trim().to_ascii_lowercase();
+        self.audience_mode = match normalized.as_str() {
+            "broad" | "core" | "growth" => normalized,
+            "" => "broad".to_string(),
+            other => {
+                tracing::warn!(value = other, "unknown CLIP_AUDIENCE_MODE; using 'broad'");
+                "broad".to_string()
+            }
+        };
         self
     }
 
@@ -150,6 +174,10 @@ impl Ranker {
                         .trend_match
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
+                    hook_type: clip
+                        .hook_type
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty()),
                     llm_score: Some(score),
                     vlm_score: None,
                     vlm_reasoning: None,
@@ -196,7 +224,8 @@ impl Ranker {
             .replace("{{current_trends}}", &trends_block)
             .replace("{{min_secs}}", &format!("{:.0}", self.clip_min_secs))
             .replace("{{max_secs}}", &format!("{:.0}", self.clip_max_secs))
-            .replace("{{target_secs}}", &format!("{:.0}", self.clip_target_secs));
+            .replace("{{target_secs}}", &format!("{:.0}", self.clip_target_secs))
+            .replace("{{audience}}", &self.audience_mode);
         out
     }
 
@@ -311,6 +340,11 @@ struct RankerClip {
     reasoning: String,
     #[serde(default)]
     trend_match: Option<String>,
+    /// Agency-style hook formula classification — added by the rewritten
+    /// `ranker_system.txt` prompt. Optional: an older prompt (or an LLM
+    /// that ignored the schema) returns nothing and we treat it as `None`.
+    #[serde(default)]
+    hook_type: Option<String>,
 }
 
 #[cfg(test)]
